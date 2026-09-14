@@ -1,0 +1,65 @@
+# ============================================================
+# AI 3D Forge —— Git 忽略清单
+# ------------------------------------------------------------
+# 两条硬约定：
+#   1. 任何可能包含 DeepSeek API Key / 令牌的文件一律不提交；
+#   2. build/ 下的所有内容都是**生成物**，一个都不进版本库
+#      （既能避免仓库被撑到几百 MB，也避免把本机路径带出去）。
+# 判断标准很简单：删掉之后 `scripts\build.ps1` 能重新生成的东西，
+# 就不该被提交。
+# ============================================================
+
+# --- 机密（绝不提交）---
+secrets/
+*.local.env
+.env
+.env.*
+!.env.example
+
+# --- 构建产物（全部位于 build\ 下，均为生成物）---
+#   build\venv          Python 虚拟环境
+#   build\cache         下载/编译缓存
+#   build\downloads     OpenSCAD 安装包缓存
+#   build\dist          PyInstaller 免安装版
+#   build\work          构建与测试的临时目录（自检、端到端、截图…）
+#   build\source        导出的源码包
+#   build\release       发布包
+#   build\*.ico         由 scripts\make_version_info.py 生成的图标
+#   build\version_info.txt  同上（PyInstaller 版本资源）
+# 整个目录一起忽略，避免以后新增子目录时漏掉、把本机路径提交上去
+# （实测 build\source 里就带着一份含 C:\Users\<用户名> 的报告）。
+build/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- 前端 ---
+webui/node_modules/
+webui/dist/
+webui/build/
+webui/.vite/
+# TypeScript 增量编译信息：可能是 tsconfig.tsbuildinfo，
+# 也可能是 tsconfig.node.tsbuildinfo，用通配符一次覆盖
+*.tsbuildinfo
+
+# --- 界面截图与体检报告（测试残留）---
+# 这些是 scripts\review-shots.mjs / 各 audit 脚本的产物：
+# 体积大、可重新生成，而且里面的 JSON 报告带有本机绝对路径。
+webui/scripts/shots/
+webui/scripts/*-report.json
+
+# --- 安装器中间产物 ---
+installer/Output/
+installer/*.exe
+
+# --- 编辑器 / 系统 ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.log

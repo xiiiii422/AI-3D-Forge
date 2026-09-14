@@ -1,0 +1,111 @@
+AI 3D Forge 许可与第三方组件说明
+================================
+
+一、本软件
+----------
+AI 3D Forge（AI 3D 打印设计工具）本体由本项目作者开发。
+本软件为桌面工具软件，按「现状」提供，请在使用前自行确认生成的模型适合你的实际用途。
+
+二、本软件「不包含」OpenSCAD，但会按你的确认安装它
+------------------------------------------------
+本软件需要一个独立的开源程序 OpenSCAD 来完成 3D 建模与 STL 导出。
+
+  * OpenSCAD 官方网站：https://openscad.org/
+  * 许可证：GNU General Public License 第 2 版（GPLv2）或更新版本
+  * 许可证全文见同目录下的 LICENSE-OpenSCAD-GPLv2.txt
+  * OpenSCAD 源代码：https://github.com/openscad/openscad
+
+关于分发方式的说明（GPLv2 合规）：
+  本软件的安装包中**没有**打包 OpenSCAD 的二进制文件。
+  安装程序与软件运行时，会在你确认后从 OpenSCAD 官方渠道
+  （files.openscad.org，该地址由 OpenSCAD 官网 downloads 页面链接）
+  下载官方发布的安装包，并在下载后校验官方公布的 SHA-256 校验值；
+  校验不通过则立即删除并中止安装。
+  因为分发给最终用户的是**未经修改的官方二进制**，并且本说明提供了
+  许可证全文与对应源代码的获取地址，符合 GPLv2 对再分发的要求。
+
+你始终可以自行从官方网站下载安装 OpenSCAD，本软件会自动识别已安装的版本。
+
+三、随程序分发的第三方组件
+--------------------------
+以下组件随本软件一起打包，均遵循其各自的许可证。
+
+完整清单（含传递依赖）由脚本自动生成，**不要手抄**：
+
+    build\venv\Scripts\python.exe scripts\list_dependencies.py
+
+改过依赖之后请重新生成，并同步更新本节。当前实际分发 23 个 Python 发行包：
+
+  1. Python 运行时
+     许可证：Python Software Foundation License
+     https://www.python.org/
+
+  2. Web 服务框架
+     fastapi            MIT          https://fastapi.tiangolo.com/
+     starlette          BSD-3-Clause https://www.starlette.io/
+     uvicorn            BSD-3-Clause https://www.uvicorn.org/
+     pydantic           MIT          https://docs.pydantic.dev/
+     pydantic_core      MIT          https://docs.pydantic.dev/
+     python-multipart   Apache-2.0   https://github.com/Kludex/python-multipart
+       （Apache-2.0 要求保留版权与许可声明，本文件即为其归属声明）
+
+  3. HTTP 客户端
+     httpx              BSD-3-Clause https://www.python-httpx.org/
+     httpcore           BSD          https://www.encode.io/httpcore/
+     h11                MIT          https://github.com/python-hyper/h11
+
+  4. 证书与编码数据
+     certifi            **MPL-2.0**  https://github.com/certifi/python-certifi
+       （MPL-2.0 要求：分发时必须提供许可证文本与来源。
+         本软件未修改 certifi，仅原样打包其证书数据。）
+     idna               BSD-3-Clause https://github.com/kjd/idna
+
+  5. API Key 安全存储
+     keyring            MIT          https://github.com/jaraco/keyring
+     jaraco.classes     MIT          https://github.com/jaraco/jaraco.classes
+     jaraco.context     MIT          https://github.com/jaraco/jaraco.context
+     jaraco.functools   MIT          https://github.com/jaraco/jaraco.functools
+     more-itertools     MIT          https://github.com/more-itertools/more-itertools
+
+  6. 桌面窗口（提供原生窗口；缺失时自动改用系统浏览器）
+     pywebview          BSD          https://pywebview.flowrl.com/
+     bottle             MIT          https://bottlepy.org/
+     proxy_tools        MIT          https://github.com/jtushman/proxy_tools
+
+  7. 其他运行时支撑
+     annotated-types    MIT          https://github.com/annotated-types/annotated-types
+     anyio              MIT          https://anyio.readthedocs.io/
+     click              BSD-3-Clause https://click.palletsprojects.com/
+     typing_extensions  PSF-2.0      https://github.com/python/typing_extensions
+
+  8. 打包工具（引导程序会被嵌入分发出去的 exe）
+     PyInstaller        GPL-2.0-or-later，附「引导程序例外条款」
+                        https://pyinstaller.org/
+       说明：PyInstaller 的引导程序（bootloader）会嵌入本软件发布的
+       AI-3D-Forge.exe。该例外条款明确允许把用 PyInstaller 打包的程序
+       以任意许可证分发，不要求本软件开源。打包产物中不含 PyInstaller
+       自身以外的 GPL 代码。
+
+  9. 前端（构建后随程序分发）
+     Three.js           MIT          https://threejs.org/
+     React              MIT          https://react.dev/
+     React DOM          MIT          https://react.dev/
+     React Router       MIT          https://reactrouter.com/
+       构建期工具（不随程序分发）：Vite、TypeScript、@vitejs/plugin-react、
+       Playwright、@types/*，均为 MIT 或 Apache-2.0。
+
+四、你的数据
+------------
+本软件不会上传你的模型、项目或 API Key。
+唯一的对外网络请求是：
+  * 调用你自己配置的 DeepSeek API（api.deepseek.com）进行 AI 设计与检查；
+  * 在你确认后，从 OpenSCAD 官方网站下载安装包。
+
+你的 API Key 保存在本机 Windows 凭据管理器中（不可用时退回仅当前用户可读的本地配置文件）。
+你的项目与模型保存在你的用户目录中，卸载或升级本软件都不会删除。
+
+五、AI 生成内容的提示
+--------------------
+模型由 AI 根据你的自然语言描述生成。虽然软件会做几何封闭性、尺寸与打印性检查，
+但请在实际打印前自行确认模型的强度、尺寸精度与安全性，
+尤其是承重件、受力件或与人身安全相关的用途。

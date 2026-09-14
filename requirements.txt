@@ -1,0 +1,28 @@
+# ============================================================
+# AI 3D Forge —— 运行时依赖（开发阶段使用）
+# ------------------------------------------------------------
+# 开发环境：
+#   python -m venv build\venv
+#   build\venv\Scripts\python -m pip install -r requirements.txt
+#
+# 发布版本：这些依赖全部由 PyInstaller 打进 dist\AI-3D-Forge\，
+#          最终用户机器上「不需要」Python，也不需要执行 pip install。
+#
+# 说明：刻意保持极少的依赖数量，以缩小安装包体积、减少 C 盘占用
+#      并降低普通用户环境出现 ModuleNotFoundError 的概率。
+# ============================================================
+
+# --- Web 服务（本机 127.0.0.1 回环，供内置界面调用）---
+fastapi==0.115.6
+uvicorn==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.4
+
+# --- HTTP 客户端（调用 DeepSeek API、下载 OpenSCAD 安装包）---
+httpx==0.28.1
+
+# --- API Key 安全存储（Windows 凭据管理器）---
+keyring==25.6.0
+
+# --- 桌面窗口（WebView2 原生窗口；缺失时自动回退到系统浏览器）---
+pywebview==5.4

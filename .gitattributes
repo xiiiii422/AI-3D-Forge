@@ -1,0 +1,31 @@
+# ============================================================
+# AI 3D Forge —— Git 换行与二进制约定
+# ------------------------------------------------------------
+# 本仓库里所有文本文件在**工作区里就是 LF**（实测：git add 时给出
+# "LF will be replaced by CRLF" 的警告，说明默认的 core.autocrlf 会在下次
+# 检出时把整仓改成 CRLF）。那会造成两个后果：
+#   1. 不同机器上 clone 出来的文件内容不一致，"整仓都是改动"的 diff 抖动；
+#   2. 本项目的源码包/安装包校验基于文件字节，换行漂移会让对照变得没有意义。
+# 所以这里明确钉死：仓库内与检出后**一律 LF**。
+#
+# 例外：Windows 批处理的 .bat/.cmd 历史上对 LF 敏感（个别解析器会把整行读成
+# 一条命令），这类文件保持 CRLF。本项目当前没有 .bat/.cmd，写上是为了以后。
+# ============================================================
+
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制资源：绝不做换行转换（做了就损坏）
+*.ico binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.webp binary
+*.zip binary
+*.exe binary
+*.stl binary
+*.3mf binary
+*.woff binary
+*.woff2 binary

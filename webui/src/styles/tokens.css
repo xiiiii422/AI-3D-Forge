@@ -1,0 +1,146 @@
+/* ==================================================================
+   AI 3D Forge —— 设计令牌（docs/API-CONTRACT.md §7.1）
+   气质：OpenAI / Apple / Xiaomi。大留白、1px 描边、极轻阴影、近黑主按钮。
+   规则：应用层样式只允许引用本文件的变量，不得写死颜色/圆角/动效时长。
+   ================================================================== */
+
+:root {
+  /* ---------- 底色与文字 ---------- */
+  --bg: #ffffff; /* 页面底色 */
+  --bg-sub: #fafafa; /* 次级底色（分组、侧栏） */
+  --surface: #ffffff; /* 卡片面 */
+  --surface-2: #f5f5f7; /* 卡片内嵌块 / 输入框 */
+  --text: #0d0d0d;
+  --text-2: #6e6e73; /* Apple 灰 */
+  /* 三级文字：原 #8e8e93 在实测中只有 3.26:1（白底）/ 3.12:1（--bg-sub），
+     低于正文所需的 4.5:1 —— 项目里用于向导步骤、项目时间、淡提示等真实文字。
+     现值在最苛刻的背景（--surface-2 #f5f5f7）上也有 4.60:1。 */
+  --text-3: #6f6f73;
+  --text-inverse: #ffffff;
+
+  /* ---------- 描边 ---------- */
+  --line: #ececec; /* 1px 描边 */
+  --line-strong: #dcdce0;
+
+  /* ---------- 主色 ---------- */
+  --accent: #111111; /* 近黑按钮，OpenAI 风 */
+  --accent-hover: #2a2a2a;
+  --accent-active: #000000;
+  --brand: #ff6a00; /* 小米橙：**仅**用于进度/焦点/选中描边（非文字、非大面积填充） */
+  --brand-soft: rgba(255, 106, 0, 0.1);
+  --brand-line: rgba(255, 106, 0, 0.35);
+  /* 品牌色作为**文字**：原实现直接把 --brand 当文字用，实测白底上只有 2.87:1。
+     这个值在白底 5.12 / --bg-sub 4.91 / --surface-2 4.70，都过 4.5。 */
+  --brand-text: #b84d00;
+  /* 品牌色作为**填充**：白字压在原 #ff6a00 上只有 2.87:1（深色主题 2.61:1）。
+     现值与白字 5.12:1。角色分开之后，以后调文字色不会再动到按钮底色。 */
+  --brand-solid: #b84d00;
+  --brand-on-solid: #ffffff; /* 压在 --brand-solid 上的文字 */
+
+  /* ---------- 状态色（除 brand 之外唯一允许的彩色，语义固定） ---------- */
+  --ok: #1a7f4b;
+  --ok-soft: rgba(26, 127, 75, 0.1);
+  /* 原 #b26a00 白底 4.24:1，差一点点没过 4.5 —— 用于 .pill-warn 这种真实文字。
+     现值白底 5.15 / --bg-sub 4.94 / --surface-2 4.73。 */
+  --warn: #9f5e00;
+  --warn-soft: rgba(178, 106, 0, 0.1);
+  --danger: #c0392b;
+  --danger-soft: rgba(192, 57, 43, 0.09);
+
+  /* ---------- 圆角 ---------- */
+  --r-card: 16px;
+  --r-btn: 10px;
+  --r-pill: 999px;
+  --r-sm: 8px;
+
+  /* ---------- 字体 ---------- */
+  --font: -apple-system, 'SF Pro Text', 'Segoe UI Variable Text', 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei UI', system-ui, sans-serif;
+  --font-mono: 'Cascadia Mono', 'SF Mono', Consolas, 'Courier New', monospace;
+
+  /* ---------- 字号 / 行高 ---------- */
+  --fs-hero: 40px;
+  --fs-h1: 26px;
+  --fs-h2: 19px;
+  --fs-h3: 15px;
+  --fs-body: 14px;
+  --fs-sm: 13px;
+  --fs-xs: 12px;
+  --lh: 1.6;
+
+  /* ---------- 留白（模块间距 24 / 32） ---------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+  --sp-8: 64px;
+
+  /* ---------- 阴影：极轻，不重投影 ---------- */
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.06);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-pop: 0 2px 6px rgba(0, 0, 0, 0.06), 0 16px 40px rgba(0, 0, 0, 0.1);
+
+  /* ---------- 动效：160ms，禁止弹跳、禁止 >400ms ---------- */
+  --dur: 160ms;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --t: var(--dur) var(--ease);
+
+  /* ---------- 焦点环 ---------- */
+  --ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--brand);
+
+  /* ---------- 结构尺寸 ---------- */
+  --topbar-h: 56px;
+  --sidebar-w: 264px;
+  --panel-w: 400px;
+  --viewer-bg: #f2f3f5; /* 预览台中性底（三点布光的台面） */
+}
+
+/* ==================================================================
+   深色主题：同一套语义令牌换值，应用层代码零改动
+   ================================================================== */
+:root[data-theme='dark'] {
+  --bg: #0b0b0f;
+  --bg-sub: #121218;
+  --surface: #141419;
+  --surface-2: #1c1c23;
+  --text: #f5f5f7;
+  --text-2: #a1a1aa;
+  /* 原 #7c7c85 在 --surface-2 #1c1c23 上只有 4.44:1；现 4.95:1（surface 5.37 / bg 5.74） */
+  --text-3: #8a8a93;
+  --text-inverse: #0b0b0f;
+
+  --line: #26262e;
+  --line-strong: #34343d;
+
+  --accent: #f5f5f7;
+  --accent-hover: #ffffff;
+  --accent-active: #e5e5ea;
+  --brand: #ff7a1a;
+  --brand-soft: rgba(255, 122, 26, 0.14);
+  --brand-line: rgba(255, 122, 26, 0.4);
+  /* 深色下品牌色当文字反而很稳（7.2~8.4:1）；当填充要压暗，白字才有 4.76:1 */
+  --brand-text: #ff8a3d;
+  --brand-solid: #b85712;
+  --brand-on-solid: #ffffff;
+
+  --ok: #4ec98a;
+  --ok-soft: rgba(78, 201, 138, 0.14);
+  --warn: #e0a33a;
+  --warn-soft: rgba(224, 163, 58, 0.14);
+  --danger: #f07167;
+  --danger-soft: rgba(240, 113, 103, 0.14);
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.35);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-pop: 0 2px 6px rgba(0, 0, 0, 0.5), 0 16px 40px rgba(0, 0, 0, 0.5);
+  --viewer-bg: #1a1a20;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur: 1ms;
+  }
+}

@@ -36,8 +36,15 @@ if not (WEBUI_DIST / "index.html").is_file():
 datas.append((str(WEBUI_DIST), "webui"))
 
 # 用户说明文档随程序附带，方便用户在安装目录里直接查看
-for doc in ("README-用户.md", "README-开发者.md", "README.md"):
+for doc in ("README-用户.md", "README-开发者.md", "README.md", "LICENSE", "CHANGELOG.md"):
     candidate = ROOT / doc
+    if candidate.is_file():
+        datas.append((str(candidate), "docs"))
+
+# 完整用户指南与开发者上手文档也在 docs/ 里，随程序一起带上，
+# 这样 README-用户.md 里那句「完整说明见 docs/USER_GUIDE.md」在安装目录里也点得开。
+for doc in ("USER_GUIDE.md", "DEVELOPMENT.md", "LICENSE-THIRD-PARTY.txt"):
+    candidate = ROOT / "docs" / doc
     if candidate.is_file():
         datas.append((str(candidate), "docs"))
 

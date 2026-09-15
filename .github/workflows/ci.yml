@@ -1,0 +1,111 @@
+name: CI
+
+# 这里刻意只跑「不需要任何密钥、不需要人工环境」的检查：
+#   * 不调用真实 DeepSeek API（避免产生费用）
+#   * 不跑端到端验收与安装包验收（需要 OpenSCAD、真实 Key 和可安装软件的 Windows）
+# 那两项请在本地按 docs/DEVELOPMENT.md 跑。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) 开源合规：文件完整性 + 密钥/隐私扫描（含 Git 历史）+ Python 语法
+  # ---------------------------------------------------------------------------
+  audit:
+    name: 开源合规与语法
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 历史扫描需要完整历史
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: 开源文件完整性
+        run: python scripts/check_oss_files.py
+
+      - name: 密钥与隐私扫描（当前文件 + Git 历史）
+        run: python scripts/check_no_secrets.py --history
+
+      - name: Python 语法与导入路径
+        run: |
+          python -m compileall -q src scripts main.py
+          python - <<'PY'
+          import ast, pathlib, sys
+          bad = []
+          for path in list(pathlib.Path('src').rglob('*.py')) + list(pathlib.Path('scripts').rglob('*.py')):
+              try:
+                  ast.parse(path.read_text(encoding='utf-8'))
+              except SyntaxError as exc:
+                  bad.append(f'{path}: {exc}')
+          if bad:
+              print('\n'.join(bad)); sys.exit(1)
+          print('Python 语法检查通过')
+          PY
+
+      - name: 仓库里没有生成物 / 本机路径
+        run: python scripts/check_no_secrets.py --paths-only
+
+  # ---------------------------------------------------------------------------
+  # 2) 后端离线自检（Windows：本项目只面向 Windows）
+  # ---------------------------------------------------------------------------
+  backend-offline:
+    name: 后端离线自检（Windows）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 后端离线自检（跳过依赖 OpenSCAD/图形界面/网络的检查）
+        # 跳过的项会逐条打印 [SKIP] 与原因，并单独计数 —— 不会混进"通过"。
+        # 完整 45 项请在本地带 OpenSCAD 的机器上跑（见 docs/DEVELOPMENT.md）。
+        run: python scripts/selfcheck.py --offline
+
+  # ---------------------------------------------------------------------------
+  # 3) 前端：类型检查 + 构建
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: 前端构建
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webui
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npx tsc --noEmit
+
+      - name: 构建
+        run: npm run build

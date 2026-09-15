@@ -1,0 +1,36 @@
+# 依赖自动更新（Dependabot）
+#
+# 为什么开：这个项目对"别人 clone 下来能不能跑"有硬要求，
+# 依赖长期不更新会同时带来安全风险和兼容性问题。
+# 但**不自动合并**：PyInstaller 打包产物与第三方许可证清单都需要人工复核
+# （改了依赖要重跑 scripts/list_dependencies.py 并同步 docs/LICENSE-THIRD-PARTY.txt）。
+
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(py)"
+    labels: ["dependencies"]
+
+  - package-ecosystem: npm
+    directory: "/webui"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(web)"
+    labels: ["dependencies"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "deps(ci)"
+    labels: ["dependencies"]

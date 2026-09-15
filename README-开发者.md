@@ -443,7 +443,7 @@ PyInstaller 打包 → **打包产物冒烟测试** → 生成安装包。
 - [ ] `AIFORGE_CHANNEL` 设置为 `release`
 - [ ] `src/aiforge/version.py` 里的 `APP_VERSION` 已递增
 - [ ] `installer/AI-3D-Forge.iss` 里的 `#define AppVersion` 已同步（**容易漏！**）
-- [ ] `scripts/selfcheck.py` 全绿（45 项，含设计机制 131 项子检查）
+- [ ] `scripts/selfcheck.py` 全绿（47 项，含设计机制 131 项子检查）
 - [ ] **克隆冒烟**：把提交集导出/克隆到项目**之外**，用它自己的
       `scripts/selfcheck.py` 跑一遍全绿（验证「别人 clone 下来能用」；
       全新 clone 里没有 `webui/dist`，自检会走「界面未构建」那一支 —— 见 §67）
@@ -467,17 +467,29 @@ PyInstaller 打包 → **打包产物冒烟测试** → 生成安装包。
       作业不能因为切页被停掉 —— 见 §69）
 - [ ] 三支界面体检脚本在**服务没起来**时必须报 `*_UNREACHABLE` 并以 2 退出，
       而不是把连接错误算成"发现 N 个问题"（见 §69 的坑 1）
-- [ ] `.\scripts\export_source.ps1` 通过（含密钥安全门禁）
+- [ ] `.\scripts\export_source.ps1` 通过（含密钥安全门禁 + 必需文件检查；
+      顶层是**允许清单**，被排除的意外目录会明确告警 —— 见 §70）
 - [ ] `.\scripts\build.ps1` 完整通过，冒烟测试无意外 ✗
 - [ ] `scripts\verify_delivery.py` 全部齐备
 - [ ] `build\venv\Scripts\python.exe scripts\list_dependencies.py` 能跑通，
-      `docs\LICENSE.txt` 的第三方清单与之**一致**（改过依赖必须重跑）
+      `docs\LICENSE-THIRD-PARTY.txt` 的第三方清单与之**一致**（改过依赖必须重跑）
 - [ ] 在**干净的 Windows** 上实测：安装 → 启动 → 自动装 OpenSCAD → 生成 → 改尺寸 → 下载 → 卸载 → 重装（数据仍在）
 
 ### 开源发布前检查（GitHub 安全门禁）
 
-- [ ] **没有提交任何密钥**：`git grep -nE 'sk-[0-9a-f]{20,}'` 无输出；
-      密钥只存在于 Windows 凭据管理器 / 环境变量，绝不进仓库
+两条命令覆盖大部分内容（CI 也会跑，见 `.github/workflows/ci.yml`）：
+
+```powershell
+& build\venv\Scripts\python.exe scripts\check_oss_files.py             # 文件与链接完整性
+& build\venv\Scripts\python.exe scripts\check_no_secrets.py --history  # 密钥/隐私（含 Git 历史）
+```
+
+- [ ] **开源文件完整性**：`check_oss_files.py` 报 `OSS_FILES_OK`
+      （33 个必需文件、README 的 10 个要点、相对链接不断链）
+- [ ] **没有提交任何密钥**（API Key / Token / 口令 / Cookie / `.env`）：
+      `check_no_secrets.py --history` 报 `NO_SECRET_FOUND`。
+      `--history` 不可省：密钥"提交过又删掉"时，当前文件是干净的，
+      但 `git log -p` 里还留着，任何人 clone 都能翻出来
 - [ ] `.gitignore` 生效：`git status --porcelain -uall` 里**不含** `build/`、
       `installer/Output/`、`webui/scripts/shots/`、`node_modules`、`__pycache__`
 - [ ] 仓库里没有本机绝对路径（`C:\Users\<用户名>`、个人目录）。
@@ -488,35 +500,35 @@ PyInstaller 打包 → **打包产物冒烟测试** → 生成安装包。
       （规则本身不硬编码任何路径，否则规则自己就是泄漏）；
       正斜杠和 JS 转义写法（`D:/...`、`C:\\Users\\...`）都覆盖 ——
       第一版靠肉眼查漏了两处正斜杠写法，靠 `D:\` 反斜杠搜索是查不出来的
-- [ ] 提交集里的文本文件编码完好：无 BOM、无 U+FFFD、无 GBK 乱码字符
-      （`scripts\selfcheck.py` 的「源码编码完好」，126 个文件全扫）
-- [ ] `docs/LICENSE.txt` 的第三方清单与 `scripts/list_dependencies.py` 输出一致
+- [ ] 提交集里的文本文件编码完好、行尾统一为 LF：无 BOM、无 U+FFFD、无 GBK 乱码字符
+      （`scripts\selfcheck.py` 的「源码编码完好」）
+- [ ] `docs/LICENSE-THIRD-PARTY.txt` 的第三方清单与 `scripts/list_dependencies.py` 输出一致
       （含 MPL-2.0 的 certifi、Apache-2.0 的 python-multipart、
       PyInstaller 引导程序例外条款）
-- [ ] **为本项目选定一个开源许可证**（当前 `docs/LICENSE.txt` 只声明了
-      第三方组件与免责条款，**没有给出本项目自身的授权**；
-      没有授权时他人默认无权使用/修改/再分发）。
-      选定后放到仓库根目录 `LICENSE`，GitHub 才能识别
+- [ ] **许可证已就位**：仓库根目录 `LICENSE` 是 MIT 全文，README 标注 MIT，
+      安装向导（`LicenseFile=..\LICENSE`）展示的也是它 —— 见 §70
+- [ ] 仓库目录（`AI-3D-Forge-GitHub`）与开发树同步且工作区干净：
+      `git status --porcelain -uall` 无输出
 
 ### 本地已验证基线（供对照，换机器后请重跑）
 
 | 项目 | 结果 |
 |---|---|
-| 后端自检 | 45/45 通过（含设计规格与改动机制 131 项子检查、模块引用静态检查、依赖声明完整性、模型外观复核、并发作业守卫、破网格修复触发与排序、STL 读取健壮性、长分析心跳、助手调用作用域、子进程不变量守护、换安装目录可回滚、进度可信度、网络失败可读且可重试、安装失败不破坏已有环境、验收脚本不覆盖用户配置、开源卫生两查） |
+| 后端自检 | 47/47 通过（含设计规格与改动机制 131 项子检查、模块引用静态检查、依赖声明完整性、模型外观复核、并发作业守卫、破网格修复触发与排序、STL 读取健壮性、长分析心跳、助手调用作用域、子进程不变量守护、换安装目录可回滚、进度可信度、网络失败可读且可重试、安装失败不破坏已有环境、验收脚本不覆盖用户配置、开源卫生两查） |
 | 端到端验收（真实 DeepSeek） | 76/76 通过（含规格确认关卡、只改点名项、越界自动缩放、AI 复核、图片复核、进度条实测轨迹） |
 | 端到端机制证据 | 12/12 命中（`verify_e2e_evidence.py`） |
 | 安装包验收 | 通过（46 项：首启准备日志、图标、版本元数据、静默卸载不挂起、升级不产生重复卸载项、重装后项目仍可读；跑完真实 `config.json`/`printers.json` 的 SHA-256 与运行前一致，测试项目零残留） |
-| 克隆冒烟（别人的机器） | 通过（把提交集克隆到项目之外，用它自己的 `scripts/selfcheck.py` 跑：**45/45**；界面未构建时走「首页 503 + npm run build 提示」那一支） |
+| 克隆冒烟（别人的机器） | 通过（把提交集克隆到项目之外，用它自己的 `scripts/selfcheck.py` 跑：**47/47**；界面未构建时走「首页 503 + npm run build 提示」那一支） |
 | 界面布局体检 / 规格卡片体检 | 10 组 + 4 组，全部 0 缺陷（含「停止后发送键恢复可点」） |
 | 真实后端停止验证 | 通过（`webui/scripts/verify-cancel-real.mjs`） |
 | 连点两次发送 | 通过（`webui/scripts/verify-double-send.mjs`：空窗期内再敲一次仍只发 1 个作业） |
 | 卡死看门狗 | 通过（`webui/scripts/verify-stall-watchdog.mjs`：真的发取消请求；等待确认时不谎报、不清卡片） |
 | 前端机型功能验收 | 23/23 通过（`webui/scripts/verify-printers.mjs`） |
 | 依赖声明完整性 | Python 6 个第三方模块 + 前端 4 个包，全部有声明 |
-| 仓库待提交体积 | 123 个文件 / 约 1.6 MB（`build/` 全部被忽略，实测避免了 25 MB+ 生成物） |
+| 仓库待提交体积 | 154 个文件 / 约 1.9 MB（`build/` 全部被忽略，实测避免了 25 MB+ 生成物） |
 | 程序本体体积 | 38.5 MB |
 | 安装包体积 | 16.1 MB |
-| 源码包体积 | 3.7 MB |
+| 源码包体积 | 4.2 MB |
 | 冷启动到界面可用 | 约 3 秒 |
 | WebView2 检测耗时 | 约 0.1 ms（打开窗口前同步执行，必须极快） |
 | OpenSCAD 复用已有安装 | 约 1.6 秒（不做任何下载） |
@@ -2297,7 +2309,7 @@ assert favicon.status_code == 204, favicon.status_code
 "仓库是不是被放在 build/ 之类的被跳过目录下了？"。
 
 **验证**：把仓库克隆到**项目之外**（用一个独立的克隆目录），
-用它自己的 `scripts/selfcheck.py` 跑 —— **45/45 通过**，
+用它自己的 `scripts/selfcheck.py` 跑 —— **47/47 通过**，
 且结果里明确写着「界面未构建：首页 503 且提示 npm run build（clone 后属正常）」。
 真正的"别人 clone 能不能用"就是这个样子验的，见
 [docs/PUBLISH-TO-GITHUB.md](docs/PUBLISH-TO-GITHUB.md) 第五节。
@@ -2438,10 +2450,94 @@ mock 后端在客户端断开 SSE 时把作业 `abort`（真后端不会，作�
    （真机形态）。顺带把 `read_version` / `run_cli` / 冒烟测试三处 OpenSCAD 调用
    也接到了 `procguard`，它们现在同样登记在册、应用退出时会被一起收走。
 
-**验证汇总**：后端自检 **45/45**（新增「进度可信度」「网络失败可读且可重试」
-「换安装目录可回滚」）；端到端 **76/76**（新增 5 项进度实测断言与 2 项字段检查）；
+**验证汇总**：后端自检 **47/47**（新增「进度可信度」「网络失败可读且可重试」
+「换安装目录可回滚」「开源文件完整性」「敏感信息扫描」）；端到端 **76/76**
+（新增 5 项进度实测断言与 2 项字段检查）；
 布局体检 0 问题；规格卡片体检 0 问题；界面规范体检 `INTERFACE_AUDIT_OK`；
 作业切页存活 `JOB_NAV_OK`；孤儿进程双向实验通过；负向对照 `NEGCTL_OK`。
+
+---
+
+### 70. 按「可直接 push 的商用开源仓库」标准补齐门面与合规守卫
+
+用户要求把这个项目整理成一个**能直接 `git push` 的完整开源仓库**：补齐开源文件、
+清理敏感信息、并借鉴成熟项目的做法。核心功能一行没动 —— 这一节全部是
+**门面、文档与自动化守卫**。
+
+**补了什么**（都在开发树里写，再镜像到仓库目录，见 `docs/PUBLISH-TO-GITHUB.md` §八）：
+
+| 文件 | 作用 |
+|---|---|
+| `LICENSE` | MIT 全文（用户明确选定）；安装向导也改为展示它 |
+| `README.en.md` | 英文版门面（中文版 `README.md` 保留为默认，两版顶部互相跳转） |
+| `README.md` | 重写为**面向 GitHub 访客**：是什么 / 功能 / 工作流 / 系统要求 / 安装 / DeepSeek 配置 / OpenSCAD 配置 / 如何运行 / 打印能力 / 截图 / 隐私 / 技术栈 / FAQ / 贡献 / 许可。删掉了原来的"交付清单（对照需求第 N 节）"这类**内部验收口吻** |
+| `SECURITY.md` | 漏洞反馈渠道（私密通道优先）、处理时限、**安全边界表**、不在范围内的事项 |
+| `CONTRIBUTING.md` | 开发流程、提交前必跑命令、按改动类型追加的验证、PR 要求、四条红线 |
+| `CODE_OF_CONDUCT.md` | Contributor Covenant 2.1 改编 |
+| `CHANGELOG.md` | 1.0.0 的功能清单与**已知限制**（含"倾斜模型的实测高度约为标称 82%~95%"） |
+| `docs/USER_GUIDE.md` | 完整用户指南（原 `README-用户.md` 的正文 + 目录 + 系统要求 + 截图位置） |
+| `docs/DEVELOPMENT.md` | 开发者最短路径：搭建 / 运行 / 测试矩阵 / 构建 / CI / 文档地图 / 七条规矩 |
+| `README-用户.md` | 改成**一页纸快速上手**（装→配→用→打），细节指向 `docs/USER_GUIDE.md`（避免两份长文各说各话） |
+| `docs/LICENSE-THIRD-PARTY.txt` | 由 `docs/LICENSE.txt` 改名，**第三方清单原样保留**，只把"本软件"一节改成指向 MIT 的 `LICENSE` |
+| `.github/workflows/ci.yml` | 三个作业：开源合规+语法（ubuntu）、后端离线自检（windows）、前端构建（ubuntu） |
+| `.github/ISSUE_TEMPLATE/*`、`pull_request_template.md`、`dependabot.yml` | Issue/PR 模板与依赖更新（不自动合并：许可证清单要人工同步） |
+| `docs/images/*` | 三张 README 截图（欢迎页 / 生成中 / 结果页） |
+
+**顺带修正的引用**：改名 `docs/LICENSE.txt` 影响到安装器（`LicenseFile` 与开始菜单）、
+`make_release.ps1`、`make_release_docs.py`、`list_dependencies.py`、`export_source.ps1`、
+`verify_delivery.py`、`AI-3D-Forge.spec` —— 全部同步更新，并新增/Renamed 的文档一起
+纳入**源码包必需文件**清单（`export_source.ps1` 缺一个就 `exit 1`）。
+
+**新增两支自动化守卫**（CI 与本地自检都会跑）：
+
+1. `scripts/check_oss_files.py` —— 开源文件完整性：
+   33 个必需文件是否存在、README 是否覆盖 10 个要点（MIT/Windows/DeepSeek/OpenSCAD/
+   截图/贡献/安全/两份 docs 入口…）、**相对链接是否断链**（脚本会跳过 GitHub 页面型链接）。
+2. `scripts/check_no_secrets.py` —— 敏感信息扫描：API Key 形状、长令牌、`Authorization`/
+   `Cookie`/`password` 字面量、私钥块、带口令连接串、`.env` 类文件、
+   本机绝对路径、不该提交的生成物；`--history` 会**再把 Git 历史整个过一遍**
+   （只扫新增行 —— 密钥"提交过又删掉"是最典型的翻车方式）。
+
+**为什么守卫必须自己先被证明有效**：另写了 `build/work/negctl_oss.py`，
+逐个制造违规并确认守卫真的变红：API Key 写进文档、本机路径写进文档、删掉 LICENSE、
+README 断链、`.env` 混进提交集；再反向确认 `.gitignore` 生效
+（已存在的 `webui/dist` 不在扫描集里）。六条全绿才算数。
+
+**这一步自己踩到的三个坑**（都由守卫当场抓到，不是事后发现）：
+
+1. 写 `docs/PUBLISH-TO-GITHUB.md` 时顺手写了开发树的**绝对路径** ——
+   `check_no_secrets.py` 立刻报「含本仓库绝对路径」。改成 `<项目目录>` 占位符。
+   （这正是 §67 那条老坑的复发，说明"靠人记住"不如"写成守卫"。）
+2. 路径规则最初只认 `.env` 开头的文件，`docs/leaked.env` 这种 `*.env` 漏掉了 ——
+   负向对照当场发现"守卫是假的"，于是把规则扩成 `.env*` 与 `*.env` 两种写法。
+3. 改了计数（45 → 47 项）之后，用 `Get-Content | Set-Content` 批量替换会**加 BOM**
+   （§54 的复发）；这次改用 `[System.IO.File]::WriteAllBytes/WriteAllText` +
+   `UTF8Encoding($false)`，并用自检的「源码编码完好」确认无 BOM。
+
+**验证**：后端自检 **47/47**（新增「开源文件完整性」「敏感信息扫描」）；
+`check_oss_files.py` `OSS_FILES_OK`（33/33 文件、10/10 要点、76 条相对链接）；
+`check_no_secrets.py` `NO_SECRET_FOUND`（156 个文本文件 + 165 个路径，
+**含 Git 历史**：仓库里 3 个提交的完整补丁）；
+负向对照 `NEGCTL_OK`（6/6）；`selfcheck.py --offline` 32 通过 / 13 跳过 / 0 失败
+（跳过项逐条打印原因，**不混进通过**）；
+**把仓库 clone 到项目之外**跑它自己的自检：**47/47**；
+安装包验收 **46/46**（安装向导改为展示 MIT 许可证；发布目录新增 `docs\USER_GUIDE.md`，
+快速上手里的相对链接在发布包里点得开）；
+`build.ps1` 全流程通过（前端 837.9 KB → 安装包 16.2 MB）；
+`make_release.ps1` + `verify_delivery.py` 22/22。
+
+**又一个"守卫救了一次"的实例**：第一次克隆冒烟把 clone 放在了 `build\work\` 下，
+两条卫生守卫立刻报 `只扫到 0 个提交文本文件，明显不对` —— 因为它们**故意**跳过
+路径里带 `build` 的文件（构建产物本来就不该被扫）。
+这正是它们该有的行为（宁可不通过，也不假装扫过），排查方法写进了
+`docs/PUBLISH-TO-GITHUB.md` 第五节。
+
+**还修掉一个"会把无关代码带进公开仓库"的设计缺陷**：`export_source.ps1` 原本是
+"拷贝一切、排除黑名单"。这次实测发现工作目录里多出了两个**与本项目无关**的目录
+（`preview/`、`shiro3d/`，不是我建的），它们被直接导进了源码包，
+再镜像就会进公开仓库 —— 无关代码可能有自己的许可证，也可能带密钥。
+现在顶层改成**允许清单**：只读 `src/webui/scripts/docs/installer/.github` 与
+已知的根文件，被排除的顶层项会明确告警（"Not part of this project, excluded: …"）。
 
 ---
 

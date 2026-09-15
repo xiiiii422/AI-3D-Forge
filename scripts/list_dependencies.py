@@ -1,6 +1,6 @@
 """列出「实际随程序分发」的第三方依赖、版本与许可证。
 
-用途：`docs/LICENSE.txt` 里的第三方清单必须以这个脚本的输出为准，
+用途：`docs/LICENSE-THIRD-PARTY.txt` 里的第三方清单必须以这个脚本的输出为准，
 不要手抄 —— 手工维护的清单一定会随着依赖升级而悄悄过期，
 而许可证漏标是实打实的合规问题（例如 certifi 是 MPL-2.0，
 必须给出归属，不能因为它只是传递依赖就省略）。
@@ -166,7 +166,7 @@ def main() -> int:
               f"{'、'.join(r['name'] for r in missing)}")
         print("       请先 pip install -r requirements.txt 再重新生成。")
         return 1
-    print("\n提示：docs/LICENSE.txt 里的第三方清单应与本输出一致；"
+    print("\n提示：docs/LICENSE-THIRD-PARTY.txt 里的第三方清单应与本输出一致；"
           "改依赖后请重新生成并更新文档。")
     return 0
 

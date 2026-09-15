@@ -9,8 +9,9 @@
       AI-3D-Forge-Setup.exe         the one-click installer
       CHECKSUMS.txt                 SHA-256, so the recipient can verify the file
       release-info.txt              build metadata for support
-      README-<localized>.md         the full user guide
-      LICENSE.txt                   licence and third-party components
+      README-<localized>.md         the quick-start guide
+      LICENSE                       the project licence (MIT)
+      LICENSE-THIRD-PARTY.txt       third-party components and their licences
       LICENSE-OpenSCAD-GPLv2.txt    OpenSCAD's GPLv2 text (required: we install it)
       <localized guide>.txt         written by make_release_docs.py
 
@@ -86,12 +87,32 @@ Get-ChildItem $Root -Filter 'README-*.md' -File | ForEach-Object {
     Copy-Item $_.FullName (Join-Path $Release $_.Name) -Force
     $copied++
 }
-foreach ($name in @('LICENSE.txt', 'LICENSE-OpenSCAD-GPLv2.txt')) {
+foreach ($name in @('LICENSE-THIRD-PARTY.txt', 'LICENSE-OpenSCAD-GPLv2.txt')) {
     $source = Join-Path $Root "docs\$name"
     if (Test-Path $source) {
         Copy-Item $source (Join-Path $Release $name) -Force
     } else {
         Write-Warn "Missing document, skipped: $name"
+    }
+}
+# The project licence itself (MIT) sits at the repository root, not in docs\.
+$licence = Join-Path $Root 'LICENSE'
+if (Test-Path $licence) {
+    Copy-Item $licence (Join-Path $Release 'LICENSE') -Force
+} else {
+    Write-Warn 'Missing document, skipped: LICENSE'
+}
+# The quick-start README links to docs/<guide>, so the full guides have to travel
+# with it in the same relative layout (otherwise the link is dead for the user who
+# only received the release folder).
+$docsOut = Join-Path $Release 'docs'
+New-Item -ItemType Directory -Force -Path $docsOut | Out-Null
+foreach ($name in @('USER_GUIDE.md', 'DEVELOPMENT.md', 'OPENSCAD-SOURCES.md')) {
+    $source = Join-Path $Root "docs\$name"
+    if (Test-Path $source) {
+        Copy-Item $source (Join-Path $docsOut $name) -Force
+    } else {
+        Write-Warn "Missing document, skipped: docs\$name"
     }
 }
 if ($copied -lt 1) { Write-Warn 'No localized README was found to copy.' }
@@ -180,21 +201,26 @@ $actual = (Get-FileHash (Join-Path $Release 'AI-3D-Forge-Setup.exe') -Algorithm 
 $checksumText = Get-Content (Join-Path $Release 'CHECKSUMS.txt') -Raw
 if ($checksumText -notlike "*$actual*") { $failures += 'CHECKSUMS.txt does not match the installer' }
 
-foreach ($required in @('LICENSE.txt', 'LICENSE-OpenSCAD-GPLv2.txt', 'CHECKSUMS.txt', 'release-info.txt')) {
+foreach ($required in @('LICENSE', 'LICENSE-THIRD-PARTY.txt', 'LICENSE-OpenSCAD-GPLv2.txt', 'CHECKSUMS.txt', 'release-info.txt')) {
     if (-not (Test-Path (Join-Path $Release $required))) { $failures += "missing document: $required" }
 }
+# The quick-start guide links into docs\ -- make sure those targets really shipped.
+foreach ($name in @('USER_GUIDE.md', 'DEVELOPMENT.md')) {
+    if (-not (Test-Path (Join-Path $Release "docs\$name"))) { $failures += "missing document: docs\$name" }
+}
 
-# The localized user guide is matched by wildcard (see the note above about
-# Chinese filenames in an ASCII-only script).
+# The localized quick-start guide is matched by wildcard (see the note above about
+# Chinese filenames in an ASCII-only script). It is deliberately short now -- the
+# full guide lives in docs\ -- so the threshold only catches a truncated copy.
 $localizedReadme = @(Get-ChildItem $Release -Filter 'README-*.md' -File)
 if ($localizedReadme.Count -lt 1) {
     $failures += 'missing the localized user guide'
-} elseif ($localizedReadme[0].Length -lt 3000) {
+} elseif ($localizedReadme[0].Length -lt 1500) {
     $failures += "the localized user guide looks truncated ($($localizedReadme[0].Length) bytes)"
 }
 
 # The Chinese guide is matched by wildcard so this script stays ASCII-only.
-$guide = @(Get-ChildItem $Release -Filter '*.txt' | Where-Object { $_.Name -notin @('CHECKSUMS.txt', 'release-info.txt', 'LICENSE.txt', 'LICENSE-OpenSCAD-GPLv2.txt') })
+$guide = @(Get-ChildItem $Release -Filter '*.txt' | Where-Object { $_.Name -notin @('CHECKSUMS.txt', 'release-info.txt', 'LICENSE-THIRD-PARTY.txt', 'LICENSE-OpenSCAD-GPLv2.txt') })
 if ($guide.Count -lt 1) {
     $failures += 'missing the Chinese install guide'
 } elseif ($guide[0].Length -lt 2000) {

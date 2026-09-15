@@ -38,9 +38,35 @@ os.environ.setdefault("AIFORGE_PROJECTS_DIR", str(ROOT / "build" / "work" / "tes
 
 PASSED: list[str] = []
 FAILED: list[tuple[str, str]] = []
+SKIPPED: list[tuple[str, str]] = []
+OFFLINE = False
+
+# `--offline` 时跳过的检查：需要真实 OpenSCAD 二进制、Windows 注册表/图形界面，
+# 或者会访问网络。CI（ubuntu / 无 OpenSCAD 的 windows）用这个模式。
+# 注意：跳过的项会**单独计数并逐条打印原因**，绝不混进"通过"。
+OFFLINE_SKIPS: dict[str, str] = {
+    "WebView2 运行时检测": "需要 Windows 注册表与系统组件",
+    "应用图标资源": "图标由 build.ps1 生成，离线环境没有构建产物",
+    "打包依赖完整性": "需要构建期依赖（PyInstaller 等）",
+    "OpenSCAD 自动安装": "需要下载安装 OpenSCAD（网络 + 约 21MB）",
+    "OpenSCAD 检测与 CLI": "需要本机已安装 OpenSCAD",
+    "STL 网格分析": "需要 OpenSCAD 编译立方体后再分析",
+    "SCAD → STL 编译": "需要 OpenSCAD 把 SCAD 编译成 STL",
+    "安装失败不破坏已有环境": "需要模拟一次真实的 OpenSCAD 安装",
+    "子进程不变量守护": "依赖 Windows 作业对象（非 Windows 上语义不同）",
+    "几何完整性自动修复": "需要真实几何数据（由 OpenSCAD 产出）",
+    "模型外观复核": "需要渲染模型（依赖 OpenSCAD）",
+    "快捷方式解析": "需要 Windows .lnk 解析",
+    "接口响应形状": "部分断言依赖已构建的前端产物 webui/dist",
+}
 
 
 def check(name: str, fn) -> None:
+    if OFFLINE and name in OFFLINE_SKIPS:
+        reason = OFFLINE_SKIPS[name]
+        SKIPPED.append((name, reason))
+        print(f"  [SKIP] {name} —— {reason}（CI 离线模式；发布前请跑完整版）")
+        return
     try:
         result = fn()
         PASSED.append(f"{name}" + (f" —— {result}" if result else ""))
@@ -3412,10 +3438,58 @@ def t_no_personal_paths() -> str:
     return f"{scanned} 个提交文本文件：没有本机用户目录 / 仓库绝对路径"
 
 
+def t_oss_files() -> str:
+    """开源文件完整性（必需文件 / README 要点 / 交叉链接）。
+
+    这两支守卫单独成脚本是为了能在 ubuntu 的 CI 上跑（不依赖 OpenSCAD/Windows），
+    自检里只是把它们也拉进来跑一遍，避免"CI 有、本地没有"的盲区。
+    """
+    import subprocess as _subprocess
+
+    proc = _subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "check_oss_files.py"), "--quiet"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    assert proc.returncode == 0, "开源文件不完整：\n" + output.strip()[-800:]
+    return "必需文件齐全、README 要点覆盖、相对链接不断链"
+
+
+def t_no_secrets() -> str:
+    """密钥 / 令牌 / 口令 / Cookie / 本机路径扫描（当前文件集）。"""
+    import subprocess as _subprocess
+
+    proc = _subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "check_no_secrets.py")],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,
+    )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    assert proc.returncode == 0, "发现敏感信息或不该提交的文件：\n" + output.strip()[-800:]
+    scanned = ""
+    for line in output.splitlines():
+        if "已扫描" in line:
+            scanned = line.strip()
+    return f"未发现密钥/令牌/口令/本机路径（{scanned or '已扫描提交集'}）"
+
+
 def main() -> int:
     # 默认降低日志噪音：自检脚本会故意触发"AI 返回的不是合法 JSON"这类降级路径，
     # 那些是预期行为，不该在构建输出里看起来像错误。加 --verbose 可看完整日志。
     import logging
+
+    global OFFLINE
+
+    OFFLINE = "--offline" in sys.argv or os.environ.get("AIFORGE_SELFCHECK_OFFLINE") == "1"
 
     logging.basicConfig(
         level=logging.DEBUG if "--verbose" in sys.argv else logging.ERROR,
@@ -3424,6 +3498,8 @@ def main() -> int:
 
     print("=" * 70)
     print("AI 3D Forge 后端自检")
+    if OFFLINE:
+        print("（离线模式：跳过需要 OpenSCAD / 图形界面 / 网络的检查，跳过的项逐条列出）")
     print("=" * 70)
 
     section("模块与基础")
@@ -3490,11 +3566,21 @@ def main() -> int:
     check("关键路由与安全拦截", t_http_api)
 
     section("开源与提交卫生")
+    check("开源文件完整性", t_oss_files)
+    check("敏感信息扫描", t_no_secrets)
     check("源码编码完好", t_source_encoding)
     check("无本机路径泄漏", t_no_personal_paths)
 
     print("\n" + "=" * 70)
-    print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
+    if SKIPPED:
+        print(f"通过 {len(PASSED)} 项，跳过 {len(SKIPPED)} 项，失败 {len(FAILED)} 项")
+        print("-" * 70)
+        print("  跳过的项（离线模式；它们**没有**被验证过）：")
+        for name, reason in SKIPPED:
+            print(f"  ○ {name} —— {reason}")
+        print("  发布前请在不带 --offline 的环境跑完整版。")
+    else:
+        print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
     if FAILED:
         print("-" * 70)
         for name, error in FAILED:

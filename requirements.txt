@@ -1,12 +1,21 @@
 # ============================================================
 # AI 3D Forge —— 运行时依赖（开发阶段使用）
 # ------------------------------------------------------------
+# 需要 Python 3.10 或更高版本（开发机实测 3.13）。
+#
 # 开发环境：
 #   python -m venv build\venv
 #   build\venv\Scripts\python -m pip install -r requirements.txt
 #
 # 发布版本：这些依赖全部由 PyInstaller 打进 dist\AI-3D-Forge\，
 #          最终用户机器上「不需要」Python，也不需要执行 pip install。
+#
+# 注意：用 Python 3.8/3.9 建 venv 会在这里失败，报
+#   "No matching distribution found for uvicorn==0.34.0"
+# 这不是依赖写错了，而是 uvicorn 0.34 要求 Python ≥3.9、pydantic 2.10 要求 ≥3.8 且
+# 新版 fastapi 要求 ≥3.8/3.9 不等 —— pip 会把不兼容的版本全部过滤掉，
+# 于是报"找不到版本"。换 3.10+ 的解释器重建 venv 即可（`python -m venv` 用的是
+# PATH 上的 python，很容易踩到现在这台机器上"python 其实是 3.8"的情况）。
 #
 # 说明：刻意保持极少的依赖数量，以缩小安装包体积、减少 C 盘占用
 #      并降低普通用户环境出现 ModuleNotFoundError 的概率。

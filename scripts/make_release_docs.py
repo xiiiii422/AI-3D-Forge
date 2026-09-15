@@ -121,8 +121,9 @@ A：设计模型时需要联网（调用你自己配置的 DeepSeek AI）。已�
 软件内「设置 → 系统诊断」会逐项检查 AI 服务、OpenSCAD、模型生成、
 文件系统、网络等，出问题的地方旁边就有【自动修复】按钮。
 
-详细使用说明见同目录的 README-用户.md。
-许可与第三方组件说明见 LICENSE.txt 与 LICENSE-OpenSCAD-GPLv2.txt。
+详细使用说明见同目录的 README-用户.md（快速上手）与仓库 docs/USER_GUIDE.md（完整指南）。
+本软件采用 MIT 许可证，全文见同目录的 LICENSE；
+随包分发的第三方组件及其许可证见 LICENSE-THIRD-PARTY.txt 与 LICENSE-OpenSCAD-GPLv2.txt。
 """
 
 

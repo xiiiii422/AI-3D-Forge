@@ -52,13 +52,59 @@ $excludeContains = @(
     'aiforge-edge', 'build-manifest.json'
 )
 
+# ---------------------------------------------------------------------------
+# ALLOW-LIST (not a deny-list).
+#
+# Why: this script used to copy "everything except a blocklist". That is fine
+# until the working directory also contains something that is not this project
+# at all -- which is exactly what happened: two unrelated folders appeared next
+# to the sources and got exported, and from there they would have been mirrored
+# into the public repository. Unrelated code can carry its own licence and its
+# own secrets; the open-source package must never pick it up by accident.
+#
+# So the top level is now explicit: only the entries below are read.
+# Anything else is skipped AND reported, so a legitimately new folder is noticed
+# immediately instead of silently missing from the package.
+# ---------------------------------------------------------------------------
+$allowTopDirs = @('src', 'webui', 'scripts', 'docs', 'installer', '.github')
+$allowTopFiles = @(
+    'main.py', 'AI-3D-Forge.spec', 'requirements.txt', 'requirements-build.txt',
+    'README.md', 'README.en.md', 'LICENSE', 'SECURITY.md', 'CONTRIBUTING.md',
+    'CHANGELOG.md', 'CODE_OF_CONDUCT.md', '.gitignore', '.gitattributes'
+)
+# Chinese-named guides are matched by wildcard (this script is ASCII-only).
+$allowTopPatterns = @('README-*.md')
+
 $copied = 0
 $skipped = 0
 $totalBytes = 0
+$outsideProject = @()
+
+function Test-AllowedTopLevel {
+    param([string]$Relative, [string]$Name)
+    $top = $Relative.Split('\')[0]
+    if ($Relative.Contains('\')) {
+        return ($allowTopDirs -contains $top)
+    }
+    if ($allowTopFiles -contains $top) { return $true }
+    foreach ($pattern in $allowTopPatterns) {
+        if ($Name -like $pattern) { return $true }
+    }
+    return $false
+}
 
 Get-ChildItem -Path $Root -Recurse -Force -File | ForEach-Object {
     $full = $_.FullName
     $relative = $full.Substring($Root.Length).TrimStart('\')
+
+    # Allow-list first: anything outside the project's own top-level entries
+    # never enters the package (see the note above the allow-list).
+    if (-not (Test-AllowedTopLevel -Relative $relative -Name $_.Name)) {
+        $top = $relative.Split('\')[0]
+        if ($outsideProject -notcontains $top) { $outsideProject += $top }
+        $skipped++
+        return
+    }
 
     $skip = $false
     foreach ($fragment in $excludeContains) {
@@ -86,6 +132,16 @@ Get-ChildItem -Path $Root -Recurse -Force -File | ForEach-Object {
 }
 
 Write-Ok "Copied $copied files ($([math]::Round($totalBytes/1KB,1)) KB); skipped $skipped"
+
+# Loudly report anything at the top level that is not part of this project.
+# Silence here is how unrelated code ends up in a public repository.
+# Known build/VCS entries are expected and stay quiet; anything else is news.
+$knownNonProject = @('.git', 'build', 'node_modules', '.vscode', '.idea', '__pycache__', '.venv', 'venv')
+$unexpected = @($outsideProject | Where-Object { $knownNonProject -notcontains $_ })
+if ($unexpected.Count -gt 0) {
+    Write-Warn "Not part of this project, excluded from the package: $($unexpected -join ', ')"
+    Write-Warn "If any of those IS part of the project, add it to the allow-list in this script."
+}
 
 # --- Security gate: refuse to ship anything that looks like a real API key --
 # Two patterns:
@@ -129,13 +185,19 @@ Write-Ok 'Security check passed: no full API key in the package'
 # spuriously (this script had exactly that bug).
 $required = @(
     'main.py', 'requirements.txt', 'requirements-build.txt',
-    'AI-3D-Forge.spec', 'README.md',
+    'AI-3D-Forge.spec', 'README.md', 'README.en.md', 'LICENSE',
+    'CONTRIBUTING.md', 'SECURITY.md', 'CHANGELOG.md', 'CODE_OF_CONDUCT.md',
+    '.github\workflows\ci.yml', '.github\pull_request_template.md',
+    '.github\ISSUE_TEMPLATE\bug_report.md', '.github\ISSUE_TEMPLATE\feature_request.md',
+    '.github\dependabot.yml',
     'src\aiforge\app.py', 'src\aiforge\jobs.py', 'src\aiforge\openscad.py',
     'webui\package.json', 'webui\src\App.tsx',
     'installer\AI-3D-Forge.iss',
-    'docs\API-CONTRACT.md', 'docs\OPENSCAD-SOURCES.md', 'docs\LICENSE.txt',
+    'docs\API-CONTRACT.md', 'docs\OPENSCAD-SOURCES.md', 'docs\LICENSE-THIRD-PARTY.txt',
+    'docs\USER_GUIDE.md', 'docs\DEVELOPMENT.md',
     'scripts\build.ps1', 'scripts\build_installer.ps1', 'scripts\selfcheck.py',
-    'scripts\e2e_test.py', 'scripts\test_install.ps1', 'scripts\export_source.ps1'
+    'scripts\e2e_test.py', 'scripts\test_install.ps1', 'scripts\export_source.ps1',
+    'scripts\check_no_secrets.py', 'scripts\check_oss_files.py'
 )
 $missing = @()
 foreach ($item in $required) {

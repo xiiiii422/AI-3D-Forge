@@ -48,7 +48,9 @@ AppPublisher={#AppPublisher}
 DefaultDirName={code:GetDefaultDir}
 DefaultGroupName={#AppName}
 AllowNoIcons=yes
-LicenseFile=..\docs\LICENSE.txt
+; The wizard shows the project licence (MIT). Third-party component licences are
+; shipped alongside it in the install directory (see the [Files] section).
+LicenseFile=..\LICENSE
 OutputDir=Output
 OutputBaseFilename=AI-3D-Forge-Setup
 Compression=lzma2/max
@@ -185,9 +187,13 @@ Source: "..\README-开发者.md"; DestDir: "{app}"; DestName: "README-开发者.
 ; License texts must ship with the product: the app downloads and runs the
 ; OpenSCAD official installer, and OpenSCAD is GPLv2 -- so the GPLv2 full text
 ; plus the source-code pointer has to be included, not just referenced.
-Source: "..\docs\LICENSE.txt"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+; The project's own licence (MIT) ships as well, and the installer wizard shows it.
+Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE"; Flags: ignoreversion
+Source: "..\docs\LICENSE-THIRD-PARTY.txt"; DestDir: "{app}"; DestName: "LICENSE-THIRD-PARTY.txt"; Flags: ignoreversion
 Source: "..\docs\LICENSE-OpenSCAD-GPLv2.txt"; DestDir: "{app}"; DestName: "LICENSE-OpenSCAD-GPLv2.txt"; Flags: ignoreversion
 Source: "..\docs\OPENSCAD-SOURCES.md"; DestDir: "{app}"; DestName: "OPENSCAD-SOURCES.md"; Flags: ignoreversion
+; Full user guide (the quick-start README above points at it)
+Source: "..\docs\USER_GUIDE.md"; DestDir: "{app}\docs"; Flags: ignoreversion skipifsourcedoesntexist
 ; Troubleshooting helper: if the app ever opens in the browser instead of its own
 ; window, this writes a diagnosis report to the Desktop that the user can send.
 Source: "..\scripts\diagnose_native_window.py"; DestDir: "{app}"; DestName: "诊断原生窗口.py"; Flags: ignoreversion
@@ -198,7 +204,7 @@ Name: "{app}\logs"; Permissions: users-modify
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
 Name: "{group}\使用说明"; Filename: "{app}\README-用户.md"; Comment: "阅读使用说明"
-Name: "{group}\许可与第三方组件"; Filename: "{app}\LICENSE.txt"; Comment: "许可与第三方组件说明"
+Name: "{group}\许可与第三方组件"; Filename: "{app}\LICENSE-THIRD-PARTY.txt"; Comment: "许可与第三方组件说明"
 Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: quicklaunchicon

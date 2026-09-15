@@ -33,6 +33,7 @@ import { toFriendlyError } from '../hooks/errors';
 import { useJobStream } from '../hooks/useJobStream';
 import { usePrinters, trimNum, type PrinterSwitchEvent } from '../hooks/usePrinters';
 import { useProjects } from '../hooks/useProjects';
+import { rememberProject } from '../lib/lastProject';
 import Viewer3D, { type ModelStats } from '../viewer/Viewer3D';
 
 /** 作业阶段 → 用户看得懂的中文（不出现 SCAD/CLI 之类的技术词） */
@@ -60,6 +61,16 @@ function newId(): string {
 function nowIso(): string {
   return new Date().toISOString();
 }
+
+/**
+ * 本次会话的对话记录（按项目 id 存）。
+ *
+ * 为什么需要：`entries` 是 Studio 的组件状态，而切到设置页 / 点别的项目会让
+ * Studio **卸载**，状态随之清空 —— 用户看到的是"我说的话、刚生成的结果都没了"。
+ * 作业本身在后端不受影响（还有重连机制），没理由让界面部分失忆。
+ * 只存在内存里：重开软件时按项目历史重建，不引入新的持久化格式。
+ */
+const conversationCache = new Map<string, ChatEntry[]>();
 
 /**
  * 卡死看门狗的时间窗（毫秒）。
@@ -133,6 +144,16 @@ export default function Studio() {
     () => projects.find((p) => p.id === activeId) ?? null,
     [projects, activeId],
   );
+
+  // 对话内容随时镜像进会话缓存：切页回来直接读回来（见 conversationCache 的说明）。
+  // 用一个 effect 而不是在每个 setEntries 调用点写入 —— 那种写法迟早会漏掉一处。
+  // 同一个地方记住"本会话最后打开的项目"，因为项目变活跃有好几条路径
+  // （打开已有项目、新建项目时后端分配 id、参数微调…），散在各处写必然漏。
+  useEffect(() => {
+    if (!activeId) return;
+    conversationCache.set(activeId, entries);
+    rememberProject(activeId);
+  }, [activeId, entries]);
 
   /** 把结果卡片推进对话，并同步参数表与预览版本 */
   const commitResult = useCallback((result: JobResult) => {
@@ -320,14 +341,19 @@ export default function Studio() {
     async (id: string) => {
       setActiveId(id);
       navigate(`/studio/${id}`, { replace: false });
-      setEntries([]);
       setParams([]);
       setModelStats(null);
       setDetailLoading(true);
       try {
         const detail = await api.getProject(id);
         const last = detail.history?.[detail.history.length - 1];
-        if (last || detail.summary) {
+        // 本次会话里已经聊过的内容要留着：切到设置页再回来不该把对话清空。
+        // 旧实现每次 openProject 都 setEntries([]) 再补一条摘要 ——
+        // 用户看到的是"我刚说的话没了"。
+        const remembered = conversationCache.get(id);
+        if (remembered && remembered.length) {
+          setEntries(remembered);
+        } else if (last || detail.summary) {
           const parts: string[] = [];
           if (last?.prompt) parts.push(`需求：${last.prompt}`);
           if (last?.instruction) parts.push(`修改：${last.instruction}`);
@@ -340,6 +366,8 @@ export default function Studio() {
               at: last?.created_at ?? detail.updated_at,
             },
           ]);
+        } else {
+          setEntries([]);
         }
         setParams(detail.params ?? []);
         setViewerRevision(detail.revision);
@@ -351,6 +379,19 @@ export default function Studio() {
         toast.error(toFriendlyError(err).message);
       } finally {
         setDetailLoading(false);
+      }
+
+      // 作业状态在后端：切页/刷新回来必须**重新接管**，否则进度条、停止按钮、
+      // 规格卡片全部凭空消失（用户实测反馈），而作业其实还在跑。
+      // 这里只接管还活着的作业；已结束的不重放，避免旧作业把界面顶掉。
+      try {
+        const { jobs } = await api.listJobs(id);
+        const live = (jobs ?? []).find(
+          (item) => item.status === 'running' || item.status === 'awaiting_confirmation',
+        );
+        if (live) setJobId(live.job_id);
+      } catch {
+        // 拿不到就算了：这不影响打开项目本身
       }
     },
     [navigate, toast],

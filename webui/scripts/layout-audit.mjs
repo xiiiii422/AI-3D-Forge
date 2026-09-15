@@ -145,6 +145,17 @@ async function launch() {
 }
 
 async function main() {
+  // 服务没起来 ≠ 界面有问题。先探一下，避免把 ERR_CONNECTION_REFUSED 当成体检结论。
+  try {
+    const probe = await fetch(baseUrl + '/', { signal: AbortSignal.timeout(8000) });
+    if (!probe.ok) throw new Error('HTTP ' + probe.status);
+  } catch (err) {
+    console.error('[ERROR] 连不上被测界面 ' + baseUrl + '：' + String(err).slice(0, 160));
+    console.error('  布局体检需要一个正在运行的界面服务（见 README-开发者.md）；本次没有测到任何东西。');
+    console.error('LAYOUT_AUDIT_UNREACHABLE');
+    process.exit(2);
+  }
+
   let browser;
   try {
     browser = await launch();

@@ -615,9 +615,13 @@ function jobSnapshot(job) {
   const elapsed = Date.now() - new Date(job.created_at).getTime() - (job.shift || 0);
   const last = [...job.script].reverse().find((s) => s.at <= elapsed && s.event !== 'done');
   const doneStep = job.script.find((s) => s.event === 'done');
-  const finished = doneStep && doneStep.at <= elapsed;
-  // 等待用户确认需求理解：这是一个**非终态**，前端不能据此停止订阅
+  // 等待用户确认需求理解：这是一个**非终态**，前端不能据此停止订阅。
   const waiting = Boolean(job.paused) && !job.confirmed;
+  // 暂停在关卡上时，时间轴**不能**继续往前走：否则作业会在"等人确认"的状态下
+  // 被时间轴判成 finished，快照报 done（约 5 秒后就发生）——
+  // 于是"停在确认卡片上"这件事根本撑不到用户回来，
+  // 「切页/刷新后能否重新接管作业」这条路径在假后端上永远测不出来。
+  const finished = !waiting && Boolean(doneStep) && doneStep.at <= elapsed;
   const wasCancelled = Boolean(job.cancelled);
 
   if (wasCancelled) {
@@ -1327,6 +1331,19 @@ const server = http.createServer(async (req, res) => {
     }
 
     /* ---------- 3. 作业 ---------- */
+    // GET /api/jobs?project_id=xxx —— 真实后端有这条（docs/API-CONTRACT.md §3.1），
+    // 前端用它**重新接管正在跑的作业**（切页/刷新回来时）。夹具缺了它，
+    // 「切页后建模界面是否还在」这类回归就没法用假后端验。
+    if (path === '/api/jobs' && method === 'GET') {
+      const wanted = url.searchParams.get('project_id');
+      const jobs = [...state.jobs.values()]
+        .filter((job) => !wanted || job.project_id === wanted)
+        .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+        .slice(0, 20)
+        .map((job) => jobSnapshot(job));
+      return sendJson(res, 200, { jobs });
+    }
+
     if (path === '/api/jobs' && method === 'POST') {
       const body = await readBody(req);
       const prompt = String(body.prompt ?? '').trim();
@@ -1417,17 +1434,25 @@ const server = http.createServer(async (req, res) => {
       const job = state.jobs.get(streamMatch[1]);
       if (!job) return sendError(res, 404, '找不到这个任务。', 'INTERNAL');
       sseHead(res);
-      let cancelled = false;
+      // 客户端断开**只代表没人看了，不代表作业被放弃**。
+      // 真实后端就是这样：作业继续跑，重连时首帧补完整快照（见下面 sseSend('snapshot')）。
+      // 旧夹具在 req.close 时直接 return，把作业"顺带"终止了 ——
+      // 于是「建模时切到别的界面再回来，作业是否还在」这条路径在假后端上根本测不了，
+      // 而且它给出的行为与契约相反（用户报的正是这个现象）。
+      let clientGone = false;
       req.on('close', () => {
-        cancelled = true;
+        clientGone = true;
       });
+      const send = (event, data) => {
+        if (!clientGone) sseSend(res, event, data);
+      };
       const started = Date.now();
       const finishedStep = job.script.find((s) => s.event === 'done');
       // 首帧立刻推当前已有状态（契约要求：断线重连后能补齐）。
       // 必须用完整快照事件：确认卡片要靠它重建，只推 stage/message 是不够的。
       const snapshot = jobSnapshot(job);
-      sseSend(res, 'snapshot', snapshot);
-      for (const m of snapshot.messages) sseSend(res, 'message', m);
+      send('snapshot', snapshot);
+      for (const m of snapshot.messages) send('message', m);
 
       void (async () => {
         // 用户点了取消：真实后端会推 `cancelled` + **完整快照** 再收流。
@@ -1436,33 +1461,31 @@ const server = http.createServer(async (req, res) => {
         const emitCancelled = () => {
           job.cancelled = true;
           job.paused = false;
-          sseSend(res, 'cancelled', { ...jobSnapshot(job), status: 'cancelled' });
+          send('cancelled', { ...jobSnapshot(job), status: 'cancelled' });
           console.log(`   [mock] 作业 ${job.id.slice(0, 8)} 已取消，已推送 cancelled`);
         };
 
         for (const step of job.script) {
-          if (cancelled) return;
           if (job.cancelled) {
             emitCancelled();
             return;
           }
           const wait = step.at + job.shift - (Date.now() - started);
           if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-          if (cancelled) return;
           if (job.cancelled) {
             emitCancelled();
             return;
           }
           if (step.event === 'message') {
             if (!job.messages.some((m) => m.seq === step.data.seq)) job.messages.push(step.data);
-            sseSend(res, 'message', step.data);
+            send('message', step.data);
           } else if (step.event === 'stage') {
-            sseSend(res, 'stage', step.data);
+            send('stage', step.data);
           } else if (step.event === 'spec') {
             job.spec = step.data;
-            sseSend(res, 'spec', step.data);
+            send('spec', step.data);
           } else if (step.event === 'done') {
-            sseSend(res, 'done', step.build(job));
+            send('done', step.build(job));
           }
           // 规格确认关卡：**先推送规格、再停在这里**，等用户 POST /confirm-spec 才继续。
           // 顺序不能反 —— 反过来用户永远看不到那张卡片，作业就在服务端死等。
@@ -1472,7 +1495,6 @@ const server = http.createServer(async (req, res) => {
             const gateReachedAt = Date.now();
             for (;;) {
               await new Promise((r) => setTimeout(r, 120));
-              if (cancelled) return;
               if (job.cancelled) {
                 emitCancelled();
                 return;
@@ -1486,9 +1508,9 @@ const server = http.createServer(async (req, res) => {
             // 界面据此把卡片收成只读版 —— 假后端必须照做，否则这条路径根本没被测到。
             if (job.spec) {
               job.spec = { ...job.spec, awaiting_confirmation: false };
-              sseSend(res, 'spec', job.spec);
+              send('spec', job.spec);
             }
-            sseSend(res, 'message', {
+            send('message', {
               seq: (job.messages.at(-1)?.seq ?? 0) + 1,
               text: '已确认，开始设计。',
               detail: null,

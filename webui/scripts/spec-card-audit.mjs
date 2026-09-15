@@ -178,6 +178,17 @@ async function checkCancelUnlocks(page) {
 }
 
 async function main() {
+  // 服务没起来 ≠ 规格卡片有问题。先探一下，别把连接错误当体检结论。
+  try {
+    const probe = await fetch(baseUrl + '/', { signal: AbortSignal.timeout(8000) });
+    if (!probe.ok) throw new Error('HTTP ' + probe.status);
+  } catch (err) {
+    console.error('[ERROR] 连不上被测界面 ' + baseUrl + '：' + String(err).slice(0, 160));
+    console.error('  本次没有测到任何东西；请先启动界面服务（见 README-开发者.md）。');
+    console.error('SPEC_CARD_AUDIT_UNREACHABLE');
+    process.exit(2);
+  }
+
   const { chromium } = await import('playwright');
   let browser;
   try {

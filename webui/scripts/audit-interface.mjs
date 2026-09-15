@@ -297,6 +297,21 @@ async function writeTheme(theme) {
 
 async function main() {
   const { chromium } = await import('playwright');
+
+  // 先确认被测服务活着。踩过的坑：Vite dev 只监听了 IPv6 的 ::1，
+  // 用 127.0.0.1 访问时每个页面都 ERR_CONNECTION_REFUSED —— 而脚本把这 6 个
+  // 连接错误当成 "找到 6 个问题" 报了出来。**服务没起来**和**界面有问题**
+  // 是两件事，混在一起就是把"没测到"伪装成"测过了"。
+  try {
+    const probe = await fetch(`${baseUrl}/`, { signal: AbortSignal.timeout(8000) });
+    if (!probe.ok) throw new Error(`HTTP ${probe.status}`);
+  } catch (err) {
+    console.log(`[ERROR] 连不上被测服务 ${baseUrl}：${String(err).slice(0, 160)}`);
+    console.log('  界面评审需要一个正在运行的界面服务（见 README-开发者.md）；本次没有测到任何东西。');
+    console.log('INTERFACE_AUDIT_UNREACHABLE');
+    process.exit(2);
+  }
+
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   const report = { base: baseUrl, routes: {}, generatedAt: new Date().toISOString() };
   let failures = 0;

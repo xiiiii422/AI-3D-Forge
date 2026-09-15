@@ -25,6 +25,7 @@ from typing import Callable, Iterator
 
 from .config import store
 from .paths import APP_SLUG, paths
+from .procguard import run as guarded_run
 
 log = logging.getLogger(__name__)
 
@@ -164,7 +165,9 @@ def output_of(proc: subprocess.CompletedProcess) -> str:
 def read_version(exe: Path, timeout: int = 20) -> str | None:
     """执行 `openscad --version` 并解析版本号。"""
     try:
-        proc = subprocess.run([str(exe), "--version"], timeout=timeout, check=False, **_popen_kwargs())
+        # 走 procguard：这些子进程要登记在册，应用退出时才会被一起收走
+        # （否则关掉软件后 openscad.exe 还会在后台跑，见 procguard 的说明）。
+        proc = guarded_run([str(exe), "--version"], timeout=timeout, **_popen_kwargs())
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.debug("读取版本失败 %s：%s", exe, exc)
         return None
@@ -216,7 +219,8 @@ def run_cli(
         )
     cmd = [str(target), *args]
     log.debug("执行：%s", " ".join(cmd))
-    return subprocess.run(cmd, timeout=timeout, check=False, **_popen_kwargs())
+    # 同样走 procguard（登记 + 退出时连带结束）
+    return guarded_run(cmd, timeout=timeout, **_popen_kwargs())
 
 
 # --------------------------------------------------------------------------
@@ -493,10 +497,9 @@ def smoke_test(exe: Path | str | None = None, work_dir: Path | None = None) -> t
         except OSError as exc:
             return False, f"无法写入自检文件：{exc.strerror or exc}", 0.0
         try:
-            proc = subprocess.run(
+            proc = guarded_run(
                 [str(target), "-o", str(stl), str(scad)],
                 timeout=120,
-                check=False,
                 **_popen_kwargs(),
             )
         except subprocess.TimeoutExpired:
@@ -611,6 +614,56 @@ def _replace_with_retry(tmp: Path, target: Path, attempts: int = 6) -> None:
             _time.sleep(0.2 * (index + 1))
     assert last is not None
     raise last
+
+
+def _rename_with_retry(src: Path, dst: Path, attempts: int = 8) -> None:
+    """把**目录**改名，容忍 Windows 上的短暂占用（文件版见 `_replace_with_retry`）。
+
+    实测触发场景：安装流程会先在旁路目录里跑一次 `openscad.exe` 冒烟测试，
+    紧接着就把这个目录改名到正式位置。Windows 在进程退出后仍会短暂持有该
+    exe 的映像句柄，此时 `rename` 报 `[WinError 5] 拒绝访问` ——
+    不是"权限不够"，只是"还没放手"。等几百毫秒到几秒就会过去，
+    所以这里退避重试（0.2s 起，累计约 7 秒），而不是让用户看到"安装失败"。
+    """
+    import time as _time
+
+    last: OSError | None = None
+    for index in range(attempts):
+        try:
+            src.rename(dst)
+            return
+        except OSError as exc:  # noqa: PERF203
+            last = exc
+            _time.sleep(0.2 * (index + 1))
+    assert last is not None
+    raise last
+
+
+def _swap_install_dir(staging: Path, target_dir: Path) -> None:
+    """把旁路目录换成正式安装目录，**失败时保证原来的目录还在**。
+
+    顺序刻意做成「三明治」，而不是先删后换：
+        正式目录 → .old 备份  →  旁路目录 → 正式目录  →  删掉 .old
+    第二步失败就把 .old 改回去。失败抛 OSError（调用方负责翻译成用户可读的错误）。
+    """
+    backup = target_dir.with_name(target_dir.name + ".old")
+    shutil.rmtree(backup, ignore_errors=True)
+    moved_aside = False
+    if target_dir.exists():
+        _rename_with_retry(target_dir, backup)
+        moved_aside = True
+    try:
+        _rename_with_retry(staging, target_dir)
+    except OSError:
+        if moved_aside:
+            try:
+                _rename_with_retry(backup, target_dir)
+            except OSError as rollback_exc:
+                log.error("回滚 OpenSCAD 目录失败：%s", rollback_exc)
+                raise
+        raise
+    # 新目录已就位，旧目录可以安全清掉（删不掉也不影响使用）
+    shutil.rmtree(backup, ignore_errors=True)
 
 
 def download_asset(
@@ -761,14 +814,23 @@ def install_portable(progress: ProgressFn | None = None) -> OpenScadInfo:
         )
 
     _emit(progress, "install", 100.0, "解压与自检通过，正在替换正式目录…")
+    # 换目录必须**可回滚**，而且必须容忍"刚跑完冒烟测试"的短暂占用。
+    #
+    # 两个真实踩坑（一次端到端实测里同时撞上）：
+    #   1. 原实现是 `先 rmtree(正式目录) 再 rename`。冒烟测试是在 staging 里跑
+    #      openscad.exe 的，Windows 在进程退出后还会短暂持有该 exe 的句柄，
+    #      于是 rename 报 `[WinError 5] 拒绝访问` —— 而那时**正式目录已经被删掉了**，
+    #      用户手里那份能用的 OpenSCAD 就这么没了（本文件上面刚写过
+    #      "一次失败的重新安装把可用环境砸掉，是最不该发生的一类退化"）。
+    #   2. rename 只有一次机会，没有重试；而文件版早就有了 _replace_with_retry。
+    # 现在交给 _swap_install_dir：备份 → 换入 → 成功才清理；换入失败自动回滚。
     try:
-        shutil.rmtree(target_dir, ignore_errors=True)
-        staging.rename(target_dir)
+        _swap_install_dir(staging, target_dir)
     except OSError as exc:
-        shutil.rmtree(staging, ignore_errors=True)
         raise OpenScadError(
             f"替换安装目录失败：{exc}",
-            hint="可能有程序正在占用该目录（杀毒软件、资源管理器）。关闭后重试即可。",
+            hint="原来的 OpenSCAD 没有被改动，可以继续使用。"
+            "通常是杀毒软件或资源管理器正在扫描刚解压的文件，稍等几秒重试即可。",
             code="INTERNAL",
         ) from exc
 

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import re
@@ -47,23 +48,59 @@ MAX_JOBS = 200
 # 而且模型贴边放容易第一层附着不良。
 SAFETY_MARGIN_MM = 5.0
 
-# 阶段 → (用户看到的中文说明, 阶段结束时的百分比)
-STAGE_LABELS: dict[str, tuple[str, float | None]] = {
-    "queued": ("正在准备…", 2.0),
-    "understanding": ("正在理解你的需求…", 12.0),
-    "awaiting_confirmation": ("等待你确认我对需求的理解", 12.0),
-    "generating_scad": ("正在按规格设计结构…", None),
-    "validating_scad": ("正在检查模型代码…", 45.0),
-    "compiling": ("正在生成 3D 模型…", 78.0),
-    "analyzing": ("正在检查模型尺寸与结构…", 86.0),
-    "verifying": ("正在核对改动是否符合你的要求…", 88.0),
-    "reviewing": ("正在进行打印性检查…", 95.0),
-    "exporting": ("正在保存项目…", 98.0),
-    "done": ("已完成。", 100.0),
+# 阶段 → (用户看到的中文说明, 起点百分比, 终点百分比)
+#
+# 为什么是「区间」而不是一个点：以前每个阶段只有一个固定百分比（78 → 86 → 95），
+# 而最长的生成阶段干脆是 None（界面显示不定态转圈）。用户的实际反馈是
+# 「进度条不能体现准确的进度」——既不动，也不知道卡没卡。
+#
+# 现在的规则：
+#   * 阶段内**按时间推进**（渐近逼近终点，永不越过），所以长阶段也在动；
+#   * 百分比**单调不减**，切阶段只会往前走；
+#   * 终点都留有余量，**只有真正 done 才是 100%**；
+#   * `awaiting_confirmation` 的起点=终点：在等人做决定，进度条不该自己往前爬
+#     （那是在骗人）。
+#
+# 数值依据：AI 调用实测 6~15 秒、编译 0.3~3 秒、分析 0.5~3 秒，
+# 所以生成阶段给的区间最宽（12→45），编译/分析各占一段。
+STAGE_BANDS: dict[str, tuple[str, float, float]] = {
+    "queued": ("正在准备…", 0.0, 2.0),
+    "understanding": ("正在理解你的需求…", 2.0, 12.0),
+    "awaiting_confirmation": ("等待你确认我对需求的理解", 12.0, 12.0),
+    "generating_scad": ("正在按规格设计结构…", 12.0, 45.0),
+    "validating_scad": ("正在检查模型代码…", 45.0, 52.0),
+    "compiling": ("正在生成 3D 模型…", 52.0, 78.0),
+    "analyzing": ("正在检查模型尺寸与结构…", 78.0, 86.0),
+    "verifying": ("正在核对改动是否符合你的要求…", 86.0, 90.0),
+    "reviewing": ("正在进行打印性检查…", 90.0, 96.0),
+    "exporting": ("正在保存项目…", 96.0, 99.0),
+    "done": ("已完成。", 100.0, 100.0),
 }
 
-STAGE_PERCENT: dict[str, float | None] = {key: value[1] for key, value in STAGE_LABELS.items()}
-STAGE_TEXT: dict[str, str] = {key: value[0] for key, value in STAGE_LABELS.items()}
+# 每个阶段「大概多久算走完一个区间」（秒）：用于把时间映射成区间内的进度。
+# 取实测耗时量级，偏大一点 —— 宁可走得慢，也不要早早顶到上限然后干等。
+STAGE_TAU_S: dict[str, float] = {
+    "queued": 1.0,
+    "understanding": 8.0,
+    "generating_scad": 12.0,
+    "validating_scad": 1.5,
+    "compiling": 4.0,
+    "analyzing": 4.0,
+    "verifying": 6.0,
+    "reviewing": 8.0,
+    "exporting": 1.5,
+}
+
+# 兼容/诊断用的派生表：阶段 → 该阶段的**上限**百分比。
+# 注意它已经不是"进度"的来源了 —— 进度由 STAGE_BANDS 的区间 + Job.creep()
+# 按时间推进（见 §69：用户反馈"进度条不能体现准确进度"）。
+# 保留它是为了让外部脚本/诊断仍能一眼看到每个阶段的终点值。
+STAGE_PERCENT: dict[str, float | None] = {key: value[2] for key, value in STAGE_BANDS.items()}
+STAGE_TEXT: dict[str, str] = {key: value[0] for key, value in STAGE_BANDS.items()}
+
+# 阶段内进度的刷新间隔（秒）。3 秒是折中：比这更密只是徒增 SSE 流量，
+# 更稀则长阶段看起来像卡住。测试会临时调小它来跑真实的推进循环。
+PROGRESS_TICK_S = 3.0
 
 
 @dataclass
@@ -93,6 +130,10 @@ class Job:
     result: dict[str, Any] | None = None
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
+    # 阶段区间与阶段开始时间：进度条在阶段内按时间推进（见 Job.creep）
+    stage_floor: float = 0.0
+    stage_ceiling: float = 0.0
+    stage_started_at: float = field(default_factory=time.time)
     task: asyncio.Task | None = field(default=None, repr=False)
 
     # --- 事件广播 -------------------------------------------------------
@@ -177,17 +218,54 @@ class Job:
         self._publish("message", message.to_dict())
 
     def set_stage(self, stage: str, percent: float | None = None, text: str | None = None) -> None:
+        """切阶段：进入该阶段的**区间起点**，并记下开始时间（供阶段内按时间推进）。"""
         self.stage = stage
-        self.percent = STAGE_PERCENT.get(stage, percent) if percent is None else percent
+        floor, ceiling = STAGE_BANDS.get(stage, ("", 0.0, 100.0))[1:]
+        self.stage_floor = float(floor)
+        self.stage_ceiling = float(ceiling)
+        self.stage_started_at = time.time()
+        if percent is not None:
+            target = float(percent)
+        else:
+            target = self.stage_floor
+        # 单调不减：切阶段不该让进度条往回退
+        self.percent = max(self.percent or 0.0, target)
         if text:
             self.say(text)
         self._publish("stage", {"stage": stage, "percent": self.percent, "text": STAGE_TEXT.get(stage, "")})
 
+    def creep(self) -> bool:
+        """阶段内按时间推进百分比（渐近逼近本阶段上限，永不越过）。
+
+        返回是否发生了变化（变了才推送，避免刷屏）。
+
+        为什么用渐近而不是线性：我们**不知道**这次 AI 调用要跑 5 秒还是 30 秒。
+        线性会在超时的时候顶到上限然后干等（看起来像卡死），
+        渐近则是"越接近上限走得越慢"，既一直在动，又永远不到 100%
+        —— 只有真正 done 才是 100%。
+        """
+        if self.status != "running":
+            return False
+        if self.stage_ceiling <= self.stage_floor:
+            # 等人确认这类区间起点=终点，故意不涨（进度条不能替用户做决定）
+            return False
+        elapsed = max(0.0, time.time() - self.stage_started_at)
+        tau = STAGE_TAU_S.get(self.stage, 6.0)
+        ratio = 1.0 - math.exp(-elapsed / tau)
+        value = self.stage_floor + (self.stage_ceiling - self.stage_floor) * ratio
+        current = self.percent or 0.0
+        if value <= current + 0.05:
+            return False
+        self.percent = min(value, self.stage_ceiling)
+        self._publish("stage", {"stage": self.stage, "percent": self.percent, "text": ""})
+        return True
+
     def progress(self, percent: float, text: str | None = None) -> None:
-        self.percent = percent
+        # 同样单调不减：显式进度也不该把已经走过的部分退回去
+        self.percent = max(self.percent or 0.0, float(percent))
         if text:
             self.say(text)
-        self._publish("stage", {"stage": self.stage, "percent": percent, "text": text or ""})
+        self._publish("stage", {"stage": self.stage, "percent": self.percent, "text": text or ""})
 
     def fail(self, message: str, *, hint: str | None = None, code: str = "INTERNAL") -> None:
         self.status = "error"
@@ -817,6 +895,10 @@ class GenerationRunner:
         compile_params: dict[str, float] | None = None,
     ) -> None:
         job = self.job
+        # 进度心跳：阶段内按时间推进百分比（用户反馈"进度条不能体现准确的进度"）。
+        # 单开一个任务，而不是塞进各个步骤里 —— 否则每个耗时步骤都得记得推一次，
+        # 漏一处进度条就停在那儿。3 秒一拍足够让细条"在动"，又不会把事件流刷爆。
+        ticker = asyncio.create_task(self._tick_progress())
         try:
             if job.mode == "create":
                 assert prompt is not None
@@ -855,6 +937,20 @@ class GenerationRunner:
                 hint=f"技术细节：{type(exc).__name__}: {exc}",
                 code="INTERNAL",
             )
+        finally:
+            # 无论成功失败都要停掉心跳，否则它会在作业结束后继续改 percent
+            ticker.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await ticker
+
+    async def _tick_progress(self) -> None:
+        """每 PROGRESS_TICK_S 秒推进一次阶段内进度（见 Job.creep）。"""
+        try:
+            while True:
+                await asyncio.sleep(PROGRESS_TICK_S)
+                self.job.creep()
+        except asyncio.CancelledError:
+            return
 
     # --- 各模式 -----------------------------------------------------------
     async def _pipeline_generate(self, project: Project, prompt: str) -> None:

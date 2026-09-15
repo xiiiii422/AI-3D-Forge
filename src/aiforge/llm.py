@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -28,6 +29,25 @@ if TYPE_CHECKING:  # 仅用于类型标注，避免运行时循环导入
 log = logging.getLogger(__name__)
 
 MAX_HISTORY_CHARS = 12_000
+
+# 连接阶段失败后的重试间隔（秒）。只用于「连接根本没建立」这一类错误，
+# 见 DeepSeekClient._post_with_connect_retry 里对可重试性的说明。
+CONNECT_RETRY_DELAY_S = 1.5
+
+
+def _describe_network_error(exc: Exception) -> str:
+    """把网络异常翻译成一句**有信息**的话。
+
+    踩过的坑：系统代理抖动时抛出的 httpx 异常 `str()` 是空字符串，
+    界面上于是出现「网络请求失败：」——冒号后面什么都没有。
+    用户拿这句话既判断不了是不是自己网络断了，也没法向客服描述。
+    兜底用异常类型名，至少能区分「连不上 / 读到一半断了 / 协议错乱」。
+    """
+    detail = str(exc).strip()
+    kind = type(exc).__name__
+    if detail:
+        return f"{kind}: {detail}"
+    return f"{kind}（系统没有给出具体原因）"
 
 # --------------------------------------------------------------------------
 # 采样温度（objective ⑥：统一调低，减少随机漂移）
@@ -628,6 +648,48 @@ class DeepSeekClient:
             "Accept": "application/json",
         }
 
+    async def _post_with_connect_retry(self, url: str, payload: dict[str, object]) -> httpx.Response:
+        """POST 一次；**只在「连都连不上」时**重试一次。
+
+        为什么只重试连接阶段：连接没建立起来 = 请求根本没发出去，
+        重试不会重复计费。反过来，`ReadError` / `RemoteProtocolError`
+        是"请求已发出、响应断了"——那时模型可能已经生成完并计费，
+        盲目重试会让用户为同一句话付两次钱，所以那类错误一律直接报错。
+
+        （实测触发场景：系统代理抖动那次，抛出的异常 `str()` 是空的，
+        界面上只显示「网络请求失败：」，用户完全无从下手 —— 所以
+        下面报错时必须把**异常类型**和**目标地址**都写出来。）
+        """
+        attempts = 2
+        last: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    return await client.post(url, headers=self._headers(), json=payload)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last = exc
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(CONNECT_RETRY_DELAY_S)
+                    continue
+            except httpx.TimeoutException as exc:
+                raise LlmError(
+                    "等待 DeepSeek 响应超时。",
+                    hint="已生成的内容较多或网络较慢，请重试；也可以在设置中调大超时时间。",
+                    code="API_UNREACHABLE",
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise LlmError(
+                    f"网络请求失败：{_describe_network_error(exc)}。",
+                    hint="请检查网络后重试；若使用代理或公司网络，请确认能访问 api.deepseek.com。",
+                    code="API_UNREACHABLE",
+                ) from exc
+        assert last is not None
+        raise LlmError(
+            f"无法连接到 DeepSeek 服务器（{self.base_url}）：{_describe_network_error(last)}。",
+            hint="请检查网络连接；若使用代理或公司网络，请在「设置」中确认可以访问 api.deepseek.com。",
+            code="API_UNREACHABLE",
+        ) from last
+
     async def chat(
         self,
         messages: list[dict[str, str]],
@@ -647,28 +709,7 @@ class DeepSeekClient:
             payload["response_format"] = {"type": "json_object"}
 
         url = f"{self.base_url}/chat/completions"
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(url, headers=self._headers(), json=payload)
-        except httpx.ConnectError as exc:
-            raise LlmError(
-                "无法连接到 DeepSeek 服务器。",
-                hint="请检查网络连接；若使用代理或公司网络，请在「设置」中确认可以访问 api.deepseek.com。",
-                code="API_UNREACHABLE",
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise LlmError(
-                "等待 DeepSeek 响应超时。",
-                hint="已生成的内容较多或网络较慢，请重试；也可以在设置中调大超时时间。",
-                code="API_UNREACHABLE",
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise LlmError(
-                f"网络请求失败：{exc}",
-                hint="请检查网络连接后重试。",
-                code="API_UNREACHABLE",
-            ) from exc
-
+        response = await self._post_with_connect_retry(url, payload)
         if response.status_code >= 400:
             raise _friendly_http_error(response.status_code, response.text, self.base_url)
 
@@ -712,33 +753,54 @@ class DeepSeekClient:
             "stream": True,
         }
         url = f"{self.base_url}/chat/completions"
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                async with client.stream("POST", url, headers=self._headers(), json=payload) as response:
-                    if response.status_code >= 400:
-                        body = (await response.aread()).decode("utf-8", errors="replace")
-                        raise _friendly_http_error(response.status_code, body, self.base_url)
-                    async for line in response.aiter_lines():
-                        if not line or not line.startswith("data:"):
-                            continue
-                        chunk = line[5:].strip()
-                        if chunk == "[DONE]":
-                            break
-                        try:
-                            parsed = json.loads(chunk)
-                        except ValueError:
-                            continue
-                        for choice in parsed.get("choices") or []:
-                            delta = choice.get("delta") or {}
-                            text = delta.get("content")
-                            if text:
-                                yield str(text)
-        except httpx.ConnectError as exc:
-            raise LlmError(
-                "无法连接到 DeepSeek 服务器。",
-                hint="请检查网络连接后重试。",
-                code="API_UNREACHABLE",
-            ) from exc
+        # 连接阶段照样只重试一次「连都连不上」；一旦开始收流就不再重试 ——
+        # 半截的流重放会让用户看到重复内容，且可能重复计费。
+        for attempt in range(2):
+            started = False
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    async with client.stream("POST", url, headers=self._headers(), json=payload) as response:
+                        started = True
+                        if response.status_code >= 400:
+                            body = (await response.aread()).decode("utf-8", errors="replace")
+                            raise _friendly_http_error(response.status_code, body, self.base_url)
+                        async for line in response.aiter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            chunk = line[5:].strip()
+                            if chunk == "[DONE]":
+                                break
+                            try:
+                                parsed = json.loads(chunk)
+                            except ValueError:
+                                continue
+                            for choice in parsed.get("choices") or []:
+                                delta = choice.get("delta") or {}
+                                text = delta.get("content")
+                                if text:
+                                    yield str(text)
+                return
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                if not started and attempt == 0:
+                    await asyncio.sleep(CONNECT_RETRY_DELAY_S)
+                    continue
+                raise LlmError(
+                    f"无法连接到 DeepSeek 服务器（{self.base_url}）：{_describe_network_error(exc)}。",
+                    hint="请检查网络连接；若使用代理或公司网络，请在「设置」中确认可以访问 api.deepseek.com。",
+                    code="API_UNREACHABLE",
+                ) from exc
+            except httpx.TimeoutException as exc:
+                raise LlmError(
+                    "等待 DeepSeek 响应超时。",
+                    hint="已生成的内容较多或网络较慢，请重试；也可以在设置中调大超时时间。",
+                    code="API_UNREACHABLE",
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise LlmError(
+                    f"网络请求失败：{_describe_network_error(exc)}。",
+                    hint="请检查网络后重试；若使用代理或公司网络，请确认能访问 api.deepseek.com。",
+                    code="API_UNREACHABLE",
+                ) from exc
 
     # --- 业务方法 --------------------------------------------------------
     async def parse_design_spec(

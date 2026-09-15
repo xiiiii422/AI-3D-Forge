@@ -1060,6 +1060,435 @@ def t_install_test_keeps_config() -> str:
     return "安装验收脚本会备份并恢复真实 config.json（备份先于覆盖、恢复无条件执行）"
 
 
+def t_child_process_guard() -> str:
+    """应用退出后，自己起的子进程不能继续跑（用户实测反馈的 Bug）。
+
+    为什么必须钉住：编译模型会起 `openscad.exe`。用户在编译期间关窗口（或从任务管理器
+    结束进程）时，Python 死了而子进程**不会跟着死** —— 软件关了 OpenSCAD 还在后台算完，
+    占满一个核，有时还留下半截 STL，下次打开看到"凭空出现"的模型。
+
+    本项目的退出路径还是 `runtime_state.force_exit()` → `os._exit()`，
+    **故意跳过** atexit/finally，所以"退出时清理"的写法根本靠不住。
+    这里验证的是三层兜底各自真的成立：
+      1. Windows 作业对象带 `KILL_ON_JOB_CLOSE`（内核保证：进程一死子进程全灭）；
+      2. 登记表 + `terminate_all()` 能真的杀掉子进程；
+      3. 超时路径不留孤儿；启动清扫**只**杀我们自己装的 OpenSCAD。
+    """
+    import subprocess as sp
+    import sys
+    import time as time_mod
+
+    from aiforge import procguard
+
+    # 1) 作业对象：Windows 上必须真的建立起来，并且 KillOnJobClose 已生效
+    active = procguard.install()
+    if os.name == "nt":
+        assert active, "Windows 上作业对象必须可用（否则退出后子进程会变孤儿）"
+        assert procguard.job_object_active()
+        # 把作业的限制标志读回来确认，而不是只信我们"设过"
+        import ctypes as ct
+
+        kernel32 = ct.WinDLL("kernel32", use_last_error=True)
+        kernel32.QueryInformationJobObject.restype = ct.c_int
+        kernel32.QueryInformationJobObject.argtypes = [ct.c_void_p, ct.c_int, ct.c_void_p, ct.c_uint32, ct.c_void_p]
+        info = procguard._ExtendedLimitInformation()  # noqa: SLF001 - 自检直接查内部句柄
+        ok = kernel32.QueryInformationJobObject(
+            ct.c_void_p(procguard._job_handle),  # noqa: SLF001
+            procguard._JobObjectExtendedLimitInformation,  # noqa: SLF001
+            ct.byref(info),
+            ct.sizeof(info),
+            None,
+        )
+        assert ok, "读回作业对象限制失败"
+        assert info.BasicLimitInformation.LimitFlags & 0x2000, (
+            f"KillOnJobClose 没设上（LimitFlags={info.BasicLimitInformation.LimitFlags:#x}）"
+        )
+
+    # 2) 登记表 + 退出时回收：起一个长睡眠子进程，terminate_all 必须真的结束它
+    sleeper = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        procguard.register(sleeper)
+        time_mod.sleep(0.2)
+        assert sleeper.poll() is None, "子进程应当还活着"
+        killed = procguard.terminate_all()
+        assert killed >= 1, f"应当至少结束 1 个子进程，实际 {killed}"
+        deadline = time_mod.time() + 5
+        while time_mod.time() < deadline and sleeper.poll() is None:
+            time_mod.sleep(0.05)
+        assert sleeper.poll() is not None, "terminate_all 之后子进程仍在运行"
+    finally:
+        if sleeper.poll() is None:
+            sleeper.kill()
+
+    # 3) 超时路径：必须抛 TimeoutExpired，并且**不留孤儿**
+    procguard.reset_for_tests()
+    timed_out = False
+    try:
+        procguard.run(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            timeout=0.4,
+            stdout=sp.PIPE,
+            stderr=sp.STDOUT,
+        )
+    except sp.TimeoutExpired:
+        timed_out = True
+    assert timed_out, "超时必须抛 TimeoutExpired（调用方依赖它给用户提示）"
+
+    # 4) 启动清扫只碰"我们装的 OpenSCAD"：把睡眠进程的 PID 写进记录文件，
+    #    它的可执行文件是 python.exe → 绝不能被误杀。
+    record = ROOT / "build" / "work" / "guard-test" / "children.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    innocent = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        record.write_text('{"pids": [%d]}' % innocent.pid, encoding="utf-8")
+        procguard._record_path = record  # noqa: SLF001 - 自检直接指定记录文件
+        managed = ROOT / "build" / "work" / "guard-test" / "runtime" / "openscad"
+        swept = procguard.sweep_orphans(managed)
+        assert swept == [], f"不该杀非 OpenSCAD 进程，实际杀了 {swept}"
+        time_mod.sleep(0.3)
+        assert innocent.poll() is None, "用户自己的进程被误杀了"
+    finally:
+        procguard._record_path = None  # noqa: SLF001
+        if innocent.poll() is None:
+            innocent.kill()
+
+    procguard.terminate_all()
+    return "退出时不留孤儿：作业对象带 KillOnJobClose、登记表可回收、超时不留孤儿、清扫不误杀"
+
+
+def t_progress_accuracy() -> str:
+    """进度条必须「在动、且不骗人」。
+
+    用户反馈「进度条不太规范，不能体现准确的进度」。旧实现每个阶段只有一个固定百分比
+    （78 → 86 → 95），最长的生成阶段干脆是 None（界面显示不定态转圈）——
+    既看不出在动，也看不出是不是卡住了。
+
+    现在的规则（这条测试逐条钉住）：
+      * 阶段内**按时间推进**，长阶段也在动；
+      * 百分比**单调不减**，切阶段不往回退；
+      * **永不越过阶段上限**，只有真正 done 才是 100%；
+      * 「等待你确认」的阶段区间起点=终点，**故意不涨** —— 进度条不能替用户做决定。
+    """
+    import asyncio
+    import contextlib
+    import inspect
+    import time
+    import types
+
+    from aiforge import jobs as jobs_mod
+
+    job = jobs_mod.create_job(project_id="progress-test", revision=1, mode="create")
+    try:
+        job.set_stage("generating_scad")
+        assert job.percent is not None, "最长的生成阶段不能是不定态（用户看不到进度）"
+        floor, ceiling = jobs_mod.STAGE_BANDS["generating_scad"][1:]
+        assert float(job.percent) == floor, (job.percent, floor)
+
+        seen = [float(job.percent)]
+        for _ in range(6):
+            job.stage_started_at -= 3.0  # 模拟时间流逝
+            job.creep()
+            seen.append(float(job.percent))
+        assert seen == sorted(seen), f"进度必须单调不减：{seen}"
+        assert max(seen) > seen[0], f"时间过去之后必须真的在动：{seen}"
+        assert max(seen) <= ceiling, f"不许越过阶段上限 {ceiling}：{seen}"
+
+        job.set_stage("compiling")
+        assert float(job.percent) >= max(seen), "切阶段不能让进度条往回退"
+
+        # 等人确认：起点=终点，且 creep 明确返回 False
+        job.set_stage("awaiting_confirmation")
+        before = float(job.percent)
+        for _ in range(5):
+            job.stage_started_at -= 10.0
+            assert job.creep() is False, "等待用户确认时进度条不该自己往前爬"
+        assert float(job.percent) == before
+
+        # 只有 done 才是 100%：其它阶段的终点都必须留余量
+        for stage, (_text, _start, end) in jobs_mod.STAGE_BANDS.items():
+            if stage in ("done", "awaiting_confirmation"):
+                continue
+            assert end < 100.0, f"{stage} 的进度上限必须留余量，实际 {end}"
+        job.set_stage("done")
+        assert float(job.percent) == 100.0
+
+        # 真实时钟推进：不靠改时间戳，sleep 之后必须真的往前走
+        real = jobs_mod.create_job(project_id="progress-real", revision=1, mode="create")
+        real.set_stage("generating_scad")
+        real_before = float(real.percent)
+        time.sleep(0.4)
+        assert real.creep() is True, "真实时间过去后 creep() 必须报告有变化"
+        assert float(real.percent) > real_before
+        real.status = "done"
+    finally:
+        job.status = "done"
+
+    # 推进循环必须真的接在生成流程上（光有 creep 没人调，界面照样不动）
+    run_src = inspect.getsource(jobs_mod.GenerationRunner.run)
+    assert "create_task(self._tick_progress())" in run_src, "生成流程必须启动阶段内推进循环"
+    assert "ticker.cancel()" in run_src, "作业结束必须停掉推进循环，否则会继续改 percent"
+
+    # 推进循环本身：用真实的 Job 跑一圈（间隔临时调小，逻辑与线上是同一份代码）
+    async def _drive_ticker() -> float:
+        ticked = jobs_mod.create_job(project_id="progress-tick", revision=1, mode="create")
+        ticked.set_stage("generating_scad")
+        original = jobs_mod.PROGRESS_TICK_S
+        jobs_mod.PROGRESS_TICK_S = 0.05
+        task = asyncio.create_task(
+            jobs_mod.GenerationRunner._tick_progress(types.SimpleNamespace(job=ticked))
+        )
+        try:
+            await asyncio.sleep(0.35)
+        finally:
+            jobs_mod.PROGRESS_TICK_S = original
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        ticked.status = "done"
+        return float(ticked.percent)
+
+    ticked_percent = asyncio.run(_drive_ticker())
+    assert ticked_percent > jobs_mod.STAGE_BANDS["generating_scad"][1], (
+        f"推进循环跑了 0.35 秒，进度却还停在区间起点：{ticked_percent}"
+    )
+    return "阶段内按时间推进、单调不减、不越界、等待确认不涨、只有 done 是 100%、推进循环真实运行"
+
+
+def t_network_errors() -> str:
+    """网络失败必须「说人话」且「重试得安全」。
+
+    这条来自一次真实的端到端翻车：系统代理抖动时抛出的 httpx 异常 `str()` 是空字符串，
+    界面上于是显示「网络请求失败：」—— 冒号后面什么都没有，用户既不知道是不是自己
+    断网了，也没法向客服描述。
+
+    更要紧的是重试边界：只有「连接根本没建立」（ConnectError / ConnectTimeout）才能
+    重试 —— 那时请求没发出去，重试不会重复计费；而 `ReadError` /
+    `RemoteProtocolError` 是「请求已发出、响应断了」，盲目重放可能让用户为同一句话
+    付两次钱，也会让界面出现重复内容。所以这条测试**同时**钉住这两个方向。
+    """
+    import asyncio
+
+    import httpx
+
+    from aiforge import llm
+
+    real_client = httpx.AsyncClient
+    real_delay = llm.CONNECT_RETRY_DELAY_S
+    llm.CONNECT_RETRY_DELAY_S = 0.01
+
+    def raise_on_call(exc: Exception):  # type: ignore[no-untyped-def]
+        def _raise(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise exc
+
+        return _raise
+
+    class FakeClient:
+        """替身：只统计被创建/被调用了几次，不真的联网。"""
+
+        calls = 0
+        next_exc: Exception | None = None
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        async def __aexit__(self, *_exc):  # type: ignore[no-untyped-def]
+            return False
+
+        async def post(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            FakeClient.calls += 1
+            assert FakeClient.next_exc is not None
+            raise FakeClient.next_exc
+
+    class FakeStreamResponse:
+        status_code = 200
+
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        async def __aexit__(self, *_exc):  # type: ignore[no-untyped-def]
+            return False
+
+        async def aread(self) -> bytes:
+            return b""
+
+        async def aiter_lines(self):  # type: ignore[no-untyped-def]
+            yield 'data: {"choices":[{"delta":{"content":"你好"}}]}'
+            raise httpx.ReadError("")
+
+    class FakeStreamClient(FakeClient):
+        streams = 0
+
+        def stream(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            FakeStreamClient.streams += 1
+            return FakeStreamResponse()
+
+    def run_chat(client):  # type: ignore[no-untyped-def]
+        return asyncio.run(client.chat([{"role": "user", "content": "hi"}]))
+
+    httpx.AsyncClient = FakeClient  # type: ignore[misc]
+    try:
+        client = llm.DeepSeekClient("sk-selftest", base_url="https://api.example.invalid")
+
+        # 1) 连接阶段失败：重试一次（共 2 次尝试），报错里必须带上异常类型
+        FakeClient.calls = 0
+        FakeClient.next_exc = httpx.ConnectError("")
+        try:
+            run_chat(client)
+            raise AssertionError("连不上服务器时必须抛 LlmError")
+        except llm.LlmError as exc:
+            assert exc.code == "API_UNREACHABLE", exc.code
+            assert "ConnectError" in exc.message, f"报错必须说清失败类型：{exc.message!r}"
+            assert "api.example.invalid" in exc.message, f"报错必须带目标地址：{exc.message!r}"
+        assert FakeClient.calls == 2, f"连接阶段应重试一次（共 2 次尝试），实际 {FakeClient.calls}"
+
+        # 2) 请求已发出后断流：**绝不重试**（防止重复计费 / 重复内容）
+        FakeClient.calls = 0
+        FakeClient.next_exc = httpx.RemoteProtocolError("")
+        try:
+            run_chat(client)
+            raise AssertionError("断流时必须抛 LlmError")
+        except llm.LlmError as exc:
+            assert exc.code == "API_UNREACHABLE", exc.code
+            assert "RemoteProtocolError" in exc.message, exc.message
+        assert FakeClient.calls == 1, f"已发出的请求不许重放，实际发了 {FakeClient.calls} 次"
+
+        # 3) 流式：已经开始吐字之后再断，同样不许从头重放
+        httpx.AsyncClient = FakeStreamClient  # type: ignore[misc]
+        FakeStreamClient.streams = 0
+        stream_client = llm.DeepSeekClient("sk-selftest", base_url="https://api.example.invalid")
+
+        async def consume() -> list[str]:
+            chunks: list[str] = []
+            async for piece in stream_client.chat_stream([{"role": "user", "content": "hi"}]):
+                chunks.append(piece)
+            return chunks
+
+        try:
+            asyncio.run(consume())
+            raise AssertionError("流中断时必须抛 LlmError")
+        except llm.LlmError as exc:
+            assert exc.code == "API_UNREACHABLE", exc.code
+            assert "ReadError" in exc.message, exc.message
+        assert FakeStreamClient.streams == 1, (
+            f"已经收到内容之后绝不能再发一次请求，实际发了 {FakeStreamClient.streams} 次"
+        )
+    finally:
+        httpx.AsyncClient = real_client  # type: ignore[misc]
+        llm.CONNECT_RETRY_DELAY_S = real_delay
+
+    # 空 `str()` 的异常也必须给出可读原因（用异常类型兜底）
+    assert llm._describe_network_error(httpx.ReadError("")).strip()  # noqa: SLF001
+    assert "ReadError" in llm._describe_network_error(httpx.ReadError(""))  # noqa: SLF001
+    assert "超时" in llm._describe_network_error(httpx.ConnectTimeout("超时了"))  # noqa: SLF001
+    return "连接阶段重试 1 次、断流不重放、报错带异常类型与目标地址"
+
+
+def t_install_swap_rollback() -> str:
+    """换安装目录必须「可回滚」，改名必须容忍短暂占用。
+
+    这条来自一次真实的端到端失败：安装流程先在旁路目录 `.new` 里跑一次
+    `openscad.exe` 冒烟测试，紧接着就把该目录改名到正式位置 —— Windows 在
+    进程退出后仍会短暂持有刚运行过的 exe 映像，`rename` 于是报
+    `[WinError 5] 拒绝访问`。旧实现是「先 rmtree(正式目录) 再 rename」，
+    这一次失败就把**用户手里那份能用的 OpenSCAD 删掉了**，
+    而本文件上面刚写过"一次失败的重新安装把可用环境砸掉，是最不该发生的退化"。
+    """
+    import tempfile
+    from pathlib import Path
+
+    from aiforge import openscad
+
+    def make_install(root: Path, marker: str) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        target = root / "openscad"
+        (target / "openscad-2021.01").mkdir(parents=True)
+        (target / "openscad-2021.01" / "openscad.exe").write_text(marker, encoding="utf-8")
+        return target
+
+    with tempfile.TemporaryDirectory(prefix="swap_") as tmp:
+        root = Path(tmp)
+
+        # 1) 正常替换：新目录就位、旁路目录消失、备份不残留
+        case1 = root / "case1"
+        target = make_install(case1, "OLD")
+        staging = case1 / "openscad.new"
+        (staging / "openscad-2021.01").mkdir(parents=True)
+        (staging / "openscad-2021.01" / "openscad.exe").write_text("NEW", encoding="utf-8")
+        openscad._swap_install_dir(staging, target)  # noqa: SLF001
+        assert (target / "openscad-2021.01" / "openscad.exe").read_text(encoding="utf-8") == "NEW"
+        assert not staging.exists(), "旁路目录应已被换走"
+        assert not (case1 / "openscad.old").exists(), "备份目录不该残留"
+
+        # 2) 换入失败：**原来的目录必须还在**（回滚），一个文件都不能少
+        case2 = root / "case2"
+        target = make_install(case2, "OLD2")
+        staging = case2 / "openscad.new"
+        (staging / "openscad-2021.01").mkdir(parents=True)
+        (staging / "openscad-2021.01" / "openscad.exe").write_text("NEW2", encoding="utf-8")
+
+        real_rename = Path.rename
+        calls: list[tuple[str, str]] = []
+
+        def flaky_rename(self, dst):  # type: ignore[no-untyped-def]
+            calls.append((self.name, Path(dst).name))
+            # 只拦「旁路 → 正式」这一步，且永久失败（模拟占用一直不释放）
+            if self.name == "openscad.new" and Path(dst).name == "openscad":
+                raise PermissionError(5, "拒绝访问")
+            return real_rename(self, dst)
+
+        Path.rename = flaky_rename  # type: ignore[method-assign]
+        try:
+            try:
+                openscad._swap_install_dir(staging, target)  # noqa: SLF001
+                raise AssertionError("换入失败时必须抛错，不能假装成功")
+            except OSError:
+                pass
+        finally:
+            Path.rename = real_rename  # type: ignore[method-assign]
+
+        assert (target / "openscad-2021.01" / "openscad.exe").read_text(encoding="utf-8") == "OLD2", (
+            "换入失败之后，用户原来那份能用的 OpenSCAD 必须还在"
+        )
+        attempts = [c for c in calls if c[0] == "openscad.new"]
+        assert len(attempts) >= 2, f"改名必须重试（实测会撞上短暂占用），实际尝试 {len(attempts)} 次"
+
+        # 3) 短暂占用（前两次失败、第三次成功）必须最终成功 —— 这正是真机上的形态
+        case3 = root / "case3"
+        target = make_install(case3, "OLD3")
+        staging = case3 / "openscad.new"
+        (staging / "openscad-2021.01").mkdir(parents=True)
+        (staging / "openscad-2021.01" / "openscad.exe").write_text("NEW3", encoding="utf-8")
+        seen = {"n": 0}
+
+        def transient_rename(self, dst):  # type: ignore[no-untyped-def]
+            if self.name == "openscad.new" and Path(dst).name == "openscad":
+                seen["n"] += 1
+                if seen["n"] <= 2:
+                    raise PermissionError(5, "拒绝访问")
+            return real_rename(self, dst)
+
+        Path.rename = transient_rename  # type: ignore[method-assign]
+        try:
+            openscad._swap_install_dir(staging, target)  # noqa: SLF001
+        finally:
+            Path.rename = real_rename  # type: ignore[method-assign]
+        assert seen["n"] == 3, f"重试次数不对：{seen['n']}"
+        assert (target / "openscad-2021.01" / "openscad.exe").read_text(encoding="utf-8") == "NEW3"
+
+    # 这条守卫本身也要防退化：安装流程里不能再出现「先删正式目录再改名」的写法
+    import inspect
+
+    source = inspect.getsource(openscad.install_portable)
+    assert "shutil.rmtree(target_dir, ignore_errors=True)\n        staging.rename" not in source, (
+        "不许先删正式目录再改名：改名失败会让用户的 OpenSCAD 彻底消失"
+    )
+    assert "_swap_install_dir(staging, target_dir)" in source, "安装流程必须走可回滚的换目录"
+    return "换目录可回滚（失败时原环境完好）、改名退避重试、正常替换无残留"
+
+
 def t_geometry_repair() -> str:
     """尺寸/结构自动修复的判定逻辑（离线，不调用 AI）。
 
@@ -3016,14 +3445,22 @@ def main() -> int:
     check("参数提取与改写", t_scad_params)
 
     section("3D 引擎")
+    # 引擎类检查放在最前面，理由只有一条：**它们需要 OpenSCAD 已经可用**。
+    # 这条是「别人的机器上 clone 下来跑」实测暴露的：全新环境里没有 OpenSCAD，
+    # 而下面是"拿 OpenSCAD 编译一个立方体再分析网格"的检查 ——
+    # 它会以 `CompileError: 没有找到 OpenSCAD` 失败，用户看到的却是
+    # 「STL 网格分析 失败」，像是代码有问题。自检应当像应用本身一样**先把
+    # 环境准备好**（自动安装那一步本来就是干这个的，且已有安装时只花 1 秒复用）。
+    check("OpenSCAD 自动安装", t_openscad_install)
+    check("OpenSCAD 检测与 CLI", t_openscad_detect)
     check("STL 网格分析", t_mesh_analysis)
     check("STL 读取健壮性", t_stl_robustness)
     check("长分析心跳", t_analysis_heartbeat)
     check("助手调用作用域", t_helper_job_scope)
-    check("OpenSCAD 自动安装", t_openscad_install)
+    check("子进程不变量守护", t_child_process_guard)
     check("安装失败不破坏已有环境", t_install_no_destroy)
+    check("换安装目录可回滚", t_install_swap_rollback)
     check("验收脚本不覆盖用户配置", t_install_test_keeps_config)
-    check("OpenSCAD 检测与 CLI", t_openscad_detect)
     check("SCAD → STL 编译", t_compiler)
 
     section("业务层")
@@ -3035,6 +3472,8 @@ def main() -> int:
     check("项目持久化", t_projects)
     check("环境检测报告", t_envcheck)
     check("作业与事件流", t_sse_contract)
+    check("进度可信度", t_progress_accuracy)
+    check("网络失败可读且可重试", t_network_errors)
     check("接口响应形状", t_contract_shapes)
     check("并发作业守卫", t_busy_guard)
     check("提示词与解析（离线）", t_llm_offline)

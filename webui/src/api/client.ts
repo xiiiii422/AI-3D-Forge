@@ -185,6 +185,15 @@ export const api = {
       method: 'POST',
       body,
     }),
+  /**
+   * 列出某个项目的作业（后端只回最近 20 条）。
+   *
+   * 用途：**切页/刷新后重新接管正在跑的作业**。作业状态在后端，
+   * 前端组件一卸载就全忘了 —— 于是"在后台建模时点去别的界面再回来，
+   * 建模界面凭空消失"，而作业其实还在跑。
+   */
+  listJobs: (projectId: string, signal?: AbortSignal) =>
+    request<{ jobs: Job[] }>('/jobs', { query: { project_id: projectId }, signal }),
   updateParams: (projectId: string, body: UpdateParamsRequest) =>
     request<JobRef>(`/projects/${encodeURIComponent(projectId)}/params`, {
       method: 'POST',

@@ -168,6 +168,11 @@ def stream_job(client: httpx.Client, job_id: str, label: str) -> dict:
     events = 0
     confirmed = False
     captured_spec: dict | None = None
+    # 进度轨迹：用户反馈「进度条不能体现准确的进度」，所以这里把真实跑一遍时
+    # SSE 里发出来的 (相对时间, 阶段, 百分比) 全记下来，跑完当场断言。
+    # 断言的是**流里真实发出来的值**，不是代码里写的常量。
+    trace: list[tuple[float, str, float]] = []
+    trace_started = time.monotonic()
     # 刷新页面时前端只剩首帧 snapshot 可用，所以「等待确认」这一步的快照
     # 必须自带 spec —— 这一条是用户在服务端死等、界面却什么都没有的根因。
     # （走事件流时快照本身可能早于状态切换，因此也接受 spec 事件这一路径。）
@@ -242,12 +247,31 @@ def stream_job(client: httpx.Client, job_id: str, label: str) -> dict:
                 if payload.get("stage") == "awaiting_confirmation":
                     _confirm()
                 percent = payload.get("percent")
+                if percent is not None:
+                    trace.append(
+                        (
+                            time.monotonic() - trace_started,
+                            str(payload.get("stage") or ""),
+                            float(percent),
+                        )
+                    )
                 if percent is not None and abs(float(percent) - last_percent) >= 4:
                     last_percent = float(percent)
                     print(f"      [{float(percent):5.1f}%] {payload.get('text', '')}", flush=True)
             elif event_name in ("done", "error", "cancelled"):
                 print(f"      <<{event_name}>>", flush=True)
                 final = {"event": event_name, **payload}
+                # 终帧也是前端读百分比的地方（done 快照里就是 100.0），
+                # 不记进来的话轨迹会停在导出阶段的 99%。
+                terminal_percent = payload.get("percent")
+                if isinstance(terminal_percent, (int, float)):
+                    trace.append(
+                        (
+                            time.monotonic() - trace_started,
+                            str(payload.get("stage") or event_name),
+                            float(terminal_percent),
+                        )
+                    )
                 # 展开 result，兼容两种载荷形状（完整快照 / 纯 JobResult）
                 result = payload.get("result")
                 if isinstance(result, dict):
@@ -261,10 +285,70 @@ def stream_job(client: httpx.Client, job_id: str, label: str) -> dict:
         # setdefault 会因为「键已存在」而跳过，导致实时收到的规格被丢掉。
         final["spec"] = captured_spec
     final["snapshot_had_spec_while_waiting"] = snapshot_had_spec_while_waiting
+    final["progress_trace"] = trace
     # 失败时把错误信息提到顶层，方便调用方统一读取
     if final.get("status") == "error" and isinstance(final.get("error"), dict):
         final.setdefault("message", final["error"].get("message"))
     return final
+
+
+def _why(result: dict) -> str:
+    """失败时说清「为什么」，成功时给一句人话。
+
+    踩过的坑：这里原来是 `str(result.get("error") or "成功")` —— 而 error 事件的
+    载荷里根本没有 `error` 字段（原因在 `message` 里），于是**作业明明报错，
+    日志上却写着"成功"**。这种"看起来通过"的假证据比不打印还坏。
+    """
+    if result.get("event") == "done":
+        return "成功"
+    parts = [
+        str(result.get(key)).strip()
+        for key in ("message", "hint", "code")
+        if result.get(key)
+    ]
+    nested = result.get("error")
+    if isinstance(nested, dict):
+        parts = [str(nested.get(key)).strip() for key in ("message", "hint", "code") if nested.get(key)]
+    return "；".join(parts) or f"作业以 {result.get('event')} 结束（没有给出原因）"
+
+
+def check_progress_trace(result: dict, label: str) -> None:
+    """进度条必须真的在动、且只进不退（跑在**真实生成**的 SSE 流上）。
+
+    用户反馈「进度条不太规范，不能体现准确的进度」。旧实现的毛病是：
+    每个阶段只有一个写死的百分比，最长的生成阶段干脆没有百分比（不定态转圈），
+    于是用户无法区分「在跑」和「卡死」。
+    """
+    trace = result.get("progress_trace") or []
+    if result.get("event") != "done":
+        # 失败/取消的运行不适用这条契约（本来就不会走到 100%）
+        return
+    percents = [percent for _t, _stage, percent in trace]
+    step(f"{label}：进度事件成序列", len(trace) >= 5, f"收到 {len(trace)} 个百分比事件")
+    step(
+        f"{label}：进度只进不退",
+        percents == sorted(percents),
+        "看不出倒退" if percents == sorted(percents) else f"{percents}",
+    )
+    by_stage: dict[str, set[float]] = {}
+    for _t, stage, percent in trace:
+        by_stage.setdefault(stage or "?", set()).add(percent)
+    moving = sorted(stage for stage, values in by_stage.items() if len(values) >= 2)
+    step(
+        f"{label}：长阶段内确实在推进（不是一个阶段一个定格数字）",
+        bool(moving),
+        f"阶段内出现多个百分比：{moving}",
+    )
+    step(
+        f"{label}：只有做完才是 100%",
+        bool(percents) and percents[-1] == 100.0 and all(p < 100.0 for p in percents[:-1]),
+        f"共 {len(set(percents))} 个不同取值，末值 {percents[-1] if percents else None}",
+    )
+    step(
+        f"{label}：进度分档有区分度",
+        len(set(percents)) >= 6,
+        f"{sorted(set(percents))}",
+    )
 
 
 def stream_install(client: httpx.Client, job_id: str) -> dict:
@@ -546,7 +630,8 @@ def main() -> int:
         project_id = ref["project_id"]
         job_result = stream_job(client, ref["job_id"], "生成")
 
-        step("AI 生成 SCAD 并编译成功", job_result.get("event") == "done", str(job_result.get("error") or "成功"))
+        step("AI 生成 SCAD 并编译成功", job_result.get("event") == "done", _why(job_result))
+        check_progress_trace(job_result, "生成")
 
         if job_result.get("event") != "done":
             print(json.dumps(job_result, ensure_ascii=False, indent=2)[:2000])
@@ -652,7 +737,8 @@ def main() -> int:
         modify = client.post("/api/jobs", json={"instruction": MODIFY, "project_id": project_id, "mode": "modify"})
         step("修改任务已创建", modify.status_code == 202, modify.text[:120])
         modify_result = stream_job(client, modify.json()["job_id"], "修改")
-        step("修改后重新生成成功", modify_result.get("event") == "done", str(modify_result.get("error") or "成功"))
+        step("修改后重新生成成功", modify_result.get("event") == "done", _why(modify_result))
+        check_progress_trace(modify_result, "修改")
 
         if modify_result.get("event") == "done":
             new_stl = modify_result.get("stl") or {}
@@ -770,23 +856,56 @@ def main() -> int:
         if height_param:
             param_name = height_param["name"]
             tweak_value = round(float(height_param["value"]) * 1.6, 1)
-            pre_metrics = client.get(f"/api/projects/{project_id}/metrics").json()
+            metrics_resp = client.get(f"/api/projects/{project_id}/metrics")
+            pre_metrics = metrics_resp.json() if metrics_resp.status_code == 200 else {}
             pre_z = (pre_metrics.get("bbox") or {}).get("z")
+            # 「拿到一个能用的基准尺寸」本身也要当成一步来报。
+            # 原先这里直接把 pre_z 丢进 float()：接口一旦没给 bbox，测试会以
+            # TypeError 崩掉整轮验收，而不是报告"这一步失败了" —— 崩掉会掩盖掉
+            # 后面所有步骤的结果，看起来像"测试脚本坏了"，其实是被测接口变了。
+            step(
+                "调参前能读到模型实测尺寸",
+                isinstance(pre_z, (int, float)),
+                f"HTTP {metrics_resp.status_code}；bbox={pre_metrics.get('bbox')}",
+            )
             tweak = client.post(f"/api/projects/{project_id}/params", json={"params": {param_name: tweak_value}})
             step("参数调整任务已创建", tweak.status_code == 202, tweak.text[:100])
             tweak_result = stream_job(client, tweak.json()["job_id"], "调参")
             if tweak_result.get("event") == "done":
                 new_params = {p["name"]: p["value"] for p in (tweak_result.get("params") or [])}
-                in_source = f"{param_name} = {tweak_value:g}" in (tweak_result.get("scad") or "")
+                # 断言要容忍我们**自己**在提示词里要求的对齐写法：源码长这样
+                #   `height   = 240;`
+                # 早期这里写成字面量 `f"{name} = {value}" in scad`，一旦 AI 把等号
+                # 对齐（我们正是这么要求的）就永远匹配不上 —— 模型明明改对了，
+                # 报告却说"参数没生效"。这类"拿字面量当断言"的脆弱检查见 §55。
+                in_source = bool(
+                    re.search(
+                        rf"(?m)^\s*{re.escape(param_name)}\s*=\s*{tweak_value:g}(?:\.0+)?\s*;",
+                        tweak_result.get("scad") or "",
+                    )
+                )
                 value_ok = abs(float(new_params.get(param_name, 0)) - tweak_value) < 1e-6
+                stl_info = tweak_result.get("stl") or {}
+                z = (stl_info.get("bbox_mm") or {}).get("z")
+                measured_ok = isinstance(z, (int, float))
+                step(
+                    "调参结果里带着模型实测尺寸",
+                    measured_ok,
+                    f"stl 字段：{sorted(stl_info)[:10]}；bbox_mm={stl_info.get('bbox_mm')}",
+                )
                 # 高度类参数会反映到 Z 尺寸，但总高通常还包含底座等其它结构，
                 # 因此断言「整体明显变高」而不是「恰好等于参数值」。
-                z = (tweak_result.get("stl") or {}).get("bbox_mm", {}).get("z")
-                raised = float(z) > float(pre_z) * 1.1
+                raised = bool(
+                    measured_ok
+                    and isinstance(pre_z, (int, float))
+                    and float(z) > float(pre_z) * 1.1
+                )
                 step(
                     f"参数生效（{param_name}: {height_param['value']} → {tweak_value}，未调用 AI）",
                     in_source and value_ok and raised,
-                    f"源码已写入新值，Z 尺寸 {pre_z}mm → {z}mm（参数值 {tweak_value}，含底座等结构故不等高）",
+                    f"写进源码={in_source}、回读参数={new_params.get(param_name)}"
+                    f"（期望 {tweak_value}，{'一致' if value_ok else '不一致'}）、"
+                    f"Z 尺寸 {pre_z}mm → {z}mm（含底座等结构故不等高）",
                 )
             else:
                 step("参数微调任务完成", False, str(tweak_result.get("message")))

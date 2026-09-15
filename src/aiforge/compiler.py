@@ -222,10 +222,13 @@ def compile_to_stl(
     cmd = [str(exe), "-o", str(stl_path), str(scad_path)]
     log.debug("编译：%s", " ".join(cmd))
     try:
-        proc = subprocess.run(
+        # 走 procguard：登记 PID，应用退出时先把它收掉，
+        # 避免"软件关了 OpenSCAD 还在算"（详见 procguard 的模块说明）。
+        from . import procguard
+
+        proc = procguard.run(
             cmd,
             timeout=timeout_s,
-            check=False,
             **scad_cli._popen_kwargs(),  # noqa: SLF001 - 同一包内的私有约定
         )
     except subprocess.TimeoutExpired:

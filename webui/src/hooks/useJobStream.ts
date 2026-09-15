@@ -118,6 +118,8 @@ export function useJobStream({
         const sameJob = prev && prev.job_id === next.job_id;
         return {
           ...next,
+          // 进度只进不退：流和轮询是两条通道，乱序到达的旧帧不该让进度条往回跳
+          percent: sameJob ? Math.max(prev.percent ?? 0, next.percent ?? 0) : next.percent,
           // 消息按 seq 合并，避免流与轮询之间的重复/乱序
           messages: mergeMessages(sameJob ? prev.messages : [], next.messages ?? []),
           // 后端在某帧里省略 result 时保留上一次已拿到的结果

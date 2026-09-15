@@ -97,6 +97,19 @@ class ServerThread(threading.Thread):
 
 
 def start_server(preferred_port: int = DEFAULT_PORT) -> tuple[ServerThread, int]:
+    # 起服务之前先把子进程守护装好：应用退出时（含 os._exit / 被强杀）
+    # 由内核连带结束所有子进程，不让 OpenSCAD 变成孤儿继续跑。
+    # 顺带清扫上次崩溃残留的、**由我们安装的** OpenSCAD 进程。
+    try:
+        from . import procguard
+        from .openscad import managed_install_dir
+
+        files = paths()
+        procguard.install(record_path=files.local_dir() / "child-processes.json")
+        procguard.sweep_orphans(managed_install_dir())
+    except Exception as exc:  # noqa: BLE001 - 守护失败不能挡住启动
+        log.warning("子进程守护启用失败（不影响使用）：%s", exc)
+
     port = find_free_port(preferred_port)
     thread = ServerThread(port)
     thread.start()

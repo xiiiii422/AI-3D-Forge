@@ -453,6 +453,12 @@ def initial_prompt(requirement: str, spec: DesignSpec, printer_block: str | None
     parts: list[str] = []
     if printer_block:
         parts.append(f"目标打印机与工艺约束：\n{printer_block}")
+    # 命中固定零件库时，先给出「现成零件」块：螺纹等功能几何不要现写
+    from .llm import _parts_block_for
+
+    parts_spec_block = _parts_block_for(requirement, spec.to_prompt())
+    if parts_spec_block:
+        parts.append(parts_spec_block)
     parts.append(
         "这是一份已经和用户确认过的设计规格，请严格按它设计，"
         "不要改变其中【用户指定】的数值，也不要引入被排除的结构：\n\n"

@@ -24,7 +24,7 @@
 
 结果：
 
-- [ ] `scripts/selfcheck.py` 全绿（47 项）
+- [ ] `scripts/selfcheck.py` 全绿（50 项）
 - [ ] `scripts/selfcheck_design.py` 全绿
 - [ ] `scripts/check_no_secrets.py --history` 无发现
 - [ ] 改过前端：`npm run build` 通过，布局/规格卡片体检 0 缺陷

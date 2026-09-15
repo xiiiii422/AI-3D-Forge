@@ -200,11 +200,30 @@ def create_user_prompt(requirement: str, extra: str | None = None, printer_block
     body = ""
     if printer_block:
         body += f"目标打印机与工艺约束：\n{printer_block}\n\n"
+    parts = _parts_block_for(requirement, extra)
+    if parts:
+        body += parts + "\n\n"
     body += f"请设计以下 3D 打印模型：\n\n{requirement.strip()}\n"
     if extra:
         body += f"\n补充要求：{extra.strip()}\n"
     body += "\n请直接输出符合上述规范、并且能在这台打印机上直接打印成功的完整 OpenSCAD 代码。"
     return body
+
+
+def _parts_block_for(*texts: str | None) -> str:
+    """命中固定零件库时，把「现成零件」块插进提示词（没命中就返回空串）。
+
+    为什么按需求文本匹配而不是让模型自己判断：模型并不知道我们有哪些现成零件，
+    而"72 转 67 滤镜环"这类需求本质是**选零件 + 填数字**；匹配放在程序里做，
+    prompt 只在真正相关时才变长（其余需求的提示词保持精简）。
+    """
+    from .parts import catalog as parts_lib
+
+    combined = " ".join(t for t in texts if t)
+    matched = parts_lib.match(combined)
+    if not matched:
+        return ""
+    return parts_lib.prompt_block(matched, combined)
 
 
 def modify_user_prompt(current_scad: str, instruction: str, printer_block: str | None = None) -> str:
@@ -428,10 +447,21 @@ def geometry_repair_user_prompt(scad: str, problem: str, attempt: int = 1) -> st
         if attempt >= 2
         else ""
     )
+    # 代码/问题里只要出现螺纹痕迹，就把固定零件库摆出来 —— 手写螺旋几何是
+    # "修不好"的典型（不封闭或整块被丢），换用现成零件才是真正的修法。
+    parts_block = ""
+    if re.search(r"thread|螺纹|螺距|滤镜|转接", scad + problem, re.IGNORECASE):
+        block = _parts_block_for(scad, problem)
+        if block:
+            parts_block = (
+                "**如果这段代码是在手写螺纹/转接结构，请改成使用程序自带的固定零件库**"
+                "（已实测验证，比自己写螺旋几何可靠）：\n\n" + block + "\n\n"
+            )
     return (
         "下面这份 OpenSCAD 代码能正常编译，但导出的模型在几何上不成立。\n\n"
         f"代码：\n```openscad\n{trimmed}\n```\n\n"
         f"程序对导出的 STL 实测结果：\n{problem.strip()[:1600]}\n\n"
+        f"{parts_block}"
         f"{retry_note}"
         "请只修复上述问题，保持参数名、参数值、整体造型和其余结构不变，"
         "输出完整的、可直接编译的 OpenSCAD 代码。只输出代码本身，不要解释。"

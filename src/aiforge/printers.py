@@ -34,12 +34,15 @@ log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
-# 生成字号时给喷嘴留的余量（见 resolve_process 的说明）
+# 生成字号时给喷嘴留的余量（见 resolve_fn 的说明）
 # 这个倍数决定「圆弧面被多边形逼近时的最大偏差」= 喷嘴 / 该倍数。
-# 取 8 时，0.4mm 喷嘴的允许偏差约 0.05mm —— 远小于一个喷嘴宽度，
-# 肉眼看不到棱面；再放宽（例如取 2）会在直径较大的圆柱上出现明显多边形感。
-FN_TOLERANCE_DIVISOR = 8.0
-FN_MIN = 24
+#   取 8  → 0.4mm 喷嘴允许偏差 0.050mm：物理上够，但用户反馈"圆看着不圆"
+#           （79 段的 Ø130 圆，弦长 5mm，轮廓看得出多边形感）；
+#   取 16 → 允许偏差 0.025mm：Ø130 圆约 113 段、Ø80 约 88 段，
+#           编译时间约增加 40%，换来肉眼干净的圆。
+# 另外把下限从 24 提到 48：小零件（Ø20）此前会被算到 31 段，棱面很明显。
+FN_TOLERANCE_DIVISOR = 16.0
+FN_MIN = 48
 FN_MAX = 160
 
 MATERIAL_DENSITY: dict[str, float] = {
@@ -622,14 +625,15 @@ def resolve_fn(profile: PrinterProfile, model_size_mm: float, is_resin: bool | N
     反解出 n ≈ π / sqrt(4 · error / 直径)。
     取 error = 喷嘴 / FN_TOLERANCE_DIVISOR，于是喷嘴越细、模型越大，分段越多。
 
-    实测参考（0.4mm 喷嘴）：直径 128mm 的圆需要约 50 段，直径 256mm 约 70 段，
-    才能把棱面误差压到 0.05mm 以下。
+    实测参考（0.4mm 喷嘴、允许偏差 0.025mm）：Ø20 → 48 段（下限）、
+    Ø80 → 约 88 段、Ø130 → 约 113 段。用户反馈过"圆看着不圆"，
+    所以这里按**看得见的标准**取，而不是"物理上够用就行"。
     """
     if is_resin is None:
         is_resin = profile.extruder == "resin" or profile.nozzle_mm <= 0
     if is_resin:
         # 光固化没有挤出宽度概念，按像素尺寸给一个足够平滑的固定值即可
-        return 64
+        return max(64, FN_MIN)
     tolerance = max(profile.nozzle_mm, 0.1) / FN_TOLERANCE_DIVISOR
     diameter = max(float(model_size_mm), 10.0)
     fn = 3.14159265358979 / (4.0 * tolerance / diameter) ** 0.5

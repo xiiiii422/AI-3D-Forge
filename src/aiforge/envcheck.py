@@ -55,6 +55,7 @@ CHECK_IDS = (
     "openscad_cli",
     "openscad_version",
     "deps",
+    "child_guard",
     "project_dir",
     "network",
     "api",
@@ -357,6 +358,42 @@ def check_deps() -> CheckItem:
         status="ok",
         detail=f"{len(present)} 项运行组件已全部就绪。",
         meta={"present": present},
+    )
+
+
+def check_child_guard() -> CheckItem:
+    """子进程守护是否真的生效（用户反馈：关掉软件后 OpenSCAD 还在后台跑）。
+
+    为什么要在"系统诊断"里露出来：这条守护是**静默降级**的 —— 装不上时
+    程序照常运行，只是退出时会留下后台进程。没有一处可看的状态，
+    这类问题就只能靠用户发现"风扇还在转"。
+    """
+    from . import procguard
+
+    if os.name != "nt":
+        return CheckItem(
+            id="child_guard",
+            title="后台进程守护",
+            status="ok",
+            detail="非 Windows 平台：退出时按登记表结束自己启动的子进程。",
+            meta={"job_object": False, "platform": os.name},
+        )
+    active = procguard.job_object_active()
+    if active:
+        return CheckItem(
+            id="child_guard",
+            title="后台进程守护",
+            status="ok",
+            detail="已启用：退出软件时系统会连带结束它启动的所有子进程（含 OpenSCAD）。",
+            meta={"job_object": True},
+        )
+    return CheckItem(
+        id="child_guard",
+        title="后台进程守护",
+        status="warn",
+        detail="当前环境不支持作业对象守护，退出时改由登记表清理子进程。",
+        action="一般无需处理；若退出后仍看到 openscad.exe 残留，请结束它并反馈本机环境信息。",
+        meta={"job_object": False},
     )
 
 
@@ -737,6 +774,7 @@ async def build_report(*, live: bool = False, use_cache: bool = True, deep: bool
         asyncio.to_thread(check_python_version),
         asyncio.to_thread(check_openscad, deep),
         asyncio.to_thread(check_deps),
+        asyncio.to_thread(check_child_guard),
         asyncio.to_thread(check_project_dir),
         asyncio.to_thread(check_temp),
         asyncio.to_thread(check_stl_preview),

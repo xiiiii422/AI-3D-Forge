@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
+import { toCreasedNormals } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { stlRawUrl } from '../api/client';
 
 export interface ModelStats {
@@ -236,8 +237,16 @@ export default function Viewer3D({
       .then((buffer) => {
         if (cancelled) return;
         if (buffer.byteLength === 0) throw new Error('模型文件为空。');
-        const geometry = new STLLoader().parse(buffer);
-        geometry.computeVertexNormals();
+        const raw = new STLLoader().parse(buffer);
+        // 法线必须按「折痕角度」算，不能直接 computeVertexNormals()。
+        //
+        // STL 里每个三角面自带三个**互不共享**的顶点，直接算顶点法线得到的是
+        // 面法线 = 平面着色：一个 79 段的圆柱在屏幕上就是 79 个平面，
+        // 用户会以为"圆根本没画圆"（用户反馈原话：「建模圆形时边数太少，
+        // 完全达不到圆的效果」）。toCreasedNormals 会在夹角小于阈值的相邻面
+        // 之间做平滑（曲面变圆滑），同时保留真正的棱角（立方体的边不会被抹圆）。
+        const geometry = toCreasedNormals(raw, THREE.MathUtils.degToRad(30));
+        raw.dispose();
         geometry.computeBoundingBox();
 
         const material = new THREE.MeshStandardMaterial({

@@ -96,19 +96,48 @@ class ServerThread(threading.Thread):
             self._server.should_exit = True
 
 
-def start_server(preferred_port: int = DEFAULT_PORT) -> tuple[ServerThread, int]:
-    # 起服务之前先把子进程守护装好：应用退出时（含 os._exit / 被强杀）
-    # 由内核连带结束所有子进程，不让 OpenSCAD 变成孤儿继续跑。
-    # 顺带清扫上次崩溃残留的、**由我们安装的** OpenSCAD 进程。
+def install_child_guard() -> bool:
+    """装好「应用一死、子进程全灭」的守护，并清扫上次崩溃残留的 OpenSCAD。
+
+    这是一条**硬不变量**（用户反馈："关闭应用后 openscan 还会继续工作"），
+    所以它单独成函数、带回返回值，能被测试与诊断直接验证 —— 而不是埋在
+    start_server 的 try/except 里"失败了也没人知道"。
+
+    实测踩过的坑（就是这次抓出来的）：这里原本写的是 `files.local_dir()`，
+    而 `AppPaths` 上根本没有这个字段（只有 `runtime_dir` / `cache_dir`）——
+    于是每次启动都抛 AttributeError、被 except 吞成一行 warning，
+    **守护实际上从来没有装上过**。自检当时只验了 procguard 模块本身
+    （直接调 install() 当然能过），没人验"应用启动时到底有没有调对"。
+    这就是"测了零件、没测接线"。
+    """
+    from . import procguard
+
     try:
-        from . import procguard
         from .openscad import managed_install_dir
 
         files = paths()
-        procguard.install(record_path=files.local_dir() / "child-processes.json")
-        procguard.sweep_orphans(managed_install_dir())
-    except Exception as exc:  # noqa: BLE001 - 守护失败不能挡住启动
-        log.warning("子进程守护启用失败（不影响使用）：%s", exc)
+        files.ensure()
+        record = files.runtime_dir / "child-processes.json"
+        active = procguard.install(record_path=record)
+        swept = procguard.sweep_orphans(managed_install_dir())
+        if swept:
+            log.info("启动清扫：结束了 %d 个上次残留的 OpenSCAD 进程", len(swept))
+        if not active:
+            # Windows 上装不上作业对象只可能是被别的作业限制住了（旧系统/受限环境），
+            # 此时还有登记表那层兜底，但必须留痕，不能静默。
+            log.error(
+                "子进程守护未生效（作业对象不可用）：退出时可能残留 OpenSCAD 子进程"
+            )
+        return active
+    except Exception as exc:  # noqa: BLE001 - 守护失败不能挡住启动，但必须可见
+        log.exception("子进程守护启用失败：%s", exc)
+        return False
+
+
+def start_server(preferred_port: int = DEFAULT_PORT) -> tuple[ServerThread, int]:
+    # 起服务之前先把子进程守护装好：应用退出时（含 os._exit / 被强杀）
+    # 由内核连带结束所有子进程，不让 OpenSCAD 变成孤儿继续跑。
+    install_child_guard()
 
     port = find_free_port(preferred_port)
     thread = ServerThread(port)

@@ -29,7 +29,7 @@ git checkout -b fix/short-description
 ### 提交前必须跑
 
 ```powershell
-# 1) 完整后端自检（47 项）
+# 1) 完整后端自检（50 项）
 & build\venv\Scripts\python.exe scripts\selfcheck.py
 
 # 2) 设计规格与改动机制（131 项子检查，不消耗 AI）

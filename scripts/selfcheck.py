@@ -55,6 +55,7 @@ OFFLINE_SKIPS: dict[str, str] = {
     "安装失败不破坏已有环境": "需要模拟一次真实的 OpenSCAD 安装",
     "子进程不变量守护": "依赖 Windows 作业对象（非 Windows 上语义不同）",
     "几何完整性自动修复": "需要真实几何数据（由 OpenSCAD 产出）",
+    "固定零件库可编译": "需要对每个零件真实编译（依赖 OpenSCAD）",
     "模型外观复核": "需要渲染模型（依赖 OpenSCAD）",
     "快捷方式解析": "需要 Windows .lnk 解析",
     "接口响应形状": "部分断言依赖已构建的前端产物 webui/dist",
@@ -616,7 +617,7 @@ def t_openscad_detect() -> str:
 
 
 def t_compiler() -> str:
-    from aiforge import compiler
+    from aiforge import compiler, openscad as scad_cli
 
     work = ROOT / "build" / "work" / "compiletest"
     if work.exists():
@@ -687,18 +688,43 @@ def t_compiler() -> str:
         assert f"$fn = {injected_fn};" in built.split("\n")[0], (
             f"{label}：应当注入 $fn = {injected_fn}，实际首行是 {built.splitlines()[0]!r}"
         )
-    # 顶层显式赋值必须被尊重，绝不覆盖作者的选择
-    respected, _a, _i = compiler.build_scad_source("$fn = 8;\n" + body, None, injected_fn)
-    assert "$fn = 8;" in respected and f"$fn = {injected_fn};" not in respected, respected.splitlines()[:2]
+    # 作者显式写了**高于下限**的 $fn：必须原样尊重（这是作者的取舍，不能覆盖）
+    respected, _a, _i = compiler.build_scad_source(f"$fn = {injected_fn + 40};\n" + body, None, injected_fn)
+    assert f"$fn = {injected_fn + 40};" in respected, respected.splitlines()[:2]
+    assert f"$fn = {injected_fn};" not in respected, respected.splitlines()[:2]
     # 顶层赋值在模块后面也算数（不能只看第一行）
-    later, _a, _i = compiler.build_scad_source(body + "$fn = 8;\n", None, injected_fn)
+    later, _a, _i = compiler.build_scad_source(body + f"$fn = {injected_fn + 40};\n", None, injected_fn)
     assert f"$fn = {injected_fn};" not in later, "顶层已有赋值就不该再注入"
-    # 并且注入真的改变了细分度（证明这条不是空跑）
+
+    # ---- 过小的 $fn 必须被抬到下限 -------------------------------------------
+    # 用户反馈原话：「建模圆形时边数太少，完全达不到圆的效果」。
+    # 实测 AI 会自己写 `$fn = 24`（甚至 8），把 Ø80 的圆画成 24 边形；
+    # 而逐图元写法（cylinder(..., $fn = 24)）优先级最高，顶层注入根本盖不住。
+    # 规则改为：作者的值只要**不低于按尺寸算出的下限**就尊重，低了就抬上来。
+    fn_floor = max(compiler.FN_FLOOR, int(injected_fn * 0.6))
+    for low in (8, 24):
+        raised, _a, _i = compiler.build_scad_source(f"$fn = {low};\n" + body, None, injected_fn)
+        assert f"$fn = {fn_floor};" in raised, f"顶层 $fn={low} 应当被抬到 {fn_floor}：{raised.splitlines()[:2]}"
+    inline, _a, _i = compiler.build_scad_source("cylinder(h=20, r=10, $fn = 8);\n", None, injected_fn)
+    assert "$fn = 8" not in inline, inline.splitlines()[:3]
+    assert "$fn = 8;" not in inline and ")" in inline, inline.splitlines()[:3]
+    # 抬升时必须保留原来的结尾符：曾经一律替换成 `$fn = N;`，
+    # 于是 `cylinder(..., $fn = 52;)` 直接语法错误 —— 修显示问题却把模型弄编译不过。
+    inline_ok = compiler.compile_to_stl("cylinder(h=20, r=10, $fn = 8);\n", work, "fn_inline")
+    assert inline_ok.ok, (inline_ok.message, inline_ok.fatal)
+    # 并且抬升真的改变了细分度（对照：直接让 OpenSCAD 编译未经规范化的 $fn = 8）
     plain_cyl = compiler.compile_to_stl(body, work, "fn_plain", None, None, injected_fn)
     coarse_cyl = compiler.compile_to_stl("$fn = 8;\n" + body, work, "fn_coarse", None, None, injected_fn)
-    assert compiler.analyze_stl(plain_cyl.stl_path).triangles > (
-        compiler.analyze_stl(coarse_cyl.stl_path).triangles * 2
-    ), "注入的 $fn 应当显著提高细分度，否则这条断言没有意义"
+    raw_scad = work / "fn_raw.scad"
+    raw_stl = work / "fn_raw.stl"
+    raw_scad.write_text("$fn = 8;\n" + body, encoding="utf-8")
+    scad_cli.run_cli(["-o", str(raw_stl), str(raw_scad)])
+    raw_triangles = compiler.analyze_stl(raw_stl).triangles
+    raised_triangles = compiler.analyze_stl(coarse_cyl.stl_path).triangles
+    assert raised_triangles > raw_triangles * 3, (
+        f"抬升后细分度必须显著提高：原始 $fn=8 是 {raw_triangles} 面，抬升后 {raised_triangles} 面"
+    )
+    assert compiler.analyze_stl(plain_cyl.stl_path).triangles >= raised_triangles, "注入值不应低于抬升后的下限"
 
     # 正确写法（旋转在挤出**外面**）不能被误判，而且形状真的对
     fixed = compiler.compile_to_stl(
@@ -1412,6 +1438,42 @@ def t_network_errors() -> str:
     return "连接阶段重试 1 次、断流不重放、报错带异常类型与目标地址"
 
 
+def t_child_guard_wiring() -> str:
+    """**接线**测试：应用启动时到底有没有把子进程守护装上。
+
+    为什么单列一条：原来只有 `t_child_process_guard` 验证 procguard 模块本身
+    （直接调 `install()` 当然过），没人验证"应用启动路径"。结果
+    `server.start_server()` 里写的是 `files.local_dir()` —— `AppPaths` 上根本没有
+    这个字段，每次启动都抛 AttributeError，被 except 吞成一行 warning，
+    **守护从未真正生效**。用户反馈的"关掉软件 OpenSCAD 还在跑"因此只修了一半。
+
+    这条测试用真实入口跑一遍，并断言 start_server 仍然会调它（防止以后被重构掉）。
+    """
+    import inspect
+
+    from aiforge import procguard, server as srv
+
+    procguard.reset_for_tests()
+    active = srv.install_child_guard()
+    if os.name == "nt":
+        assert active, "Windows 上必须能装上作业对象守护（否则退出会残留子进程）"
+        assert procguard.job_object_active(), "守护函数返回成功但作业对象没生效"
+    else:  # pragma: no cover - CI 可能跑在 Linux 上
+        assert active is False, "非 Windows 上应当明确返回 False，而不是假装成功"
+
+    source = inspect.getsource(srv.start_server)
+    assert "install_child_guard()" in source, "start_server 必须调用 install_child_guard()"
+
+    # 守护状态要能在「系统诊断」里看见 —— 静默降级等于没有
+    from aiforge import envcheck
+
+    item = envcheck.check_child_guard()
+    assert item.id == "child_guard", item.id
+    assert item.status in ("ok", "warn"), item.status
+    assert "child_guard" in envcheck.CHECK_IDS, "诊断报告里必须有这一项"
+    return f"启动即装好守护（active={active}），且能在系统诊断里看到"
+
+
 def t_install_swap_rollback() -> str:
     """换安装目录必须「可回滚」，改名必须容忍短暂占用。
 
@@ -1513,6 +1575,131 @@ def t_install_swap_rollback() -> str:
     )
     assert "_swap_install_dir(staging, target_dir)" in source, "安装流程必须走可回滚的换目录"
     return "换目录可回滚（失败时原环境完好）、改名退避重试、正常替换无残留"
+
+
+def t_parts_library() -> str:
+    """固定零件库：每个零件都要真实编译并实测（封闭 / 单一实体 / 尺寸对）。
+
+    为什么这条必须存在：零件库里放的是**手写几何**（螺旋螺纹），
+    这类几何一旦在 OpenSCAD 里镶嵌失败，用户拿到的是残缺或拧不上的模型，
+    而 OpenSCAD 的退出码仍然是 0 —— 不实测就发现不了。
+    参考 earthtojake/text-to-cad 的做法：标准件不现画，而是从**验证过的零件库**里选。
+    """
+    import subprocess as _subprocess
+
+    from aiforge.parts import catalog as parts_lib
+
+    # 库文件必须真实存在，且目录可被 OPENSCADPATH 引用
+    library = parts_lib.library_path()
+    assert library.is_file(), f"固定零件库缺失：{library}"
+    text = library.read_text(encoding="utf-8")
+    for spec in parts_lib.PARTS:
+        assert f"module {spec.module}(" in text, f"零件库缺少模块 {spec.module}"
+
+    # 安全例外必须**只**对该文件名生效（不能变成"放开 use"）
+    from aiforge import scad as scad_mod
+
+    assert scad_mod.validate(f"use <{parts_lib.LIBRARY_NAME}>\n{parts_lib.PARTS[0].usage.splitlines()[-1]}\n").ok, (
+        "自带零件库的 use 应当被允许"
+    )
+    for blocked in (
+        "use <threads.scad>\ncube(1);",
+        "use <../aiforge_parts.scad>\ncube(1);",
+        "use <C:/x/aiforge_parts.scad>\ncube(1);",
+        "include <aiforge_parts.scad>\ncube(1);",
+    ):
+        assert not scad_mod.validate(blocked).ok, f"这个引用必须被拦截：{blocked!r}"
+
+    # 需求匹配：用户问滤镜转接环时必须命中 filter_adapter
+    matched = parts_lib.match("设计一个 72mm 转 67mm 的滤镜转接环，M72×0.75 外螺纹转 M67×0.75 内螺纹")
+    assert matched and matched[0].id == "filter_adapter", [p.id for p in matched]
+    block = parts_lib.prompt_block(matched, "72mm 转 67mm 滤镜转接环")
+    assert "use <aiforge_parts.scad>" in block and "filter_adapter" in block, block[:200]
+    # 无关需求不该被塞零件块（否则每次生成都要多花 token）
+    assert not parts_lib.match("设计一个桌面手机支架，高度 100mm"), "无关需求不应命中零件库"
+
+    proc = _subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "verify_parts.py")],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=600,
+    )
+    output = (proc.stdout or "") + (proc.stderr or "")
+    assert proc.returncode == 0, "固定零件库实测未通过：\n" + output.strip()[-900:]
+    checked = output.strip().splitlines()[-1] if output.strip() else ""
+    return checked or f"{len(parts_lib.PARTS)} 个零件全部通过实测"
+
+
+def t_thread_detection() -> str:
+    """螺纹识别：真螺旋 vs 同心环（后者看着有纹路，实际拧不上）。
+
+    用**合成点云**测，不需要 OpenSCAD，所以离线也能跑：
+      * 真螺旋：牙顶只出现在一个薄片高度里的一小段角度上；
+      * 同心环（rotate_extrude 的产物）：同一个高度上四周到处都有牙顶。
+    用户反馈的「72 转 67 滤镜转接环做不出来」正是后者 —— 模型封闭、尺寸也对，
+    只有专门量才能发现拧不上。
+    """
+    import math as _math
+
+    from aiforge import mesh
+
+    def helix_points(turns: int = 6, pitch: float = 0.75, r_root: float = 35.5,
+                     depth: float = 0.46, per_turn: int = 120) -> list[tuple[float, float, float]]:
+        points = []
+        total = turns * per_turn
+        for i in range(total):
+            theta = 2 * _math.pi * i / per_turn
+            z = pitch * i / per_turn
+            # 牙型：相位 = 角度/2π − z/螺距，取三角波
+            phase = (i / per_turn) % 1.0
+            tooth = 1 - abs(2 * phase - 1)
+            r = r_root + depth * tooth
+            for offset in (0.0, 0.02):  # 表面附近两个半径，模拟网格厚度
+                points.append((r * _math.cos(theta), r * _math.sin(theta), z + offset))
+        return points
+
+    def ring_points(z_levels: int = 40, per_level: int = 60, pitch: float = 0.75,
+                    r_root: float = 35.5, depth: float = 0.46) -> list[tuple[float, float, float]]:
+        points = []
+        for level in range(z_levels):
+            z = pitch * level / 8.0
+            phase = (level / 8.0) % 1.0
+            tooth = 1 - abs(2 * phase - 1)
+            r = r_root + depth * tooth
+            for j in range(per_level):  # 同一高度上**整圈**都是这个半径
+                theta = 2 * _math.pi * j / per_level
+                points.append((r * _math.cos(theta), r * _math.sin(theta), z))
+        return points
+
+    helix = helix_points()
+    rings = ring_points()
+    assert mesh.detect_helix_thread(helix) is True, "真螺旋必须被判为螺旋"
+    # 同心环必须**不能**被判成螺旋。返回 None 表示"没找到螺旋"（保守结论），
+    # 与 False 同样是正确的判定 —— 关键是绝不能说它是螺旋。
+    assert mesh.detect_helix_thread(rings) is not True, "同心环绝不能被判成螺旋"
+    assert mesh.measure_thread_depth(helix) is not None, "真螺旋应当量出牙深"
+
+    # 需求里要螺纹、模型却没有真螺旋时，必须产出可执行的修复证据
+    from aiforge import jobs as jobs_mod
+
+    class _FakeMetrics:
+        thread_depth_mm = None
+        thread_is_helix = None
+
+    problems = jobs_mod._thread_problems(_FakeMetrics(), "设计一个 72mm 转 67mm 的滤镜转接环")  # noqa: SLF001
+    assert problems and "aiforge_parts.scad" in problems[0], problems
+    assert not jobs_mod._thread_problems(_FakeMetrics(), "设计一个桌面手机支架"), (  # noqa: SLF001
+        "无关需求不该报螺纹问题"
+    )
+    spiral = _FakeMetrics()
+    spiral.thread_depth_mm = 0.46
+    spiral.thread_is_helix = False
+    problems = jobs_mod._thread_problems(spiral, "螺纹转接环")  # noqa: SLF001
+    assert problems and "同心环" in problems[0], problems
+    return "真螺旋/同心环可区分（合成点云），无螺纹时给出「改用零件库」的修复证据"
 
 
 def t_geometry_repair() -> str:
@@ -3534,6 +3721,7 @@ def main() -> int:
     check("长分析心跳", t_analysis_heartbeat)
     check("助手调用作用域", t_helper_job_scope)
     check("子进程不变量守护", t_child_process_guard)
+    check("守护接线（启动即生效）", t_child_guard_wiring)
     check("安装失败不破坏已有环境", t_install_no_destroy)
     check("换安装目录可回滚", t_install_swap_rollback)
     check("验收脚本不覆盖用户配置", t_install_test_keeps_config)
@@ -3542,6 +3730,8 @@ def main() -> int:
     section("业务层")
     check("设计规格与改动机制", t_design_mechanism)
     check("几何完整性自动修复", t_geometry_repair)
+    check("固定零件库可编译", t_parts_library)
+    check("螺纹识别（螺旋/同心环）", t_thread_detection)
     check("模型外观复核", t_visual_review)
     check("模块引用静态检查", t_module_aliases)
     check("依赖声明完整性", t_declared_dependencies)

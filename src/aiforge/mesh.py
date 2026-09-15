@@ -56,6 +56,12 @@ class MeshMetrics:
     too_thin_rough: bool = False
     too_thin_wall: bool = False
     exceeds_build_volume: bool = False
+    # 实测到的螺旋螺纹牙深（mm）；None = 没有检测到螺纹。
+    # 为什么要单独记：细牙螺纹的牙尖只有零点几毫米，用普通壁厚判据看会误报成
+    # 「壁太薄、无法打印」——实测一个完全合规的 M72×0.75 转接环就被这么报过。
+    thread_depth_mm: float | None = None
+    # 螺纹是不是真螺旋（False = 同心环，看着有纹路但拧不上）；None = 没测/没螺纹
+    thread_is_helix: bool | None = None
     # 模型由几个互不相连的实体组成。
     # 为什么必须测这个：AI 很爱把「一个成品」做成「几个零件的组合」——
     # 实测用户的桌面垃圾桶需求，它给出的是「一个夹子 + 一个普通垃圾桶」，
@@ -309,6 +315,104 @@ def limits_from_printer(profile: Any, material: str | None = None) -> AnalysisLi
     )
 
 
+def measure_thread_depth(points: list[tuple[float, float, float]]) -> float | None:
+    """判断这个模型上有没有**螺旋螺纹**，有就返回实测牙深（mm）。
+
+    为什么要单独判一次：细牙螺纹的牙尖只有零点几毫米，用普通「壁厚」判据去看，
+    一个完全合规的 M72×0.75 转接环会被报成"壁厚 0.05mm，远低于 1.2mm，无法打印" ——
+    这是**误报**，用户会以为模型废了。
+
+    判据（实测定标）：
+      * 螺纹在固定高度上半径随角度周期变化，周期 ≈ 螺距对应的角度（0.75mm 螺距、
+        半径 36mm 时只有约 1.2°），比网格角度步长还小 —— 所以**不能**按角度分箱量，
+        那样会把牙顶牙底平均掉（实测只量出 0.07mm，真值 0.46mm）；
+      * 正确做法：取一个**跨一个螺距的高度带**（相位走满一圈），量该带内
+        **外表面**（半径较大的一半）的半径极差 —— 光滑圆筒≈0，真螺纹≈牙深；
+      * 高度带取模型高度的 1/8 且不超过 1.2mm；样本太少时返回 None（不猜）。
+
+    已知螺距范围 0.5~3mm 都覆盖得住（0.5mm 螺距时带高 0.5mm 也够走满一圈相位）。
+    """
+    if not points:
+        return None
+    zs = [p[2] for p in points]
+    if not zs:
+        return None
+    lo, hi = min(zs), max(zs)
+    height = hi - lo
+    if height < 0.6:
+        return None
+    band = min(1.2, max(0.5, height / 8.0))
+    z0 = lo + height * 0.35
+    z1 = min(z0 + band, hi)
+    radii = [math.hypot(p[0], p[1]) for p in points if z0 <= p[2] <= z1]
+    if len(radii) < 64:
+        return None
+    outer = [r for r in radii if r > (max(radii) + min(radii)) / 2]
+    if len(outer) < 32:
+        return None
+    depth = max(outer) - min(outer)
+    # 阈值 0.15mm：光滑圆筒的镶嵌噪声远小于它，而 0.5mm 螺距的牙深约 0.3mm
+    return round(depth, 3) if depth >= 0.15 else None
+
+
+def detect_helix_thread(points: list[tuple[float, float, float]]) -> bool | None:
+    """判断螺纹到底是**真螺旋**还是「一圈一圈的同心环」。
+
+    为什么必须分清（实测踩到的事故）：用 `rotate_extrude` 把一个牙型绕轴转一圈，
+    得到的是**同心环**——半径随高度变化、但同一高度上各个角度完全一样。
+    这种零件看着有"螺纹纹理"，实际根本拧不进去（滤镜转接环就是这么翻车的）。
+    上面那个 measure_thread_depth 只量"半径随高度有没有起伏"，
+    同心环照样能过 —— 所以再加这一条。
+
+    判据（不依赖已知螺距，也不怕角度采样比牙距粗）：
+      真螺旋：同一个**薄片高度**里，牙顶只出现在某一小段角度上 → 这些点的角度
+              高度集中（圆统计量 R = |mean(e^{iθ})| 接近 1）；
+      同心环：同一个高度上四周到处都有牙顶 → 角度均匀分布 → R 接近 0。
+    返回 True/False；样本不足时返回 None（不猜）。
+    """
+    if len(points) < 200:
+        return None
+    radii = [math.hypot(p[0], p[1]) for p in points]
+    r_max = max(radii)
+    if r_max <= 0:
+        return None
+    zs = [p[2] for p in points]
+    lo, hi = min(zs), max(zs)
+    if hi - lo < 0.6:
+        return None
+    slice_h = max(0.05, min(0.25, (hi - lo) / 60.0))
+    best: float | None = None
+    for frac in (0.25, 0.4, 0.55, 0.7):
+        z0 = lo + (hi - lo) * frac
+        in_slice = [
+            (math.hypot(p[0], p[1]), math.atan2(p[1], p[0]))
+            for p in points
+            if z0 <= p[2] <= z0 + slice_h
+        ]
+        if len(in_slice) < 8:
+            continue
+        radii_in = [r for r, _a in in_slice]
+        span = max(radii_in) - min(radii_in)
+        if span <= 0.05:
+            # 这一片里半径几乎没有变化（同心环的环带内部就是这样），没有牙顶可分
+            continue
+        # 取这一片里**最靠外**的一小撮点（按分位数取，而不是按距最大半径的差值）：
+        # 切片里往往同时含内孔与外表面，用"最大半径 - 25% span"会把整个外表面都算进来，
+        # 于是螺旋也被算成"四周到处都有牙顶"（实测踩过这个坑）。
+        ordered = sorted(radii_in)
+        cutoff = ordered[int(len(ordered) * 0.85)]
+        crest = [a for r, a in in_slice if r >= cutoff]
+        if len(crest) < 5:
+            continue
+        sx = sum(math.cos(a) for a in crest) / len(crest)
+        sy = sum(math.sin(a) for a in crest) / len(crest)
+        concentration = math.hypot(sx, sy)
+        best = concentration if best is None else max(best, concentration)
+    if best is None:
+        return None
+    return best >= 0.5
+
+
 def analyze(path: Path, limits: AnalysisLimits | None = None) -> MeshMetrics:
     """完整分析一个 STL 文件。
 
@@ -417,6 +521,12 @@ def analyze(path: Path, limits: AnalysisLimits | None = None) -> MeshMetrics:
     metrics.stray_details = stray_details
     metrics.cavity_islands = _detect_cavity_islands(points, triangle_count, metrics)
     metrics.wall = measure_wall_thickness(points, triangle_count, metrics)
+    # 螺纹检测：细牙的牙尖只有零点几毫米，不知道这一点的话，
+    # 一个完全合规的 M72×0.75 转接环会被"壁厚"判据误报成无法打印。
+    metrics.thread_depth_mm = measure_thread_depth(points)
+    if metrics.thread_depth_mm is not None:
+        # 有牙型起伏还不够 —— 还要确认它是**螺旋**，而不是同心环（拧不进去的那种）
+        metrics.thread_is_helix = detect_helix_thread(points)
     metrics.support = estimate_support(points, triangle_count, metrics, active.max_overhang_deg)
     # 支撑占比高时顺带算一次「哪个方向更省」。
     # 注意：六个方向的支撑量用的是同一个粗糙模型，所以**绝对值不可靠、相对比较才有意义** ——
@@ -1620,7 +1730,21 @@ def _collect_issues(metrics: MeshMetrics, limits: AnalysisLimits) -> None:
                 f"实测壁厚：5% 分位 {wall.p05_mm:.2f}mm、中位数 {wall.median_mm:.2f}mm、"
                 f"最薄 {wall.min_mm:.2f}mm（共 {wall.samples} 处采样）"
             )
-            if limits.is_resin:
+            thread_depth = metrics.thread_depth_mm
+            if thread_depth is not None:
+                # 螺纹件的「薄」是牙型本身，不是壁做薄了 —— 必须分开说。
+                # 实测：一个完全合规的 M72×0.75 转接环，射线法量出来最薄 0.05mm、
+                # 中位数 0.47mm；照普通薄壁判据就会报"远低于 1.2mm 无法打印"，
+                # 而它其实是可以打的（0.1mm 层高），只是牙尖细。
+                # 用户看到这种结论会以为模型废了 —— 这是**误报**，要按螺纹口径讲清楚。
+                metrics.thread_depth_mm = thread_depth
+                metrics.issues.append(
+                    f"检测到螺旋螺纹（实测牙深约 {thread_depth:.2f}mm，即 0.75mm 细牙）："
+                    f"上方那条「壁厚」统计量的是**牙尖**，不是壁做得薄。"
+                    f"细牙在 {limits.nozzle_mm}mm 喷嘴上建议用 0.1mm 层高打印；"
+                    f"若只想粗用，可把牙型换成粗牙（例如 M72×2）。{where}"
+                )
+            elif limits.is_resin:
                 metrics.issues.append(
                     f"{stats}。该机型建议的最小细节厚度为 {limits.min_wall_mm:.2f}mm，"
                     f"当前有一片区域偏薄，脱模与后固化时易变形。{where}"

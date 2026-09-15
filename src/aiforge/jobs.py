@@ -596,7 +596,9 @@ class GenerationRunner:
         取舍原则与改动校验一致：**修不好就保留原样**，
         绝不因为修复失败而让用户拿到比原来更差的东西。
         """
-        problems = _geometry_integrity_problems(metrics, spec, visual, dropped)
+        problems = _geometry_integrity_problems(
+            metrics, spec, visual, dropped, self._requirement_text()
+        )
         if not problems:
             return source, compile_result, metrics
 
@@ -618,7 +620,11 @@ class GenerationRunner:
             try:
                 repaired = await client.repair_geometry(
                     best_source,
-                    "\n".join(_geometry_integrity_problems(best_metrics, spec, visual, dropped)),
+                    "\n".join(
+                        _geometry_integrity_problems(
+                            best_metrics, spec, visual, dropped, self._requirement_text()
+                        )
+                    ),
                     attempt,
                 )
             except LlmError as exc:
@@ -673,7 +679,9 @@ class GenerationRunner:
             job.say("修正没有变得更好，保留当前模型。", kind="warn")
             return source, compile_result, metrics
 
-        remaining = _geometry_integrity_problems(best_metrics, spec, visual, dropped)
+        remaining = _geometry_integrity_problems(
+            best_metrics, spec, visual, dropped, self._requirement_text()
+        )
         if remaining:
             job.say(
                 "已改善，但仍有残留问题。",
@@ -895,6 +903,9 @@ class GenerationRunner:
         compile_params: dict[str, float] | None = None,
     ) -> None:
         job = self.job
+        # 本次作业的「需求原文」：几何完整性判定要用它（例如需求里有没有提螺纹）。
+        # 用一个方法取，而不是各处自己拼 prompt/instruction —— 少一处就等于漏判一类。
+        self._requirement = " ".join(part for part in (prompt, instruction) if part)
         # 进度心跳：阶段内按时间推进百分比（用户反馈"进度条不能体现准确的进度"）。
         # 单开一个任务，而不是塞进各个步骤里 —— 否则每个耗时步骤都得记得推一次，
         # 漏一处进度条就停在那儿。3 秒一拍足够让细条"在动"，又不会把事件流刷爆。
@@ -2006,24 +2017,62 @@ def _merge_ai_review(verdict: ChangeVerdict, review: dict[str, object] | None) -
         verdict.reasons.append("AI 指出的疑点：" + "；".join(verdict.ai_concerns[:3]))
 
 
+def _thread_problems(metrics: MeshMetrics, requirement: str) -> list[str]:
+    """需求里要螺纹、但模型上量不到**真螺旋**时，明确报出来。
+
+    为什么单列一条（用户反馈的翻车现场）：用户要"72 转 67 滤镜转接环"，
+    模型做出来了、也封闭、尺寸也对，但螺纹是用 `rotate_extrude` 把牙型绕一圈做的 ——
+    那是**同心环**：看着有螺纹纹路，实际根本拧不进去。
+    这类问题包围盒、体积、封闭性、零件数**全都看不出来**，只能靠专门量。
+
+    判据来自 mesh.detect_helix_thread / measure_thread_depth（都经过实物定标）。
+    """
+    if not re.search(r"螺纹|螺距|滤镜|转接|拧|丝口|丝锥|thread", requirement, re.IGNORECASE):
+        return []
+    depth = metrics.thread_depth_mm
+    is_helix = metrics.thread_is_helix
+    if depth is None:
+        return [
+            "【问题 7】需求里要的是**能拧上的螺纹**，但程序在模型上量不到螺纹牙型"
+            "（沿轴线取一条跨一个螺距的高度带，量外表面的半径起伏，结果≈0）。"
+            "推测做成了光滑圆柱或者只有装饰性凹槽 —— 这样是拧不进去的。\n"
+            "不要自己手写螺旋几何（实测会不封闭或被 OpenSCAD 丢掉整块几何）。"
+            "请改用程序自带的固定零件库：`use <aiforge_parts.scad>` 后调用 "
+            "`filter_adapter(...)` / `thread_sleeve(...)` / `threaded_cap(...)`，"
+            "把用户给的公称直径与螺距填进参数。"
+        ]
+    if is_helix is False:
+        return [
+            f"【问题 7】程序量到了牙型起伏（约 {depth:.2f}mm），但**不是螺旋** ——"
+            "同一个高度上四周到处都有牙顶，说明是用 `rotate_extrude` 把牙型绕轴转了一圈，"
+            "得到的是同心环：看着像螺纹，实际拧不进去（旋转时不会沿轴向前进）。\n"
+            "请改用程序自带的固定零件库（真螺旋、已实测）：`use <aiforge_parts.scad>` + "
+            "`filter_adapter(...)` / `thread_sleeve(...)` / `threaded_cap(...)`。"
+        ]
+    return []
+
+
 def _geometry_integrity_problems(
     metrics: MeshMetrics,
     spec: DesignSpec | None = None,
     visual: str = "",
     dropped: list[str] | None = None,
+    requirement: str = "",
 ) -> list[str]:
     """把「几何不成立」翻译成给 AI 的实测证据（而不是泛泛的建议）。
 
-    报六类，因为它们既严重又**可核对**：
+    报七类，因为它们既严重又**可核对**：
       1. 模型不是一整件（连通分量数 > 1）
       2. 外壁特征穿进了腔体（水平截面上空腔里有材料环）
       3. 用户在规格里点名的整体尺寸没做到（实测 vs 声明）
       4. 多模态模型看渲染图后明确报告的问题（程序测不出来的那一类）
       5. OpenSCAD 明明警告过「这块几何被丢掉了」（编译成功也没用）
       6. 网格有开放边（不是封闭实体 → 切不出来）
+      7. 要螺纹却没有真螺旋（同心环 / 光滑圆柱 → 拧不上）
     其余的几何瑕疵（壁厚、悬垂）交给打印性检查那一条链路，职责不重叠。
     """
     problems: list[str] = []
+    problems.extend(_thread_problems(metrics, requirement))
     if dropped:
         # 这一类最阴：编译返回成功、STL 非空，只是**少了一部分几何**。
         # 实测：把 3D 的 rotate() 写在 linear_extrude() 的子节点位置，

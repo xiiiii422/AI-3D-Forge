@@ -48,6 +48,14 @@ for doc in ("USER_GUIDE.md", "DEVELOPMENT.md", "LICENSE-THIRD-PARTY.txt"):
     if candidate.is_file():
         datas.append((str(candidate), "docs"))
 
+# 固定零件库（经过实测验证的参数化零件）：必须随程序分发 ——
+# 生成的模型会写 `use <aiforge_parts.scad>`，编译时靠 OPENSCADPATH 找到它。
+# 放到包内的 parts/ 目录，运行期由 aiforge.parts.catalog.library_path() 定位。
+PARTS_DIR = ROOT / "src" / "aiforge" / "parts"
+if not (PARTS_DIR / "aiforge_parts.scad").is_file():
+    raise SystemExit("未找到固定零件库 src\\aiforge\\parts\\aiforge_parts.scad")
+datas.append((str(PARTS_DIR / "aiforge_parts.scad"), "parts"))
+
 # --------------------------------------------------------------------------
 # 隐式导入
 # --------------------------------------------------------------------------

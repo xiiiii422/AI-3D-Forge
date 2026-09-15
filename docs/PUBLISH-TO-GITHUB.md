@@ -118,7 +118,7 @@ git commit --amend --reset-author --no-edit
 ## 五、推送前自查（每条都能自己跑）
 
 ```powershell
-# 1) 后端自检（47 项，秒级，不消耗 AI 额度）
+# 1) 后端自检（50 项，秒级，不消耗 AI 额度）
 & build\venv\Scripts\python.exe scripts\selfcheck.py
 
 # 2) 开源文件完整性（必需文件 / README 要点 / 交叉链接）

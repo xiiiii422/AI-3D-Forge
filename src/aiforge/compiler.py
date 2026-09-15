@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -25,6 +26,11 @@ log = logging.getLogger(__name__)
 
 COMPILE_TIMEOUT_S = 300
 DEFAULT_FN = 64
+
+# $fn 的硬性下限：低于这个值，圆弧面在屏幕上就是明显的多边形。
+# （用户反馈「建模圆形时边数太少，完全达不到圆的效果」——
+#   实测 AI 自己写过 `$fn = 24`，把 Ø80 的圆画成了 24 边形。）
+FN_FLOOR = 48
 
 LEVEL_MAP = {
     "ERROR": "error",
@@ -151,7 +157,7 @@ def build_scad_source(
     params: dict[str, float] | None = None,
     fn: int | None = None,
 ) -> tuple[str, list[str], list[str]]:
-    """规范化源码（去 BOM、全角标点）并按需覆盖参数、注入 $fn。
+    """规范化源码（去 BOM、全角标点）并按需覆盖参数、注入/校准 $fn。
 
     fn 由目标打印机的喷嘴直径与表面质量要求算出（见 printers.resolve_fn）：
     喷嘴越细、模型越大，需要的分段数越多，否则圆弧面会出现肉眼可见的棱面。
@@ -161,6 +167,7 @@ def build_scad_source(
     ignored: list[str] = []
     if params:
         cleaned, applied, ignored = scad_src.apply_params(cleaned, params)
+    target_fn = int(fn or DEFAULT_FN)
     # 只有「顶层真的赋值过 $fn」才尊重作者。
     # 不能用 `"$fn" not in cleaned` 这种子串检查：注释里提一句 $fn、
     # 模块内部局部设一次 $fn、甚至字符串里出现，都会让子串检查为真而跳过注入 ——
@@ -169,8 +176,88 @@ def build_scad_source(
     # 而我们的提示词本身就会让 AI 在参数区写 `// @param $fn …` 注释，
     # 所以「只有注释、没有赋值」是很容易命中的情况。
     if "$fn" not in scad_src.top_level_assignments(cleaned):
-        cleaned = f"$fn = {int(fn or DEFAULT_FN)};\n" + cleaned
+        cleaned = f"$fn = {target_fn};\n" + cleaned
+    # 不管顶层有没有写 $fn，都要把**过小**的那些抬起来。
+    # 曾经把这一步放在 else 分支里，于是 `cylinder(..., $fn = 24)` 这种
+    # 逐图元写法（优先级最高，顶层注入根本盖不住）被漏掉了 ——
+    # 用户看到的仍然是一个 24 边形。
+    cleaned = _raise_small_fn(cleaned, target_fn)
+    # $fa/$fs 是另一套细分控制：$fn>0 时它优先，所以只要保证 $fn 够大即可；
+    # 但若模型里用 $fa/$fs 且被设得很粗（$fa=30 → 12 段圆），同样要拉回来。
+    cleaned = _clamp_coarse_fa_fs(cleaned, target_fn)
     return cleaned, applied, ignored
+
+
+FN_ASSIGN_RE = re.compile(r"(?<![\w$])\$fn\s*=\s*(\d+)(\s*[;,)]|$)")
+
+
+def _raise_small_fn(source: str, target: int) -> str:
+    """把代码里**所有**过小的 $fn 赋值抬到下限（顶层与逐图元都算）。
+
+    为什么连逐图元的都改：`cylinder(r = 40, $fn = 24)` 这种写法优先级最高，
+    顶层注入再大也没用 —— 用户看到的还是 24 边形。
+
+    注意必须**保留原来的结尾符**（`;` / `)` / `,`）：早先版本一律替换成 `$fn = N;`，
+    结果 `cylinder(..., $fn = 52;)` 直接语法错误 —— 修一个显示问题却把模型弄编译不过。
+    """
+    floor = max(FN_FLOOR, int(target * 0.6))
+    changed = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changed
+        value = int(match.group(1))
+        tail = match.group(2)
+        if 0 < value < floor:
+            changed += 1
+            return f"$fn = {floor}{tail}"
+        return match.group(0)
+
+    updated = FN_ASSIGN_RE.sub(replace, source)
+    if changed:
+        log.info("把 %d 处过小的 $fn 抬到 %d（避免圆弧面出现明显棱面）", changed, floor)
+    return updated
+
+
+FA_ASSIGN_RE = re.compile(r"(?<![\w$])\$fa\s*=\s*([\d.]+)(\s*[;,)]|$)")
+FS_ASSIGN_RE = re.compile(r"(?<![\w$])\$fs\s*=\s*([\d.]+)(\s*[;,)]|$)")
+
+
+def _clamp_coarse_fa_fs(source: str, target: int) -> str:
+    """$fa 太大 / $fs 太大时收紧（它们会让圆变成十几边形）。"""
+    max_fa = max(2.0, 360.0 / max(target, 1))
+    max_fs = max(0.2, 400.0 / max(target, 1))
+
+    def fa_replace(match: re.Match[str]) -> str:
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            return match.group(0)
+        return f"$fa = {max_fa:g}{match.group(2)}" if value > max_fa else match.group(0)
+
+    def fs_replace(match: re.Match[str]) -> str:
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            return match.group(0)
+        return f"$fs = {max_fs:g}{match.group(2)}" if value > max_fs else match.group(0)
+
+    return FS_ASSIGN_RE.sub(fs_replace, FA_ASSIGN_RE.sub(fa_replace, source))
+
+
+def _library_search_path(existing: str | None) -> str:
+    """OpenSCAD 的库搜索路径：把自带的固定零件库目录接在用户已有路径前面。
+
+    为什么用 OPENSCADPATH 而不是把库拷到项目目录：项目目录是用户的数据，
+    往里塞一个 .scad 会让"这个项目到底有哪些文件"变得含糊；而 OPENSCADPATH
+    是 OpenSCAD 官方支持的库搜索路径，指向程序自己的安装目录，只读、干净。
+    """
+    from .parts import catalog as parts_lib
+
+    library_dir = str(parts_lib.library_path().parent)
+    if not existing:
+        return library_dir
+    # OpenSCAD 在 Windows 上用 ';' 分隔多个路径
+    return library_dir + os.pathsep + existing
 
 
 def compile_to_stl(
@@ -226,11 +313,14 @@ def compile_to_stl(
         # 避免"软件关了 OpenSCAD 还在算"（详见 procguard 的模块说明）。
         from . import procguard
 
-        proc = procguard.run(
-            cmd,
-            timeout=timeout_s,
-            **scad_cli._popen_kwargs(),  # noqa: SLF001 - 同一包内的私有约定
-        )
+        kwargs = dict(scad_cli._popen_kwargs())  # noqa: SLF001 - 同一包内的私有约定
+        # 让 `use <aiforge_parts.scad>` 能解析到我们自带的固定零件库。
+        # 不能靠改当前目录：编译的工作目录是用户项目目录，放库进去会污染项目。
+        env = dict(kwargs.get("env") or os.environ)
+        env["OPENSCADPATH"] = _library_search_path(env.get("OPENSCADPATH"))
+        kwargs["env"] = env
+
+        proc = procguard.run(cmd, timeout=timeout_s, **kwargs)
     except subprocess.TimeoutExpired:
         raise CompileError(
             f"生成模型超时（超过 {timeout_s} 秒）。",

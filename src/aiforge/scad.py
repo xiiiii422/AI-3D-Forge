@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .parts import catalog as parts_lib
+
 # 这些函数会读取本机文件或访问网络。AI 生成的代码绝不应该需要它们。
 FORBIDDEN_CALLS = {
     "import": "读取外部文件（import）",
@@ -59,6 +61,14 @@ IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # 单个模型的最大合理包围盒（毫米）。超出即认为不是 3D 打印件。
 MAX_DIMENSION_MM = 2000.0
 MIN_DIMENSION_MM = 0.2
+
+
+def _angle_target(text: str, open_index: int) -> str:
+    """取出 `<...>` 里的内容（用于报错信息与零件库白名单比对）。"""
+    end = text.find(">", open_index)
+    if end == -1:
+        return ""
+    return text[open_index + 1 : end].strip()
 
 
 @dataclass
@@ -154,17 +164,27 @@ def validate(source: str) -> ScadValidation:
 
     # --- 读入外部源文件（include / use）------------------------------------
     # 尖括号写法，圆括号那套匹配不到，必须单独查。
-    include_hit = INCLUDE_DIRECTIVE_RE.search(cleaned)
-    if include_hit:
+    #
+    # 唯一的例外：**本程序自带的固定零件库**（src/aiforge/parts/aiforge_parts.scad）。
+    # 为什么值得开这个口子：螺纹这类功能性几何让模型每次现写几乎必错（实测：不封闭、
+    # 或者被 CGAL 丢掉整块几何，用户拿到一个拧不上的光滑圆筒）。零件库是我们自己
+    # 写、自己编译验证过的文件，不含任何用户数据。
+    # 例外必须**精确到文件名**：不允许路径分隔符、不允许 ..、不允许绝对路径，
+    # 也不允许大写/空格变体 —— 否则就等于把 include 全放开了。
+    for directive in INCLUDE_DIRECTIVE_RE.finditer(cleaned):
+        target = _angle_target(cleaned, directive.end() - 1)
+        if directive.group(1).lower() == "use" and target == parts_lib.LIBRARY_NAME:
+            continue
         issues.append(
             ScadIssue(
                 severity="error",
                 title="模型代码包含不安全的操作",
                 detail=(
-                    f"检测到 {include_hit.group(1)} <…> 指令：它会读入本机的另一个 .scad 源文件，"
-                    "属于文件读取操作。出于安全考虑，本软件只允许生成纯几何模型。"
+                    f"检测到 {directive.group(1)} <{target or '…'}> 指令：它会读入本机的 .scad 源文件，"
+                    "属于文件读取操作。出于安全考虑，本软件只允许生成纯几何模型"
+                    f"（唯一允许的是自带的固定零件库 use <{parts_lib.LIBRARY_NAME}>）。"
                 ),
-                suggestion="请重新描述需求，不要引用外部文件或库。",
+                suggestion=f"请只引用自带的零件库（use <{parts_lib.LIBRARY_NAME}>），不要引用其它文件。",
             )
         )
 
@@ -192,10 +212,13 @@ def validate(source: str) -> ScadValidation:
             )
 
     # --- 必须真的产出几何 -------------------------------------------------
+    # 固定零件库里的模块也算「产出几何」：一旦调用它们，
+    # 真正的几何在库里（我们自己的文件），这里不能误判成"什么都没画"。
+    library_modules = "|".join(re.escape(part.module) for part in parts_lib.PARTS)
     has_geometry = re.search(
         r"\b(?:cube|sphere|cylinder|polyhedron|circle|square|polygon|text|"
         r"linear_extrude|rotate_extrude|surface|union|difference|intersection|hull|minkowski|"
-        r"import)\s*\(",
+        rf"import|{library_modules})\s*\(",
         lowered,
     )
     if not has_geometry:

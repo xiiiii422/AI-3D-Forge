@@ -90,6 +90,15 @@ def main(argv: list[str] | None = None) -> int:
 
     logging_setup.setup(console=args.check or args.server or args.install_openscad)
 
+    # 子进程守护要在**所有入口**上生效，而不是只在"启动服务"那条路上。
+    # 实测踩到：`--check` 不经过 start_server，于是「系统诊断」里那条
+    # 「后台进程守护」显示成"当前环境不支持" —— 明明是我们自己没装。
+    # 一条会误报的诊断比没有诊断更糟：用户会去查一个不存在的问题。
+    # install() 是幂等的（已经建好作业对象就直接返回），放在这里没有副作用。
+    from aiforge import server as _server
+
+    _server.install_child_guard()
+
     if args.version:
         print(f"{APP_NAME} {APP_VERSION}（{CHANNEL_LABEL}）")
         print(f"运行环境：Python {python_version()}")

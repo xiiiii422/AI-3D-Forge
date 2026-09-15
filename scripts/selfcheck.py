@@ -1463,6 +1463,10 @@ def t_child_guard_wiring() -> str:
 
     source = inspect.getsource(srv.start_server)
     assert "install_child_guard()" in source, "start_server 必须调用 install_child_guard()"
+    # 命令行入口（--check / --install-openscad 等）也要装：不然「系统诊断」里那条
+    # 「后台进程守护」会显示成"当前环境不支持"（明明只是我们自己没装）—— 实测踩过。
+    main_src = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "install_child_guard()" in main_src, "main.py 的所有入口都必须先装好子进程守护"
 
     # 守护状态要能在「系统诊断」里看见 —— 静默降级等于没有
     from aiforge import envcheck

@@ -121,7 +121,7 @@ cd <项目目录>
 | `scripts/selfcheck_design.py` | 无 | 设计规格与改动机制的 144 项细判据 | 全部通过 |
 | `webui/scripts/verify-flow.mjs` | mock 后端（`--first-run` **新起**）+ vite | 界面全流程：欢迎向导 → 工作台 → 需求确认 → 结果卡片 → 预览（含尺寸标注）→ 线框开关 → 设置（页面动画、液态玻璃 10 条、送到切片软件）→ 缺 WebView2 的回退横幅 4 条 → 溢出审计 | 83/83，且 console/pageErrors/failedRequests 全空（2026-10-12 复跑） |
 | `webui/scripts/verify-glass-contrast.mjs` | 同上 | 玻璃上的字还读不读得清：逐像素量文字对比度 / 底纹泄漏 / 浮层分界度。写进注释与文档的玻璃数字必须能在报告里找到 | `CONTRAST_OK`（不达标就非零退出） |
-| `webui/scripts/layout-audit.mjs` / `audit-interface.mjs` | 真实后端托管 `webui/dist`（默认 8770）或 vite | 布局溢出/遮挡；对比度、焦点、命名、颜色单载、tabular-nums | 0 问题 + `INTERFACE_AUDIT_OK`（audit 必须含一个真实项目路由 `#/studio/<id>`） |
+| `webui/scripts/layout-audit.mjs` / `audit-interface.mjs` | 真实后端托管 `webui/dist`（默认 8770）或 vite | 布局溢出/遮挡；对比度、焦点、命名、颜色单载、tabular-nums | 0 问题 + `INTERFACE_AUDIT_OK`（audit 必须含一个真实项目路由 `#/studio/<id>`；2026-10-13 在真后端上复跑：10 组 0 问题，项目路由 tabular 候选 7 个、仅颜色 59、无焦点 25 全部 0 违规） |
 | `scripts/verify_modify_matrix.py` | **真实 AI + OpenSCAD** | 端到端自然语言修改：改高度 / 加通孔 / 改孔径 / 加厚底座 / 整体缩放 / 历史回退，每一步都用 STL 实测判定 | 逐项 OK（见 §7 现状） |
 | `scripts/verify_parts.py` | OpenSCAD | 固定零件库每个零件能编译且封闭、尺寸正确 | 3 个零件共 6 个用例全通过（6/6，含升口径与内外螺纹位置） |
 | `scripts/e2e_test.py` + `scripts/verify_e2e_evidence.py` | 真实 AI | 全链路端到端与"证据"校验（防伪造） | 通过 |
@@ -210,6 +210,16 @@ cd <项目目录>
    `$env:BASE_URL='http://localhost:5273'; node scripts\verify-flow.mjs`。
 3. `scripts/test_install.ps1` —— 本轮在 **1.0.3 安装包**上跑完 **54/54**（1.0.2 时是 46 项）。
    **每次发布后必须补验**：2b 段（真双开唤窗）只有装到本机才验得到，代码改不动它坏没坏。
+4. 真后端界面审计（2026-10-13 跑通，跑法记在这里，别再当成「本机做不了」）：先把数据目录
+   指到沙箱，**不拿真实用户项目做审计**：
+   `$env:AIFORGE_DATA_DIR='build\work\audit-data'`、`$env:AIFORGE_LOCAL_DIR='build\work\audit-local'`、
+   `$env:AIFORGE_PROJECTS_DIR='build\work\audit-projects'` → `build\venv\Scripts\python.exe -X utf8 scripts\probes\make_audit_project.py`
+   造一个**真编译出来的**项目（否则 `tabular-nums` 永远 0 个候选）→ `… main.py --server --port 8770`
+   → `node webui\scripts\layout-audit.mjs http://127.0.0.1:8770` 与 `…audit-interface.mjs …`。
+   接口路径是 `/health` 与 `/version`（没有 `/api/` 前缀），探错了会得到 404 而误报成缺陷。
+5. 安装包在本机还打不出来：`ISCC.exe` 不在 `C:/D: 的 Inno Setup 6` 任何常见路径，
+   `build_installer.ps1` 会**联网自动获取** Inno Setup（属于往本机装东西的动作，需用户同意）。
+   只验打包链本身可以跑 `scripts\build.ps1 -SkipInstaller`（PyInstaller + 冻结版冒烟）。
 
 ---
 

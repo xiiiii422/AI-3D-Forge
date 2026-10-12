@@ -41,6 +41,7 @@
 | `probe_ai_credit.py` | 真实 API Key | 一次最小真实调用，区分"余额不足/鉴权失败/网络不通" |
 | `negctl_oss.py` | 无（只临时改 `README.md` / `LICENSE` / `docs/USER_GUIDE.md`，跑完逐条还原） | **负向对照**：证明开源合规那几支守卫在真出问题时会变红。六种违规逐个制造（API Key 写进文档、本机绝对路径、删 LICENSE、README 断链、`.env` 混进提交集、`.gitignore` 生效性反证），最后确认还原后重新全绿。它从 `build\work\` 提到这里的理由就是本文件上面那句：铁证不能写在忽略目录里 |
 | `probe_slicer_roundtrip.py` | 本机真装的 Bambu Studio / OrcaSlicer + 一个隔离后端 | 送到切片软件的**真机往返**：进程表里确有 pid、命令行里带着我们的 3MF、`detached: true` 问得出来、快照没被自己的清理删掉。自检验不了这一段（它只能验“杀父进程后子进程还在”），所以这个探针不能只留在 `build\work\` 里（那是忽略目录，新 clone 的人拿不到）—— 它就是“送到切片软件”那一段取证在仓库里的唯一落点 |
+| `make_audit_project.py` | OpenSCAD（不依赖 AI、不花额度） | 给真后端界面审计造一个**真的有模型**的项目：`audit-interface.mjs` 的 `tabular-nums` 一项只有在工作台加载了真实模型时才有候选，空工作台永远报「0 个候选」，看着全清其实一步未查。数据全写在 `build\work\audit-*` 沙箱里，绝不碰用户真实项目（跑法见 `docs/HANDOVER.md` §7 第 4 条） |
 
 ## 探针的退场（删掉的那些）
 

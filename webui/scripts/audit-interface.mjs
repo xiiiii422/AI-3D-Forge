@@ -207,16 +207,25 @@ function auditPage(TYPE_SCALE_ARR) {
   // ---- 5. 会变化的数字有没有 tabular-nums ----
   // 选择器必须对着**真实类名**：`.stat-value`（尺寸/面数，每次生成都会变）、
   // `.readiness-num`（顶栏 11/12）、`.runbar-status-text`（进度文案）、
-  // `.chip-unit`（参数值）、`.verdict-score span`、`.downloads`（文件大小）。
+  // `.chip-unit`（参数值）、`.params-group-count`（分栏里每类几个）、
+  // `.verdict-score span`、`.downloads`（文件大小）。
   const numSelector = [
     '.stat-value', '.readiness-num', '.runbar-status-text', '.chip-unit',
-    '.verdict-score span', '.downloads', '.stats-cell b', '[data-changing-number]',
+    '.params-group-count', '.verdict-score span', '.downloads', '.stats-cell b',
+    '[data-changing-number]',
   ].join(', ');
-  // 候选还要**含数字**才算：`.chip-unit` 的文本是单位 "mm"，它不会变，
-  // 把它算进来会得到 16 条假问题（第一版就是这样）。会跳动的是数值本身。
+  // 候选还要**以数字为主**才算：
+  //   * `.chip-unit` 的文本是单位 "mm"，不会变，算进来会得到 16 条假问题（第一版就是这样）；
+  //   * `.downloads` 是按钮行，文本「下载 STL下载 SCAD下载 3MF打开文件夹」里只有
+  //     格式名 “3MF” 带数字，它不是会跳动的测量值 —— 按“数字占比”过滤而不是
+  //     改按钮文案去迎合检查。
   const numEls = Array.from(document.querySelectorAll(numSelector))
     .filter(visible)
-    .filter((el) => /\d/.test(el.textContent || ''));
+    .filter((el) => {
+      const text = (el.textContent || '').trim();
+      const digits = (text.match(/\d/g) || []).length;
+      return digits >= 2 && digits / Math.max(text.length, 1) >= 0.25;
+    });
   out.inspected.numbers = numEls.length;
   for (const el of numEls) {
     const s = getComputedStyle(el);

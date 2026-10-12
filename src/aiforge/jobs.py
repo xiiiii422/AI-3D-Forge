@@ -20,22 +20,25 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any
 
 from . import compiler, openscad as scad_cli, printers, projects, render, scad as scad_src
 from . import llm as llm_mod
+from . import reqtests
 from .changes import (
     ChangeContract,
     ChangeVerdict,
     build_change_contract,
     embed_fingerprint,
+    follow_values,
     resolve_param_name,
     summarize_verdict,
     verify_change,
 )
 from .config import store
-from .design import DesignSpec, merge_specs
-from .llm import DeepSeekClient, LlmError
+from .design import DesignSpec, diameter_is_fit_scope, merge_specs, normalize_name
+from .llm import DeepSeekClient, LlmError, detect_provider
 from .mesh import MeshMetrics, StlError, estimate_usage, summarize_for_ai
 from .projects import HistoryEntry, Project, now_iso
 
@@ -47,6 +50,27 @@ MAX_JOBS = 200
 # 自动缩放到成型范围时留出的边距（mm）：切片软件的裙边/擦料塔需要空间，
 # 而且模型贴边放容易第一层附着不良。
 SAFETY_MARGIN_MM = 5.0
+
+# 直出标准零件时允许的「特征」白名单：需求里一旦出现白名单之外的特征
+# （挂绳孔、刻字、卡扣等），就认为用户要的是「零件 + 额外结构」，回退 AI 自由设计。
+PLAIN_PART_FEATURES = ("螺纹", "内螺纹", "外螺纹", "中空", "通孔", "镂空", "挡肩", "转接")
+
+# 编译修复两轮仍失败时的「换路径重生成」附加约束（P0：生成随机性加固）。
+# 不是再修同一份代码，而是带着硬约束重新生成，避免卡在同一个错误写法上。
+_REGEN_EXTRA = (
+    "上一次生成的代码编译失败（多为 CGAL 布尔运算失败）。这次请**换一种建模路径**："
+    "用最少的 union/difference 层级；所有相减/相加的实体沿接触方向错开 ≥0.01mm，"
+    "杜绝共面重合与零厚度；所有 extrude 高度与 cylinder 半径必须为正；"
+    "不要复用上一次的具体写法与模块划分。"
+)
+# 完整性修复两轮仍散件时的「换路径重生成」约束：散件靠微调坐标修不好（实测），
+# 必须换画法（先 2D 截面 union 再挤出 / 保证实体重叠）。
+_INTEGRITY_REGEN_EXTRA = (
+    "上一次生成的模型经实测由多个互不相连的零件组成（散件）。这次请**换一种建模路径**："
+    "把全部特征（支臂、底座、卡槽、阵列孔等）先在一个 2D 截面里 union 成完整轮廓再统一挤出，"
+    "或确保每个特征与主体有 ≥0.2mm 的实体重叠；最终必须是**一个连通实体**，"
+    "不允许任何只靠「摆得近」而不相交的结构。"
+)
 
 # 阶段 → (用户看到的中文说明, 起点百分比, 终点百分比)
 #
@@ -91,11 +115,10 @@ STAGE_TAU_S: dict[str, float] = {
     "exporting": 1.5,
 }
 
-# 兼容/诊断用的派生表：阶段 → 该阶段的**上限**百分比。
-# 注意它已经不是"进度"的来源了 —— 进度由 STAGE_BANDS 的区间 + Job.creep()
-# 按时间推进（见 §69：用户反馈"进度条不能体现准确进度"）。
-# 保留它是为了让外部脚本/诊断仍能一眼看到每个阶段的终点值。
-STAGE_PERCENT: dict[str, float | None] = {key: value[2] for key, value in STAGE_BANDS.items()}
+# 派生表：阶段 → 该阶段的展示文案。（曾经还有一张 `STAGE_PERCENT` 阶段→上限百分比，
+# 注释里写着「保留给外部脚本/诊断用」，实测全仓（含自检与构建脚本）没有任何代码读它，
+# 只剩文档里一处历史描述提到——典型的「写句理由把没人用的东西留在原地」。进度真正的来源是
+# STAGE_BANDS 区间 + Job.creep() 按时间推进（见 §69），已删。）
 STAGE_TEXT: dict[str, str] = {key: value[0] for key, value in STAGE_BANDS.items()}
 
 # 阶段内进度的刷新间隔（秒）。3 秒是折中：比这更密只是徒增 SSE 流量，
@@ -400,9 +423,14 @@ async def _analyze_with_heartbeat(
     stl_path: Path,
     limits: Any,
     *,
+    source: str | None = None,
     heartbeat_s: float = 10.0,
 ) -> MeshMetrics:
     """在线程里做网格分析，同时每隔几秒报一次「还在跑」。
+
+    source 传进来时顺带核对「源码里声明了的间隙/夹口在网格里量不量得到」：
+    夹口这一刀完全没切到时，零件数/封闭性/包围盒/壁厚全绿，只有「找不到任何空隙」
+    能揭穿它（实测交付给用户的那版手机夹就是这么假绿的）。不传则完全不测，零成本。
 
     为什么需要心跳：网格分析是纯 Python 的逐面计算，面数大的模型要跑很久
     （实测 100 万面约 50 秒），这段时间里**一个事件都不推**。
@@ -414,7 +442,10 @@ async def _analyze_with_heartbeat(
     分析本身仍然在 worker 线程里跑（不阻塞事件循环）；
     这里的 `say()` 只是状态行，不会往对话里刷屏（界面只显示最后一条）。
     """
-    task = asyncio.create_task(asyncio.to_thread(compiler.analyze_stl, stl_path, limits))
+    declared_gaps = _declared_gaps_from_source(source)
+    task = asyncio.create_task(
+        asyncio.to_thread(compiler.analyze_stl, stl_path, limits, declared_gaps or None)
+    )
     started = time.monotonic()
     try:
         while True:
@@ -430,6 +461,31 @@ async def _analyze_with_heartbeat(
             task.cancel()
 
 
+# 需求原文的长度上限：它会被发给 AI（散件重生成），不能把整个历史拼上去。
+_REQUIREMENT_MAX_CHARS = 900
+
+
+def _project_baseline_requirement(project: Project) -> str:
+    """项目建立时那句用户原话（history.jsonl 第一条里的 prompt/instruction）。
+
+    为什么取“第一条有字的”而不是取 prompt 类型的那条：实测真实项目里
+    history.jsonl 的第一行就是创建那一次的 prompt（“设计一个圆形的桌面笔筒：…底部是
+    封闭的实心底…”）；而“回退到第N版”那类条目只写 instruction。所以按顺序
+    拿第一条非空的原文最稳。
+
+    为什么不拿 meta.summary / spec.summary：那是 AI 转述的一句话（“收纳笔具的桌面
+    圆柱形容器”），用户点名的约束在转述过程中会丢 —— 实测过“实心底”被改写成
+    “底部为实心封闭结构”，按词表门控就命中不了。
+    """
+    for entry in getattr(project, "history", None) or []:
+        text = " ".join(
+            str(part) for part in (getattr(entry, "prompt", None), getattr(entry, "instruction", None)) if part
+        ).strip()
+        if text:
+            return text[:_REQUIREMENT_MAX_CHARS]
+    return ""
+
+
 # --------------------------------------------------------------------------
 # 执行器
 # --------------------------------------------------------------------------
@@ -442,6 +498,14 @@ class GenerationRunner:
         self._printer = None
         self._constraints = None
         self._printer_block: str | None = None
+        # 修复循环跑完后仍然存在的问题（实测证据）。它必须带到最终判定里去：
+        # 以前只在对话里 say 一句就丢了，结果「残留问题」与「全部通过」在结果卡上长得一样。
+        self._integrity_remaining: list[str] = []
+        # 需求原文：本次指令（`_requirement`）+ 项目最初那句诉求（`_requirement_base`）。
+        # 两个都在 __init__ 里给空默认值，而不是等 `run()` 赋值：任何一条分支先问了
+        # `_requirement_text()` 都不该 AttributeError（“接线比方法后到”的坑踩过）。
+        self._requirement: str = ""
+        self._requirement_base: str = ""
 
     # --- 打印机上下文 -----------------------------------------------------
     # 只在「AI 从零设计」时强制模型必须放得进成型范围。
@@ -547,6 +611,17 @@ class GenerationRunner:
                 job_work_dir(project),
                 prefix=f"r{project.revision + 1}",
             )
+            # 面数过多时 render 会按步长抽样，并在 `sampled` 里如实标出来。
+            # 这一句必须**真的执行**：原来这里写了个赋值表达式却从不读它，
+            # 于是「外观复核用的是抽样渲染图（细节可能有孔洞）」这条告警
+            # 永远不出现 —— 用户以为看的是完整模型，实际看到的是抽稀的。
+            # 判据要出现在 AI 结论**之前**，否则用户先看到"未发现明显问题"
+            # 再看到告警，注意力已经被前者带走了。
+            if any(shot.sampled for shot in shots):
+                job.say(
+                    "模型面数较多，外观复核用的是抽样渲染图（细节可能有孔洞）。",
+                    kind="warn",
+                )
             images = [shot.path.read_bytes() for shot in shots]
             summary = summarize_for_ai(metrics, project.name, self.analysis_limits)
             text = await client.review_snapshot(images, requirement, summary)
@@ -560,16 +635,150 @@ class GenerationRunner:
             # 空回复必须如实说成「没有结论」。当成「没问题」会静默放过缺陷。
             job.say("图片复核没有给出结论（已跳过，不影响模型本身）。", kind="warn")
             return ""
-        if sampled := any(shot.sampled for shot in shots):
-            job.say(
-                "模型面数较多，外观复核用的是抽样渲染图（细节可能有孔洞）。",
-                kind="warn",
-            )
         if llm_mod.parse_snapshot_verdict(text):
             job.say("AI 看过外观后提出了问题。", detail=text[:400], kind="warn")
         else:
             job.say("AI 看过外观，未发现明显问题。", detail=text[:400], kind="success")
         return text
+
+    def _dim_deviation(
+        self,
+        metrics: MeshMetrics,
+        spec: DesignSpec | None,
+        contract: "ChangeContract | None" = None,
+        declared: dict[int, tuple[str, float, str]] | None = None,
+    ) -> float:
+        """点名尺寸实测偏差的归一化和（越小越好）；用于逐轴校正的采纳比较。
+
+        declared 传 None 时退回按轴记账的老判据；有需求核对表时应传它的
+        `dimension_targets()` —— 那是**水平尺寸择优配对之后**的方向，
+        跟校正用的是同一套事实，不会出现「照着 X 校、按 Y 打分」。
+        """
+        if declared is None:
+            declared = _spec_declared_dimensions(spec)
+        if not declared or not metrics.bbox:
+            return 0.0
+        targets: dict[str, float] = {}
+        if contract is not None:
+            targets = {
+                normalize_name(key): float(value)
+                for key, value in contract.target_values.items()
+                if isinstance(value, (int, float))
+            }
+        total = 0.0
+        for axis, (label, want, spec_name) in declared.items():
+            for key in (normalize_name(spec_name), normalize_name(label)):
+                if key in targets:
+                    want = targets[key]
+                    break
+            if want <= 0:
+                continue
+            got = (
+                max(metrics.bbox[0], metrics.bbox[1])
+                if axis == HORIZONTAL_ENVELOPE_AXIS
+                else metrics.bbox[axis]
+            )
+            total += abs(got - want) / want
+        return total
+
+    def _requirement_suite(
+        self, metrics: MeshMetrics | None, spec: DesignSpec | None
+    ) -> reqtests.ReqSuite | None:
+        """把设计契约编译成**逐条可执行判定**（PR/RS/IR），对标 CADTests 口径。
+
+        与 `_geometry_integrity_problems` 的分工：那边是给 AI 的详细改法（实测踩坑攒出来的），
+        这边是能统计、能展示、能回归的判定表。两边的阈值同源（都取 jobs 的判据与机型公差），
+        自检带一条单向一致性守卫，防止两处慢慢漂移。
+        """
+        if metrics is None:
+            return None
+        try:
+            tolerance = float(getattr(self.printer, "dimensional_tolerance_mm", 0.25) or 0.25)
+        except (TypeError, ValueError):
+            tolerance = 0.25
+        return reqtests.evaluate(
+            spec=spec,
+            metrics=metrics,
+            requirement=self._requirement_text(),
+            contract=self._change_contract,
+            limits=self.analysis_limits,
+            tolerance_mm=tolerance,
+            declared_dimensions=_spec_declared_dimensions(spec),
+            planar_dimensions=spec_planar_dimensions(spec),
+            declared_holes=_spec_declared_holes(spec),
+            spec_items=list(getattr(spec, "specs", []) or []) if spec is not None else [],
+        )
+
+    def _axis_dimension_fix(
+        self,
+        source: str,
+        metrics: MeshMetrics,
+        spec: DesignSpec | None,
+        contract: "ChangeContract | None" = None,
+        declared: dict[int, tuple[str, float, str]] | None = None,
+    ) -> str | None:
+        """点名整体尺寸实测偏差过大时，算出逐轴校正倍率并包裹几何；不该修时返回 None。
+
+        判据保守：偏差 ≤2% 不修（测量/舍入噪声）；倍率超出 `_MIN_SHRINK_FACTOR`~2.0 不修
+        （那不像「写错一段」，更像需求理解错了，宁可报问题不要乱缩）。
+        缩小方向的下界与「超出 50% 就不可能是多了个底座」那条判据用同一把尺子：
+        要缩到 2/3 以下才能达标的目标，说明这两个数字讲的压根不是同一个东西 ——
+        实测的「杯径 70 vs 整件 132」倍率 0.53 在旧的 0.5 下界下是**放行**的，
+        会把整件缩掉 47%（破坏性「修复」比不修更糟）。
+        目标值优先取**契约里的新目标**（修改流程），其次取规格声明值 ——
+        否则「把高度改成 50」会拿旧规格的 100 去算倍率，算出 2.4 倍被拒修。
+        方向优先取需求核对表配对后的结果（`declared`）：模型绕竖直轴转 90° 是等价摆放，
+        按固定轴缩放会把正确的模型放大一倍。
+        """
+        if declared is None:
+            declared = _spec_declared_dimensions(spec)
+        if not declared:
+            return None
+        targets: dict[str, float] = {}
+        if contract is not None:
+            targets = {
+                normalize_name(key): float(value)
+                for key, value in contract.target_values.items()
+                if isinstance(value, (int, float))
+            }
+        fx = fy = fz = 1.0
+        for axis, (label, value, spec_name) in declared.items():
+            for key in (normalize_name(spec_name), normalize_name(label)):
+                if key in targets:
+                    value = targets[key]
+                    break
+            if value <= 0:
+                continue
+            if axis == HORIZONTAL_ENVELOPE_AXIS:
+                measured = max(metrics.bbox[0], metrics.bbox[1])
+                factor = value / measured if measured > 0 else 1.0
+                # 「杯径 70」这类**配合尺寸**不能拿来缩整件：包围盒比它大是正常的
+                # （座子要包住杯子），拿它当外形目标会把夹口、底座、筋一起缩掉。
+                # 放大方向仍然放行 —— 整件连 70 都不到，那个杯径必然是没做到的。
+                if factor < 1.0 and diameter_is_fit_scope(label, spec_name):
+                    continue
+                fx *= factor
+                fy *= factor
+            else:
+                measured = metrics.bbox[axis]
+                factor = value / measured if measured > 0 else 1.0
+                if axis == 0:
+                    fx *= factor
+                elif axis == 1:
+                    fy *= factor
+                else:
+                    fz *= factor
+        if all(abs(f - 1.0) <= 0.02 for f in (fx, fy, fz)):
+            return None
+        if any(f > 2.0 or f < _MIN_SHRINK_FACTOR for f in (fx, fy, fz)):
+            return None
+        return _wrap_geometry_in_scale_axes(
+            source,
+            fx,
+            fy,
+            fz,
+            f"实测包围盒与点名尺寸偏差过大，已按轴校正（x{fx:.3f} y{fy:.3f} z{fz:.3f}）",
+        )
 
     async def _repair_geometry_integrity(
         self,
@@ -596,92 +805,194 @@ class GenerationRunner:
         取舍原则与改动校验一致：**修不好就保留原样**，
         绝不因为修复失败而让用户拿到比原来更差的东西。
         """
-        problems = _geometry_integrity_problems(
-            metrics, spec, visual, dropped, self._requirement_text()
-        )
-        if not problems:
-            return source, compile_result, metrics
-
         job = self.job
-        job.say(
-            "模型有尺寸或结构问题，正在让 AI 修正…",
-            detail="；".join(problems)[:300],
-            kind="warn",
+        suite0 = self._requirement_suite(metrics, spec)
+        targets0 = suite0.dimension_targets() if suite0 is not None else None
+        problems = _geometry_integrity_problems(
+            metrics, spec, visual, dropped, self._requirement_text(), self._change_contract,
+            targets0,
         )
-
-        # 最多两轮。为什么要第二轮：实测「线缆收纳底座」一次修复只把
-        # 77 个散件降到 73 个 —— 模型容易只去调坐标，越调越乱。
-        # 第二轮会把上一版的实测数字一并给它，并明确要求**换策略**
-        # （用 hull 连起来 / 改成深入主体），而不是继续微调。
         best_source, best_compile, best_metrics = source, compile_result, metrics
-        best_rank = _integrity_rank(metrics, spec)
-        for attempt in (1, 2):
-            job.progress(90.0, f"正在修正尺寸/结构问题（第 {attempt} 次）…")
-            try:
-                repaired = await client.repair_geometry(
-                    best_source,
-                    "\n".join(
-                        _geometry_integrity_problems(
-                            best_metrics, spec, visual, dropped, self._requirement_text()
-                        )
-                    ),
-                    attempt,
+        best_rank = _integrity_rank(metrics, spec, self._change_contract)
+
+        # AI 修复轮只在确实报了问题时才花网络调用。但**不能提前 return**：
+        # 偏 2%~10% 这一档「不报错、也确实在规格上没做到」的偏差，
+        # 正是下面那个确定性逐轴校正的活（第二轮基准实测到的就是这个空档）。
+        if problems:
+            job.say(
+                "模型有尺寸或结构问题，正在让 AI 修正…",
+                detail="；".join(problems)[:300],
+                kind="warn",
+            )
+            # 最多两轮。为什么要第二轮：实测「线缆收纳底座」一次修复只把
+            # 77 个散件降到 73 个 —— 模型容易只去调坐标，越调越乱。
+            # 第二轮会把上一版的实测数字一并给它，并明确要求**换策略**
+            # （用 hull 连起来 / 改成深入主体），而不是继续微调。
+            for attempt in (1, 2):
+                job.progress(90.0, f"正在修正尺寸/结构问题（第 {attempt} 次）…")
+                try:
+                    # 先算清单：水平尺寸配对后的方向由它给出，下面的问题段落与回喂都用它，
+                    # 两层不再各量各的。
+                    suite = self._requirement_suite(best_metrics, spec)
+                    suite_targets = suite.dimension_targets() if suite is not None else None
+                    feedback = _geometry_integrity_problems(
+                        best_metrics, spec, visual, dropped,
+                        self._requirement_text(), self._change_contract, suite_targets,
+                    )
+                    # 需求核对表：把「要求 / 实测 / 偏差 / 公差」的**数字**一并回喂。
+                    # 中文段落说的是「偏小到什么程度」这类判据，表格里则是每条需求的确切差距 ——
+                    # 论文的对照实验显示，带数值的执行日志回喂比只给文字建议更能提升达成率。
+                    if suite is not None:
+                        feedback.extend(suite.repair_lines())
+                    repaired = await client.repair_geometry(
+                        best_source,
+                        "\n".join(feedback),
+                        attempt,
+                    )
+                except LlmError as exc:
+                    job.say("结构修正未成功，保留当前模型。", detail=exc.message, kind="warn")
+                    break
+                except Exception as exc:  # noqa: BLE001 - 修复失败不该让整个作业失败
+                    log.warning("几何完整性修复调用失败：%s", exc)
+                    break
+
+                candidate = scad_src.strip_code_fences(repaired.content)
+                if not scad_src.validate(candidate).ok:
+                    job.say("结构修正后的代码没通过安全检查，保留当前模型。", kind="warn")
+                    break
+
+                retry = await asyncio.to_thread(
+                    compiler.compile_to_stl,
+                    candidate,
+                    job_work_dir(project),
+                    "model",
+                    params,
+                    None,
+                    self.resolve_fn_for(candidate),
                 )
-            except LlmError as exc:
-                job.say("结构修正未成功，保留当前模型。", detail=exc.message, kind="warn")
-                break
-            except Exception as exc:  # noqa: BLE001 - 修复失败不该让整个作业失败
-                log.warning("几何完整性修复调用失败：%s", exc)
-                break
+                if not retry.ok:
+                    job.say("结构修正后的代码编译失败，保留当前模型。", kind="warn")
+                    break
 
-            candidate = scad_src.strip_code_fences(repaired.content)
-            if not scad_src.validate(candidate).ok:
-                job.say("结构修正后的代码没通过安全检查，保留当前模型。", kind="warn")
-                break
+                try:
+                    retry_metrics = await _analyze_with_heartbeat(
+                        job, retry.stl_path, limits, source=candidate
+                    )
+                except StlError as exc:
+                    job.say("结构修正后的模型无法分析，保留当前模型。", detail=exc.message, kind="warn")
+                    break
 
+                # 采纳条件：**封闭性不变差** + 完整性严格更好
+                # （散件更少 → 点名尺寸更准 → 穿腔更少）。
+                # 平手一律保留原版 —— 改动越少，用户越不容易发现别的结构被动过。
+                #
+                # 不能简单写成「候选必须封闭」：如果原版本来就不封闭
+                # （例如网格有非流形边），那么「把 3 个散件修成一整件」的候选
+                # 也会因为仍不封闭而被拒绝，用户只能继续拿着更差的那一版 ——
+                # 修复明明有效，却永远不会生效。所以判据是「不比原版更差」：
+                #   * 原版封闭 → 候选也必须封闭（绝不能用封闭性换别的指标）
+                #   * 原版不封闭 → 已经是失败状态，允许候选继续改善别的方面
+                # 不能只比 watertight 布尔值：两边都不水密时它恒为真，
+                # 于是「28 条非流形边」可以被换成「287 条」还算改善。
+                if _mesh_quality_not_worse(best_metrics, retry_metrics) and _integrity_rank(retry_metrics, spec, self._change_contract) < best_rank:
+                    best_source, best_compile, best_metrics = candidate, retry, retry_metrics
+                    best_rank = _integrity_rank(retry_metrics, spec, self._change_contract)
+                if best_rank == (0, 0, 0, 0, 0, 0, 0):
+                    break
+
+        # 两轮定点修复仍散件 → 换一条生成路径重试一次（带着「必须一整件」的硬约束）。
+        if best_rank[1] > 0:
+            requirement = self._requirement_text()
+            if requirement:
+                job.say("散件仍未消除，正在换一条建模路径重新生成…", kind="warn")
+                try:
+                    regen = await client.generate_scad(
+                        requirement, _INTEGRITY_REGEN_EXTRA, self.printer_block
+                    )
+                    candidate = scad_src.strip_code_fences(regen.content)
+                    if scad_src.validate(candidate).ok:
+                        retry = await asyncio.to_thread(
+                            compiler.compile_to_stl,
+                            candidate,
+                            job_work_dir(project),
+                            "model",
+                            params,
+                            None,
+                            self.resolve_fn_for(candidate),
+                        )
+                        if retry.ok:
+                            retry_metrics = await _analyze_with_heartbeat(
+                                job, retry.stl_path, limits, source=candidate
+                            )
+                            wt_ok = _mesh_quality_not_worse(best_metrics, retry_metrics)
+                            rank = _integrity_rank(retry_metrics, spec, self._change_contract)
+                            if wt_ok and rank < best_rank:
+                                best_source, best_compile, best_metrics = candidate, retry, retry_metrics
+                                best_rank = rank
+                                job.say("换路径重新生成后结构更完整。", kind="success")
+                except LlmError as exc:
+                    log.warning("完整性换路径重生成失败：%s", exc)
+
+        # 声明的整体尺寸实测偏差过大 → 确定性逐轴缩放兜底。
+        # 为什么需要：弱模型（实测 glm-4.7-flash）常把「总高」写成某一段的高度、
+        # 「外径」写成不含唇边的直径，AI 修两轮也不收敛；而包围盒偏差是纯几何事实，
+        # 逐轴缩放可以确定性命中目标（只动偏差的轴，不缩壁厚方向）。
+        # 它必须在 problems 门外无条件尝试：第二轮基准实测到的正是
+        # 「要求 60×40、做出 56×36（偏 6.7%）」—— 不报问题、也没人修。
+        # 门控放在 _axis_dimension_fix 内部（偏差≤2% 返回 None），这里不再依赖
+        # 「是否已报尺寸问题」——报问题的阈值（偏小 10%）比校正阈值（2%）宽，
+        # 用它当门会把 8% 这种「没报问题但也没做到」的偏差漏掉。
+        suite_now = self._requirement_suite(best_metrics, spec)
+        fix_targets = suite_now.dimension_targets() if suite_now is not None else None
+        fixed = self._axis_dimension_fix(
+            best_source, best_metrics, spec, self._change_contract, fix_targets
+        )
+        if fixed:
             retry = await asyncio.to_thread(
                 compiler.compile_to_stl,
-                candidate,
+                fixed,
                 job_work_dir(project),
                 "model",
                 params,
                 None,
-                self.resolve_fn_for(candidate),
+                self.resolve_fn_for(fixed),
             )
-            if not retry.ok:
-                job.say("结构修正后的代码编译失败，保留当前模型。", kind="warn")
-                break
+            if retry.ok:
+                retry_metrics = await _analyze_with_heartbeat(
+                    job, retry.stl_path, limits, source=fixed
+                )
+                wt_ok = _mesh_quality_not_worse(best_metrics, retry_metrics)
+                parts_ok = retry_metrics.stray_parts <= best_metrics.stray_parts
+                dev_before = self._dim_deviation(
+                    best_metrics, spec, self._change_contract, fix_targets
+                )
+                fixed_suite = self._requirement_suite(retry_metrics, spec)
+                dev_after = self._dim_deviation(
+                    retry_metrics,
+                    spec,
+                    self._change_contract,
+                    fixed_suite.dimension_targets() if fixed_suite is not None else fix_targets,
+                )
+                # 采纳判据用「实测尺寸偏差更小」而不是 integrity rank：
+                # 偏差 8% 这种「没报问题但也没做到」的情况 rank 不变，比 rank 会漏掉改善。
+                if wt_ok and parts_ok and dev_after < dev_before - 1e-3:
+                    best_source, best_compile, best_metrics = fixed, retry, retry_metrics
+                    best_rank = _integrity_rank(retry_metrics, spec, self._change_contract)
+                    job.say("已按点名的尺寸对模型做逐轴校正。", kind="success")
 
-            try:
-                retry_metrics = await _analyze_with_heartbeat(job, retry.stl_path, limits)
-            except StlError as exc:
-                job.say("结构修正后的模型无法分析，保留当前模型。", detail=exc.message, kind="warn")
-                break
-
-            # 采纳条件：**封闭性不变差** + 完整性严格更好
-            # （散件更少 → 点名尺寸更准 → 穿腔更少）。
-            # 平手一律保留原版 —— 改动越少，用户越不容易发现别的结构被动过。
-            #
-            # 不能简单写成「候选必须封闭」：如果原版本来就不封闭
-            # （例如网格有非流形边），那么「把 3 个散件修成一整件」的候选
-            # 也会因为仍不封闭而被拒绝，用户只能继续拿着更差的那一版 ——
-            # 修复明明有效，却永远不会生效。所以判据是「不比原版更差」：
-            #   * 原版封闭 → 候选也必须封闭（绝不能用封闭性换别的指标）
-            #   * 原版不封闭 → 已经是失败状态，允许候选继续改善别的方面
-            watertight_not_worse = retry_metrics.watertight or not best_metrics.watertight
-            if watertight_not_worse and _integrity_rank(retry_metrics, spec) < best_rank:
-                best_source, best_compile, best_metrics = candidate, retry, retry_metrics
-                best_rank = _integrity_rank(retry_metrics, spec)
-            if best_rank == (0, 0, 0, 0):
-                break
-
-        if best_rank == _integrity_rank(metrics, spec) and best_source is source:
-            job.say("修正没有变得更好，保留当前模型。", kind="warn")
+        if best_source is source:
+            # 「一开始就没报问题」是正常路径，不能对它播报失败
+            # （以前由开头的 early-return 挡掉，去掉 early-return 后必须在这里补上）。
+            if problems:
+                job.say("修正没有变得更好，保留当前模型。", kind="warn")
+                # 一轮都没修掉：这些问题全部残留，必须交给最终判定
+                self._integrity_remaining = list(problems)
             return source, compile_result, metrics
 
         remaining = _geometry_integrity_problems(
-            best_metrics, spec, visual, dropped, self._requirement_text()
+            best_metrics, spec, visual, dropped, self._requirement_text(), self._change_contract
         )
+        self._integrity_remaining = list(remaining)
         if remaining:
             job.say(
                 "已改善，但仍有残留问题。",
@@ -751,7 +1062,7 @@ class GenerationRunner:
             job.say("重新设计的版本编译失败，保留原结果。", kind="warn")
             return source, compile_result, metrics
 
-        retry_metrics = await _analyze_with_heartbeat(job, retry.stl_path, limits)
+        retry_metrics = await _analyze_with_heartbeat(job, retry.stl_path, limits, source=candidate)
         if not retry_metrics.exceeds_build_volume:
             job.say("已按成型范围重新设计，现在可以放进这台打印机。", kind="success")
             return candidate, retry, retry_metrics
@@ -854,7 +1165,9 @@ class GenerationRunner:
                     log.warning("  缩放诊断 [%s] %s", diag.severity, diag.text[:200])
                 continue
 
-            new_metrics = await _analyze_with_heartbeat(self.job, result.stl_path, limits)
+            new_metrics = await _analyze_with_heartbeat(
+                self.job, result.stl_path, limits, source=candidate_source
+            )
             if new_metrics.exceeds_build_volume:
                 log.warning(
                     "缩放后仍超界：%s（factor=%.3f）", new_metrics.bbox, factor
@@ -889,9 +1202,57 @@ class GenerationRunner:
                 code="NO_API_KEY",
             )
         api = self.config.config.api
-        return DeepSeekClient(key, api.base_url, api.model, api.timeout_s)
+        # glm-4.7-flash 免费档高峰常连发 1305；给它一个同提供商内的降级模型，
+        # 限流时自动临时改用，避免整条作业因过载失败（降级会留日志）。
+        fallback = None
+        if detect_provider(api.base_url) == "glm" and api.model == "glm-4.7-flash":
+            fallback = "glm-4-flash"
+        return DeepSeekClient(key, api.base_url, api.model, api.timeout_s, fallback)
+
+    def _client_economy(self) -> DeepSeekClient:
+        """混合·性价比模式的经济档客户端：规格解析/打印性评审/AI 复核走免费档。
+
+        生成/修改/几何修复仍用主模型（付费质量档）—— 结构质量是钱该花的地方；
+        解析/评审这类「判断型」调用免费档足够，省下的就是性价比。
+        未配置经济档时退回主客户端，行为与原来完全一致。
+        """
+        api = self.config.config.api
+        if not (api.economy_model and api.economy_base_url):
+            return self._client()
+        base = api.economy_base_url
+        key = self.config.api_key_for(base) or self.config.api_key
+        fallback = None
+        if detect_provider(base) == "glm" and api.economy_model == "glm-4.7-flash":
+            fallback = "glm-4-flash"
+        return DeepSeekClient(key, base, api.economy_model, api.timeout_s, fallback)
 
     # --- 主流程 -----------------------------------------------------------
+    def _requirement_text(self) -> str:
+        """需求原文：**本次指令 + 项目最初那句诉求**（生成用 prompt / 修改用 instruction）。
+
+        为什么要有个方法而不是各处自己拼：几何完整性判定要用它（例如判断需求里
+        有没有提"螺纹"），少传一处就少判一类问题。踩过的坑：加了这个调用却没把
+        方法本身加进类里，运行到"几何修复"这条分支就直接 AttributeError ——
+        而自检当时是绿的（那条分支离线不跑），必须补一条接线测试。
+
+        为什么必须算上最初那句（实测）：项目第一条 prompt 写着「底部是封闭的实心底」，
+        而**把底挖穿的那一步**指令是「在顶部正中间增加一个直径10mm 的圆孔，
+        要完全贯通到底部。」——只看本次指令，所有按需求文本门控的判定（实心底、螺纹）
+        都不会出场，产品就对着一个没有底的笔筒说“改好了”。同一个字符串还是【散件
+        重生成】的输入（下面 `generate_scad`），只喂「把高度改成50mm」会重生成一个
+        与项目无关的东西。
+
+        为什么不拿 spec.features 那种 AI 改写去补：实测同一句“实心底”被改写成
+        「底部为实心封闭结构」（不在词表里）——门控要用**用户原话**，不用二手转述。
+        """
+        current = getattr(self, "_requirement", "") or ""
+        base = getattr(self, "_requirement_base", "") or ""
+        if not base or base in current:
+            return current
+        if current in base:
+            return base
+        return f"{base} {current}"[:_REQUIREMENT_MAX_CHARS]
+
     async def run(
         self,
         *,
@@ -906,6 +1267,26 @@ class GenerationRunner:
         # 本次作业的「需求原文」：几何完整性判定要用它（例如需求里有没有提螺纹）。
         # 用一个方法取，而不是各处自己拼 prompt/instruction —— 少一处就等于漏判一类。
         self._requirement = " ".join(part for part in (prompt, instruction) if part)
+        # 项目最初那句诉求（存于 history.jsonl 第一条）：拼到需求原文里去，见
+        # `_requirement_text()` 的实测理由。
+        self._requirement_base = _project_baseline_requirement(project)
+        # 本次改动的授权契约（生成类作业为 None）：几何判定要用它区分
+        # 「用户授权改的项」与「规格里原来点名、本次没让动的项」。
+        self._change_contract = None
+        # **归档当前版本必须放在最前面**，因为编译会把新的 model.scad / model.stl
+        # 直接写进项目目录（job_work_dir 就是项目目录）。放在收尾阶段归档，
+        # 存进 revisions/rNNN 的其实是第 N+1 版的内容 —— 实测就是这样：
+        # revisions/r001 里躺着第 2 版（高度已改）的源码，
+        # 于是"恢复历史版本"会把用户带回一个错误的模型。
+        if project.revision > 0:
+            try:
+                projects.store().archive_revision(
+                    project,
+                    project.revision,
+                    keep_stl=self.config.config.behavior.keep_stl_history,
+                )
+            except Exception as exc:  # noqa: BLE001 - 归档失败不该挡住生成
+                log.warning("归档当前版本失败（不影响本次生成）：%s", exc)
         # 进度心跳：阶段内按时间推进百分比（用户反馈"进度条不能体现准确的进度"）。
         # 单开一个任务，而不是塞进各个步骤里 —— 否则每个耗时步骤都得记得推一次，
         # 漏一处进度条就停在那儿。3 秒一拍足够让细条"在动"，又不会把事件流刷爆。
@@ -987,18 +1368,22 @@ class GenerationRunner:
         spec = DesignSpec()
         try:
             previous = DesignSpec.from_dict(project.spec) if project.spec else None
-            spec = await client.parse_design_spec(prompt, previous)
+            spec = await self._client_economy().parse_design_spec(prompt, previous)
         except LlmError:
             raise
         except Exception as exc:  # noqa: BLE001 - 规格解析失败不应阻断生成
             log.warning("规格解析失败，退化为直接生成：%s", exc)
 
         if spec.is_empty():
-            # 解析不出来就退回旧路径，至少别让用户拿不到东西
-            job.say("未能整理出明确规格，将按你的原话直接设计。", kind="warn")
-            result = await client.generate_scad(prompt, None, self.printer_block)
-            source = scad_src.strip_code_fences(result.content)
-            self._log_usage(result)
+            # 解析不出来：标准零件仍走确定性直出（不依赖规格），其余退回旧路径。
+            source = self._deterministic_part_source(prompt, spec)
+            if source:
+                job.say("命中标准零件，直接生成已验证几何（不经 AI 画螺纹）。", kind="success")
+            else:
+                job.say("未能整理出明确规格，将按你的原话直接设计。", kind="warn")
+                result = await client.generate_scad(prompt, None, self.printer_block)
+                source = scad_src.strip_code_fences(result.content)
+                self._log_usage(result)
             source = await self._ensure_compilable(client, source, project=project, prompt=prompt)
             await self._finish(project, source, prompt=prompt, requirement=prompt)
             return
@@ -1029,23 +1414,54 @@ class GenerationRunner:
 
         # --- 按规格生成 -------------------------------------------------
         job.set_stage("generating_scad", text="正在按确认的规格设计结构…")
-        result = await client.generate_from_spec(prompt, spec, self.printer_block)
-        source = scad_src.strip_code_fences(result.content)
-        self._log_usage(result)
+        # 标准零件且需求明确时**确定性直出**已验证几何，不经 AI 画螺纹/填参 ——
+        # 这是「67 转 77 滤镜环始终做不对」这类问题的根治：口径映射与几何都由程序保证。
+        source = self._deterministic_part_source(prompt, spec)
+        if source:
+            job.say("命中标准零件，直接生成已验证几何（不经 AI 画螺纹）。", kind="success")
+        else:
+            result = await client.generate_from_spec(prompt, spec, self.printer_block)
+            source = scad_src.strip_code_fences(result.content)
+            self._log_usage(result)
         source = embed_fingerprint(source, spec)
 
         source = await self._ensure_compilable(client, source, project=project, prompt=prompt)
         await self._finish(project, source, prompt=prompt, requirement=prompt, spec=spec)
 
     def _announce_spec(self, job: Job, spec: DesignSpec) -> None:
-        """在对话里用最少的话说明「我理解成了什么」。"""
+        """在对话里用最少的话说明「我理解成了什么」，并把**我替你定的具体取值**摊开。
+
+        只说「有几点你没说清楚，我按常见做法先定了」而不给出数字，用户就没有可纠正的对象 ——
+        实测用户反馈「对话大模型无法领会意思」，很大一块正是这类没露面就生效的假设
+        （夹口开度、配合孔径、壁厚全部在内）：程序以为已经交代了，用户根本不知道定了什么。
+        所以必须把值念出来，并明确鼓动用户纠正。
+        """
         headline = spec.summary or spec.kind or "你的需求"
         job.say(f"我理解你要的是：{headline}", detail=spec.to_prompt()[:400])
-        if spec.open_questions:
-            job.say(
-                "有几点你没说清楚，我按常见做法先定了：" + "；".join(spec.open_questions[:2]),
-                kind="warn",
+        assumed = [it for it in spec.specs if not it.user_specified and it.value is not None]
+        undecided = [it for it in spec.specs if not it.user_specified and it.value is None]
+        if not assumed and not undecided and not spec.open_questions:
+            return
+        chunks: list[str] = []
+        if assumed:
+            chunks.append(
+                "我按常见做法取了值："
+                + "、".join(
+                    f"{it.label or it.name} {float(it.value):g}{it.unit or 'mm'}"
+                    for it in assumed[:8]
+                )
             )
+        if undecided:
+            chunks.append(
+                "这几项规格里没数值，我在代码里按品类惯例定了值："
+                + "、".join(str(it.label or it.name) for it in undecided[:5])
+            )
+        if spec.open_questions:
+            chunks.append("不确定处：" + "；".join(str(q).strip() for q in spec.open_questions[:2]))
+        job.say(
+            "；".join(chunks) + "。哪一项不对，直接说「把××改成多少」就行。",
+            kind="warn",
+        )
 
     def _publish_spec(self, job: Job, spec: DesignSpec, awaiting: bool = True) -> None:
         """把规格推给界面（用于渲染成可确认/可纠正的卡片）。"""
@@ -1066,6 +1482,36 @@ class GenerationRunner:
             return False
         return True
 
+    @staticmethod
+    def _spec_is_plain(spec: DesignSpec) -> bool:
+        """规格是否「只是一个标准零件」：无禁止项、特征全在白名单内。
+
+        只要用户提了白名单之外的特征（挂绳孔、刻字、卡扣……），就回退 AI ——
+        直出只保证「纯零件」正确，带额外结构时必须让 AI 在零件之上加东西。
+        """
+        if spec.prohibitions:
+            return False
+        return all(
+            any(word in feature for word in PLAIN_PART_FEATURES)
+            for feature in spec.features
+            if feature.strip()
+        )
+
+    def _deterministic_part_source(self, requirement: str, spec: DesignSpec) -> str | None:
+        """需求明确命中标准零件时，直接渲染已验证几何的源码；否则返回 None 走 AI。"""
+        from .parts import catalog as parts_lib
+
+        call = parts_lib.extract_call(requirement, spec)
+        if call is None or not self._spec_is_plain(spec):
+            return None
+        part, values = call
+        return parts_lib.render_source(
+            part,
+            values,
+            name=(spec.kind or spec.summary or part.name),
+            summary=(spec.summary or part.summary),
+        )
+
     async def _pipeline_modify(self, project: Project, instruction: str) -> None:
         """续改：先立变更契约 → 只改授权内容 → 校验 → 不达标带差异重做一次。
 
@@ -1085,7 +1531,7 @@ class GenerationRunner:
         spec = DesignSpec.from_dict(project.spec) if project.spec else DesignSpec()
         job.set_stage("understanding", text="正在理解你的修改要求…")
         try:
-            updated = await client.parse_design_spec(instruction, spec if not spec.is_empty() else None)
+            updated = await self._client_economy().parse_design_spec(instruction, spec if not spec.is_empty() else None)
             if not updated.is_empty():
                 # 保留旧规格里用户指定过的项与禁止项，再并入新信息
                 spec = merge_specs(spec, updated)
@@ -1095,7 +1541,15 @@ class GenerationRunner:
 
         # --- 变更契约 ---------------------------------------------------
         current_params = scad_src.extract_top_level_numbers(current)
-        contract = build_change_contract(instruction, spec, current_params)
+        # 注释标签（`// @param total_h 100 总高`）是规格名 ↔ 源码参数名之间最可靠的桥：
+        # 少了它，「规格叫 height、源码叫 total_h」时整条修改链路会静默失效（§73）。
+        contract = build_change_contract(
+            instruction,
+            spec,
+            current_params,
+            scad_src.extract_param_labels(current),
+        )
+        self._change_contract = contract
         job.say(
             "本次只改这些，其余保持不变。",
             detail=contract.describe(),
@@ -1148,6 +1602,24 @@ class GenerationRunner:
                                 "已直接按你的目标值改动，其余部分原样保留。",
                                 kind="success",
                             )
+                    if not verdict.ok and contract.scale_factor:
+                        # 整体缩放没有"目标参数值"可写（它改的是所有尺寸的比例），
+                        # 所以上面那条兜底对它是空转 —— 实测「整体缩小到80%」
+                        # 因此变成静默无操作：作业报成功，模型一毫米没变。
+                        # 缩放本身是纯变换，程序自己就能做（拿现成的
+                        # build_scaled_source，成型范围兜底一直在用它）。
+                        scaled = build_user_scaled_source(
+                            current, float(contract.scale_factor), self.printer.name
+                        )
+                        if scaled and scaled != current:
+                            scale_verdict = verify_change(current, scaled, contract, spec)
+                            if scale_verdict.ok:
+                                source = scaled
+                                verdict = scale_verdict
+                                job.say(
+                                    "已按你的比例整体缩放，其余结构保持不变。",
+                                    kind="success",
+                                )
                     if not verdict.ok:
                         # 仍不达标：在「重做版 / 首版 / 完全没改」三者里挑代价最小的那一版，
                         # 并如实说明。注意「完全没改」也参与比较，不允许它靠无害白占便宜。
@@ -1185,6 +1657,17 @@ class GenerationRunner:
                 log.warning("重做/兜底改动的过程中出错（保留现有结果）：%s", exc, exc_info=True)
         else:
             job.say("改动符合你的要求，其它部分未变。", kind="success")
+
+        # 改动生效后，把用户授权的目标值写进**规格本身**。
+        # 不这么做的话，规格永远是项目最初那版（例如"总高 100mm"），
+        # 下一轮检查又会拿它去要求已经改成 50mm 的模型 —— 互相打架（见 §72）。
+        if verdict.ok and contract.target_values:
+            updated = spec.apply_authorized_change(contract.target_values)
+            if updated:
+                job.say(
+                    "已把这次改动的数值记进设计规格。",
+                    detail="更新：" + "、".join(updated),
+                )
 
         source = embed_fingerprint(source, spec)
         # 改动前的实测尺寸：上一次生成时已经测量过并存在项目里，直接取即可，
@@ -1227,8 +1710,9 @@ class GenerationRunner:
             return None
         if scad_src.strip_comments(before).strip() == scad_src.strip_comments(after).strip():
             return None
+        job = self.job  # 实测踩到：漏了这行，AI 复核一提出异议就 NameError 崩掉整个 modify 作业
         try:
-            client = self._client()
+            client = self._client_economy()  # 复核属「判断型」调用，混合模式走免费档
             review = await client.review_change(before, after, contract, spec)
         except LlmError as exc:
             log.info("AI 复核未完成（程序化核对结果仍然有效）：%s", exc.message)
@@ -1298,16 +1782,23 @@ class GenerationRunner:
                 if issue.severity == "error":
                     job.say(f"检查发现问题：{issue.title}", detail=issue.detail, kind="warn")
             job.progress(52.0, "正在让 AI 修正代码问题…")
-            repaired = await client.repair_scad(source, problem)
-            candidate = scad_src.strip_code_fences(repaired.content)
-            revalidation = scad_src.validate(candidate)
-            if revalidation.ok:
-                job.say("已修正代码问题。", kind="success")
-                return candidate
-            reason = "；".join(i.detail for i in revalidation.issues if i.severity == "error")
+            # 校验修复给两次机会：实测 glm 偶发产出触发安全校验的代码（禁用调用/外部引用），
+            # 一次修复有时删不干净，直接终止会让用户拿不到模型。
+            candidate = source
+            for _attempt in range(2):
+                repaired = await client.repair_scad(candidate, problem)
+                candidate = scad_src.strip_code_fences(repaired.content)
+                revalidation = scad_src.validate(candidate)
+                if revalidation.ok:
+                    job.say("已修正代码问题。", kind="success")
+                    return candidate
+                problem = "；".join(
+                    f"{i.title}：{i.detail}" for i in revalidation.issues if i.severity == "error"
+                )
+            reason = problem
             raise LlmError(
                 "AI 生成的模型代码没有通过安全检查，已停止生成。",
-                hint=f"原因：{reason or problem}。请换一种描述方式再试一次。",
+                hint=f"原因：{reason}。请换一种描述方式再试一次。",
                 code="SCAD_INVALID",
             )
 
@@ -1332,7 +1823,12 @@ class GenerationRunner:
 
         job.say("模型代码编译失败，正在让 AI 自动修复…", detail=compile_result.message, kind="warn")
         job.progress(70.0, "正在自动修复模型代码…")
-        repaired = await client.repair_scad(previous or source, compile_result.fatal or compile_result.message)
+        # 修复证据 = 已知成因的**可执行改法**（如果有）+ OpenSCAD 原文。
+        # 只丢原文时（CGAL assert 这种），AI 两轮改的还是同一个错 —— 实测踩过。
+        evidence = compile_result.fatal or compile_result.message
+        if compile_result.advice:
+            evidence = f"{compile_result.advice}\n\nOpenSCAD 原始报错：\n{evidence}"
+        repaired = await client.repair_scad(previous or source, evidence)
         candidate = scad_src.strip_code_fences(repaired.content)
         revalidation = scad_src.validate(candidate)
         if not revalidation.ok:
@@ -1355,6 +1851,29 @@ class GenerationRunner:
         if retry.ok:
             job.say("已自动修复并生成成功。", kind="success")
             return candidate
+
+        # 修复两轮仍失败 → 换一条生成路径重试一次（P0：生成随机性加固）。
+        # 再修同一份代码往往卡在同一个错误写法上；带着硬约束重新生成是另一条路。
+        if prompt:
+            job.say("自动修复仍失败，正在换一条建模路径重新生成…", kind="warn")
+            try:
+                regen = await client.generate_scad(prompt, _REGEN_EXTRA, self.printer_block)
+                candidate2 = scad_src.strip_code_fences(regen.content)
+                if scad_src.validate(candidate2).ok:
+                    retry2 = await asyncio.to_thread(
+                        compiler.compile_to_stl,
+                        candidate2,
+                        job_work_dir(project),
+                        "model",
+                        None,
+                        None,
+                        self.resolve_fn_for(candidate2),
+                    )
+                    if retry2.ok:
+                        job.say("换路径重新生成成功。", kind="success")
+                        return candidate2
+            except LlmError as exc:
+                log.warning("换路径重生成失败：%s", exc)
 
         raise compiler.CompileError(
             "模型代码无法编译为 3D 模型，自动修复后仍然失败。",
@@ -1383,7 +1902,12 @@ class GenerationRunner:
         job.revision = revision
 
         validation = scad_src.validate(source)
-        meta_name, meta_summary, meta_params = validation.model_name, validation.summary, validation.params
+        # 只取注释元数据里的名字与摘要。`validation.params`（从源码解析出的参数）
+        # **不在这里取**：参数是经 `params` / `param_meta` 单独传给落盘层的
+        # （见本函数后面的 _persist 调用），那一路才是权威来源。原来在这里
+        # 多解构一个 `meta_params` 却从不使用，读代码的人会误以为参数走的是
+        # 这条路 —— 与「算出来却不用」是同一类误导，直接不取。
+        meta_name, meta_summary = validation.model_name, validation.summary
 
         # 1) 编译（$fn 按这台打印机 + 这个模型的真实尺寸决定）
         job.set_stage("compiling", text="正在生成 3D 模型…")
@@ -1412,7 +1936,7 @@ class GenerationRunner:
         metrics: MeshMetrics | None = None
         metrics_error: str | None = None
         try:
-            metrics = await _analyze_with_heartbeat(job, compile_result.stl_path, limits)
+            metrics = await _analyze_with_heartbeat(job, compile_result.stl_path, limits, source=source)
             # 耗材用量需要材料密度，而 analyze 只拿到工艺约束 —— 在这里补算。
             # 密度查表见 printers.material_density（PLA 1.24、ABS 1.04、PETG 1.27 …）。
             metrics.usage = estimate_usage(
@@ -1501,6 +2025,9 @@ class GenerationRunner:
                 previous_values=previous_values,
                 previous_largest=previous_largest,
             )
+            scale_gap = _scale_mismatch(contract, metrics, previous_largest)
+            if scale_gap:
+                mismatched = [*mismatched, scale_gap]
             if mismatched:
                 change_verdict.ok = False
                 change_verdict.implausible.extend(mismatched)
@@ -1522,12 +2049,75 @@ class GenerationRunner:
         effective_params = scad_src.extract_top_level_numbers(final_source)
         param_meta = build_param_meta(final_source, effective_params)
 
+        # 3.8) 需求核对：把契约编译成逐条判定，既进清单也进落盘数据。
+        #      必须算在打印性检查**之前**：打印性判定的降级要靠这些实测结论。
+        requirement_suite = self._requirement_suite(metrics, spec)
+        if requirement_suite is not None:
+            # 只对“用户提的要求没做到”开门；工艺类（壁厚/支撑/面数/超范围）
+            # 归打印性检查那条链路去说，否则同一件事会被提醒两次。
+            blocking = [
+                t
+                for t in requirement_suite.tests
+                if t.status == reqtests.FAIL and not t.advisory
+            ]
+            summary = requirement_suite.summary()
+            if blocking:
+                # 以前只在「修复循环残留问题」时说话，未达成项的具体数字用户完全看不到。
+                # 现在明确摊开：要求什么、实测什么、差多少。
+                job.say(
+                    f"需求核对：{round(summary['requirement_score'] * 100)}% 的需求达成，"
+                    f"{len(blocking)} 项未达成。",
+                    detail="；".join(
+                        f"{t.requirement}（要求 {t.expected} / 实测 {t.actual}）"
+                        for t in blocking[:4]
+                    )[:300],
+                    kind="warn",
+                )
+            else:
+                # “全部达成”只能说“能测的都测到了”：manual 项是程序测不了的语义需求，
+                # 拿 success 报「全部达成」会让用户以为连外观都算过了。
+                manual_tests = [
+                    t for t in requirement_suite.tests if t.status == reqtests.MANUAL
+                ]
+                manual_count = len(manual_tests)
+                manual_names = "、".join(t.requirement for t in manual_tests[:4])
+                job.say(
+                    "需求核对：可测项全部达成"
+                    + (f"（另有 {manual_count} 项程序测不了）" if manual_count else "。"),
+                    detail=f"{summary['counts']['pass']} 项实测通过"
+                    + (
+                        f"；「{manual_names[:80]}」这几项只有外观复核/人工能确认"
+                        if manual_count
+                        else ""
+                    ),
+                    kind="info" if manual_count else "success",
+                )
+
+        # 3.9) 实测硬失败也必须让「改动核对结论」闭嘴。
+        #      实测过：AI 复核说「改动成功，满足用户要求且未破坏其他功能」，
+        #      而网格上声明的夹口根本不存在 —— 参数级核对看不出这一类，几何能。
+        hard_fails = _hard_failures(requirement_suite)
+        if change_verdict is not None and hard_fails and change_verdict.ok:
+            change_verdict.ok = False
+            change_verdict.reasons.append(
+                "实测发现要求没做到："
+                + "；".join(
+                    f"{t.requirement}（要求 {t.expected or '—'} / 实测 {t.actual or '量不到'}）"
+                    for t in hard_fails[:3]
+                )[:300]
+            )
+            job.say(
+                "改动后的模型实测下来还有要求没做到，这次改动不算完全成功。",
+                detail=change_verdict.reasons[-1],
+                kind="warn",
+            )
+
         # 4) AI 打印性检查（以选中打印机为准绳）
         printability: dict[str, Any] | None = None
         job.set_stage("reviewing", text=f"正在按 {self.printer.name} 做打印性检查…")
         if metrics is not None:
             try:
-                client = self._client()
+                client = self._client_economy()
                 summary = summarize_for_ai(metrics, project.name, limits)
                 printability = await client.review_printability(
                     final_source, summary, requirement, self.printer_block
@@ -1537,10 +2127,31 @@ class GenerationRunner:
                 metrics_note = "；".join(metrics.issues) if metrics.issues else "程序测量未发现明显几何问题。"
                 printability["metrics_note"] = metrics_note
                 printability["printer"] = self.printer_context()
-                verdict_text = {"pass": "可以打印", "warn": "可以打印，但有注意事项", "fail": "存在打印风险"}.get(
-                    str(printability.get("verdict")), "检查完成"
+                # 判定诚实化：实测硬失败 / 外观复核报的问题 / 修复残留，都必须拖低 verdict 与 score。
+                # 不加这一步的后果（实测）：夹口完全没切出来，AI 仍给 pass/85 分，
+                # 而唯一看出问题的外观复核只被当成一段附注文字，用户根本看不到。
+                honesty = _downgrade_printability(
+                    printability,
+                    requirement_suite,
+                    visual_review,
+                    self._integrity_remaining,
                 )
-                job.say(f"打印性检查：{verdict_text}。", detail=str(printability.get("summary") or ""), kind="success")
+                if honesty:
+                    log.info("打印性判定已按实测证据降级：%s", honesty)
+                verdict_key = str(printability.get("verdict"))
+                verdict_text = {
+                    "pass": "可以打印",
+                    "warn": "可以打印，但有注意事项",
+                    # 不要弱化：判 fail 时模型往往是**非封闭/严重超差**，
+                    # 实测用 kind="success" 播报「存在打印风险」，
+                    # 界面上看起来就是一条成功提示，用户很容易照打。
+                    "fail": "存在必须修复的问题，现在这版不建议直接打印",
+                }.get(verdict_key, "检查完成")
+                job.say(
+                    f"打印性检查：{verdict_text}。",
+                    detail=str(printability.get("summary") or ""),
+                    kind="success" if verdict_key == "pass" else ("error" if verdict_key == "fail" else "warn"),
+                )
             except LlmError as exc:
                 job.say("打印性检查未完成，但模型已生成成功。", detail=exc.message, kind="warn")
         else:
@@ -1562,6 +2173,7 @@ class GenerationRunner:
             prompt,
             instruction,
             spec,
+            requirement_suite,
         )
 
         stl_path = compile_result.stl_path
@@ -1627,6 +2239,8 @@ class GenerationRunner:
             "printability": printability,
             # 设计契约与本次改动核对结论 —— 界面用它说明「我按什么做的、改了什么」
             "spec": spec.to_display() if spec is not None else None,
+            # 逐条需求判定 + PR/RS/IR —— 用户判断「这版能不能直接用」的依据
+            "requirement_tests": requirement_suite.to_dict() if requirement_suite else None,
             "change_verdict": change_verdict.to_dict() if change_verdict is not None else None,
             "change_summary": summarize_verdict(change_verdict) if change_verdict is not None else None,
             "diagnostics": metrics_error
@@ -1638,6 +2252,22 @@ class GenerationRunner:
         job.succeed()
 
     # --- 落盘 -------------------------------------------------------------
+    @staticmethod
+    def _metrics_payload(
+        metrics: MeshMetrics | None, req_suite: reqtests.ReqSuite | None
+    ) -> dict[str, Any] | None:
+        """实测数据 + 需求核对清单。
+
+        为什么把清单塞进 metrics：项目重开时界面要显示同一份核对表，
+        而 metrics 是唯一已经持久化、且 /api/projects/{id}/metrics 会回传的载荷。
+        """
+        if metrics is None:
+            return None
+        payload = metrics.to_dict()
+        if req_suite is not None:
+            payload["requirement_tests"] = req_suite.to_dict()
+        return payload
+
     def _persist(
         self,
         project: Project,
@@ -1652,11 +2282,15 @@ class GenerationRunner:
         prompt: str | None,
         instruction: str | None,
         spec: DesignSpec | None = None,
+        req_suite: reqtests.ReqSuite | None = None,
     ) -> None:
         store_projects = projects.store()
 
-        # 归档上一版之后再覆盖，保证历史可回溯
-        if project.revision > 0:
+        # 归档放在这里已经太晚：编译早把新的 model.scad / model.stl 写进项目目录了。
+        # 现在归档在作业开始时做（见 GenerationRunner.run 的说明）。
+        # 这里保留一次幂等兜底：只有当对应目录还不存在时才补归档，
+        # 避免把"已经写入的新版本"当成旧版本存进去。
+        if project.revision > 0 and not project.revision_dir(project.revision).exists():
             store_projects.archive_revision(
                 project,
                 project.revision,
@@ -1673,7 +2307,7 @@ class GenerationRunner:
         project.summary = meta_summary or project.summary
         project.params = params
         project.param_meta = param_meta
-        project.metrics = metrics.to_dict() if metrics else None
+        project.metrics = self._metrics_payload(metrics, req_suite)
         project.printability = printability
         project.printer = self.printer_context()
         # 规格随每次生成更新：它是用户意图的累积记录，跨会话不丢
@@ -1699,11 +2333,37 @@ class GenerationRunner:
                 summary=meta_summary or "",
                 name=project.name,
                 stl=True,
-                metrics=metrics.to_dict() if metrics else None,
+                metrics=self._metrics_payload(metrics, req_suite),
                 printability=printability,
                 params=params,
             ),
         )
+        # 3MF：切片软件真正想要的格式。STL 不带单位，导进 Bambu Studio /
+        # OrcaSlicer / Cura 时常见“尺寸差 10/100 倍”后手动缩放；3MF 明确声明
+        # unit="millimeter"，并把机型/材料/设计尺寸写进元数据。
+        # 从**已交付的那个 STL** 直接转（不重跑 OpenSCAD），保证两者面数/几何一致。
+        try:
+            if project.stl_path.is_file():
+                from .threemf import write_3mf_from_stl
+
+                bbox = metrics.bbox if metrics is not None else (0.0, 0.0, 0.0)
+                write_3mf_from_stl(
+                    project.stl_path,
+                    project.three_mf_path,
+                    title=project.name,
+                    metadata={
+                        "Title": project.name,
+                        "Application": "AI 3D Forge",
+                        "Description": project.summary or "",
+                        "Printer": f"{self.printer.name}（喷嘴 {self.printer.nozzle_mm}mm）",
+                        "Material": self.material or "",
+                        "DesignSizeMM": f"{bbox[0]:.1f}x{bbox[1]:.1f}x{bbox[2]:.1f}",
+                        "Revision": str(revision),
+                    },
+                )
+        except Exception:  # noqa: BLE001 - 3MF 是附加交付物，写不了不影响 STL 主流程
+            log.debug("3MF 导出失败", exc_info=True)
+
         # 自动导出一份到 export\，方便用户直接拖进切片软件
         try:
             store_projects.export_copy(project)
@@ -1765,7 +2425,12 @@ def _pick_least_bad(
     return min(pool, key=score)
 
 
-def build_scaled_source(source: str, factor: float, printer_name: str) -> str | None:
+def build_scaled_source(
+    source: str,
+    factor: float,
+    printer_name: str,
+    note: str | None = None,
+) -> str | None:
     """构造一份「等比缩放到刚好装得下」的源码（两条路径，二选一）。
 
     **路径 A：改写顶层参数值**（`_scale_param_values`）。
@@ -1787,14 +2452,14 @@ def build_scaled_source(source: str, factor: float, printer_name: str) -> str | 
         # 源码里没有任何会产出几何的东西（只有声明，或只有 module 定义却从未
         # 实例化）——OpenSCAD 会给出空模型，缩放它没有意义。
         # 唯一例外：只有一个 module 时补上实例化还能救（见 `_wrap_geometry_in_scale`）。
-        return _wrap_geometry_in_scale(source, factor, printer_name)
+        return _wrap_geometry_in_scale(source, factor, printer_name, note)
 
     # 尺寸走参数的形态（AI 生成的绝大多数）：改写参数值即可。
     # 注意不能与 scale 块叠加 —— 叠加就缩两次（实测 240 → 135 而非 180）。
     param_scaled = _scale_param_values(source, factor)
     if param_scaled is not None:
         return param_scaled
-    return _wrap_geometry_in_scale(source, factor, printer_name)
+    return _wrap_geometry_in_scale(source, factor, printer_name, note)
 
 
 _INSTANCE_CALL_RE = re.compile(r"^[ \t]*[A-Za-z_][A-Za-z0-9_]*\s*\([^;]*\)\s*;\s*$", re.MULTILINE)
@@ -1812,7 +2477,12 @@ def _has_geometry(source: str) -> bool:
     return bool(_INSTANCE_CALL_RE.search(scad_src.strip_comments(source)))
 
 
-def _wrap_geometry_in_scale(source: str, factor: float, printer_name: str) -> str | None:
+def _wrap_geometry_in_scale(
+    source: str,
+    factor: float,
+    printer_name: str,
+    note: str | None = None,
+) -> str | None:
     """把源码里的**几何语句**包进 `scale(){...}`，声明一律留在顶层。
 
     为什么必须把 module/function 定义与赋值挑出来放在块外：
@@ -1849,7 +2519,7 @@ def _wrap_geometry_in_scale(source: str, factor: float, printer_name: str) -> st
         if head:
             head += "\n"
         return (
-            f"// 已按目标打印机（{printer_name}）的成型范围等比缩放 {factor:.3f} 倍\n"
+            f"// {note or f'已按目标打印机（{printer_name}）的成型范围等比缩放 {factor:.3f} 倍'}\n"
             f"__aiforge_fit = {factor:.6f};\n"
             f"{head}// 原源码没有实例化任何 module，这里按成型范围补上\n"
             f"scale([__aiforge_fit, __aiforge_fit, __aiforge_fit]) {name}();\n"
@@ -1860,7 +2530,7 @@ def _wrap_geometry_in_scale(source: str, factor: float, printer_name: str) -> st
         head += "\n"
     body = "\n".join(geometry)
     return (
-        f"// 已按目标打印机（{printer_name}）的成型范围等比缩放 {factor:.3f} 倍\n"
+        f"// {note or f'已按目标打印机（{printer_name}）的成型范围等比缩放 {factor:.3f} 倍'}\n"
         f"__aiforge_fit = {factor:.6f};\n"
         f"{head}"
         f"scale([__aiforge_fit, __aiforge_fit, __aiforge_fit]) {{\n{body}\n}}\n"
@@ -1889,12 +2559,86 @@ def _scale_param_values(source: str, factor: float) -> str | None:
     )
 
 
+def build_user_scaled_source(source: str, factor: float, printer_name: str) -> str | None:
+    """按**用户要求**整体缩放（「整体缩小到原来的80%」）。
+
+    与 `build_scaled_source`（服务于"装不下就缩到装得下"）的区别只有一条：
+    这里只缩**尺寸类**参数，数量/角度类保持不变 —— 用户说"缩小到 80%"时，
+    把 `rib_count` 从 16 缩成 12.8（渲染成 13 条筋）是**改了结构**，
+    不是等比缩小。装不下时的兜底则宁可整体缩，所以两条路各自独立。
+    """
+    note = f"已按你的要求整体缩放 {factor:.3f} 倍（长宽高同比例，其余结构未改）"
+    if _has_geometry(source):
+        scaled = scale_dimension_params(source, factor)
+        if scaled:
+            return scaled
+    return _wrap_geometry_in_scale(source, factor, printer_name, note=note)
+
+
+# 数量/角度类参数：整体缩放时**不**跟着变（它们是"有几个""转多少度"，
+# 不是长度）。判据来自参数注释标签，例如「竖向加强筋数量」「顶部外扩量」。
+_COUNT_ANGLE_WORDS = (
+    "数量", "个数", "齿数", "条数", "层数", "圈数", "角度", "倾角", "度数",
+    "count", "angle", "number", "segments", "sides",
+)
+
+
+def scale_dimension_params(source: str, factor: float, keep_labels: tuple[str, ...] = _COUNT_ANGLE_WORDS) -> str | None:
+    """只按倍率改写**尺寸类**顶层参数；数量/角度类原样保留。
+
+    没有注释标签的参数**照缩**：标签缺失时无法判断语义，而"模型没缩到位"
+    比"某个数值跟着缩了"严重得多（前者直接违背用户要求）。
+    """
+    labels = scad_src.extract_param_labels(source)
+    values: dict[str, float] = {}
+    for name, value in scad_src.extract_top_level_numbers(source).items():
+        if not value:
+            continue
+        label = labels.get(name, "")
+        if label and any(word in label.lower() for word in keep_labels):
+            continue
+        values[name] = value * factor
+    if not values:
+        return None
+    scaled_source, applied, _ignored = scad_src.apply_params(source, values)
+    if not applied:
+        return None
+    return (
+        "// 已按倍率改写顶层尺寸参数（数量/角度类保持不变）\n" + scaled_source
+        + ("" if scaled_source.endswith("\n") else "\n")
+    )
+
+
 def _scale_geometry(source: str, factor: float, printer_name: str) -> str | None:
     """把几何语句包进 `scale(){...}`（声明留在块外）；无法构造时返回 None。
 
     给「尺寸直接写死在几何里、没有可改写参数」的源码用。
     """
     return _wrap_geometry_in_scale(source, factor, printer_name)
+
+
+def _wrap_geometry_in_scale_axes(
+    source: str, fx: float, fy: float, fz: float, note: str
+) -> str | None:
+    """逐轴缩放：把几何语句包进 `scale([fx,fy,fz]){...}`，声明留在块外。
+
+    与等比缩放的区别：只校正偏差的那个轴（如总高偏了就只动 z），
+    不会把没偏的轴（壁厚方向）一起缩掉。
+    """
+    lines = source.splitlines()
+    kinds = _classify_lines(lines)
+    kept = [line for line, kind in zip(lines, kinds) if kind == "keep"]
+    geometry = [f"  {line}" for line, kind in zip(lines, kinds) if kind == "geometry"]
+    if not geometry:
+        return None
+    head = "\n".join(kept)
+    if head:
+        head += "\n"
+    body = "\n".join(geometry)
+    return (
+        f"// {note}\n{head}"
+        f"scale([{fx:.6f}, {fy:.6f}, {fz:.6f}]) {{\n{body}\n}}\n"
+    )
 
 
 _DECLARATION_RE = re.compile(
@@ -2052,16 +2796,40 @@ def _thread_problems(metrics: MeshMetrics, requirement: str) -> list[str]:
     return []
 
 
+def _sliver_problems(metrics: MeshMetrics) -> list[str]:
+    """≈0 厚的薄膜/重合面（实测 p05 < 0.05mm）报为完整性问题。
+
+    为什么单列：这不是「壁偏薄」的设计取舍，而是建模 bug —— 实测 glm 挖空时
+    刀具没伸出底面，留下一层 0.01mm 的膜把腔体封住（杯子底变成纸一样薄）。
+    这类缺陷水密、单件、尺寸全对，只有射线壁厚能量出来；不报的话用户
+    拿到的是一个打印必失败的模型。
+    """
+    wall = metrics.wall
+    if wall is None or wall.p05_mm >= 0.05:
+        return []
+    loc = wall.thinnest[0][0] if wall.thinnest else None
+    where = f"（最薄处约 {[round(v, 1) for v in loc]}）" if loc else ""
+    return [
+        f"【问题 9】模型里存在≈0 厚的薄膜/重合面：射线法实测壁厚 p05 只有 "
+        f"{wall.p05_mm:.2f}mm{where}，而中位壁厚 {wall.median_mm:.2f}mm —— "
+        "说明掏空/挖孔的刀具**没有伸出本体表面**，留下一层膜把腔体封住。\n"
+        "改法：让 difference() 的刀具沿挖空方向**两端各伸出 ≥0.1mm**"
+        "（例如底部挖空时刀具 z 从 -0.1 开始），不要正好与本体表面对齐。"
+    ]
+
+
 def _geometry_integrity_problems(
     metrics: MeshMetrics,
     spec: DesignSpec | None = None,
     visual: str = "",
     dropped: list[str] | None = None,
     requirement: str = "",
+    contract: "ChangeContract | None" = None,
+    dim_targets: dict[int, tuple[str, float, str]] | None = None,
 ) -> list[str]:
     """把「几何不成立」翻译成给 AI 的实测证据（而不是泛泛的建议）。
 
-    报七类，因为它们既严重又**可核对**：
+    报十一类，因为它们既严重又**可核对**：
       1. 模型不是一整件（连通分量数 > 1）
       2. 外壁特征穿进了腔体（水平截面上空腔里有材料环）
       3. 用户在规格里点名的整体尺寸没做到（实测 vs 声明）
@@ -2069,10 +2837,15 @@ def _geometry_integrity_problems(
       5. OpenSCAD 明明警告过「这块几何被丢掉了」（编译成功也没用）
       6. 网格有开放边（不是封闭实体 → 切不出来）
       7. 要螺纹却没有真螺旋（同心环 / 光滑圆柱 → 拧不上）
+      8. 用户点名的孔径没做到（射线法实测剖面 vs 声明；参数核对看不到表达式写法）
+      9. ≈ 0 厚的薄膜/重合面（挖空刀具没伸出表面，把腔体封住）
+     10. 源码自己声明的间隙/夹口在网格里量不到（那一刀完全没切到实体）
     其余的几何瑕疵（壁厚、悬垂）交给打印性检查那一条链路，职责不重叠。
     """
     problems: list[str] = []
     problems.extend(_thread_problems(metrics, requirement))
+    problems.extend(_sliver_problems(metrics))
+    problems.extend(_gap_problems(metrics))
     if dropped:
         # 这一类最阴：编译返回成功、STL 非空，只是**少了一部分几何**。
         # 实测：把 3D 的 rotate() 写在 linear_extrude() 的子节点位置，
@@ -2089,7 +2862,8 @@ def _geometry_integrity_problems(
             "    错误：linear_extrude(h) rotate([90,0,90]) polygon(...);\n"
             "如果只是想在平面内转角度，用 rotate([0,0,角度]) 才是合法的。"
         )
-    problems.extend(_spec_dimension_problems(spec, metrics))
+    problems.extend(_spec_dimension_problems(spec, metrics, contract, dim_targets))
+    problems.extend(_hole_problems(spec, metrics))
     if metrics.stray_parts > 0:
         lines = [
             f"【问题 1】模型不是一整件：程序对导出的 STL 做连通性分析，"
@@ -2154,9 +2928,42 @@ def _geometry_integrity_problems(
     return problems
 
 
+# 流形边占比允许的抖动：同一段几何重算一次的量级差异远小于此
+_MESH_RATIO_EPS = 0.005
+
+
+def _mesh_quality_not_worse(before: MeshMetrics, after: MeshMetrics) -> bool:
+    """修复后的网格拓扑质量是否「不比原版差」（True 才允许采纳）。
+
+    为什么不能写成 `after.watertight or not before.watertight`：
+    这个判据在原版已经不水密时恒为真，等于「一旦原版破了，修成多破都行」。
+    第三轮基准实测到逐轴校正把 28 条非流形边（流形边占比 0.9948）
+    换成 287 条（占比 0.3376）并作为成品交付 —— 三分之二的面互相穿插，
+    切片软件会当成废件，而这正是「修复」环节自己造成的。
+    逐轴缩放是纯仿射变换，本不该改变拓扑；一旦计数变了，
+    说明缩放把原本重合的面拉开了，属于必须拒绝的候选。
+
+    判据（全部满足才算不差）：
+      * 原版水密 → 候选也必须水密（不能用封闭性去换别的指标）
+      * 候选的流形边占比不得低于原版（允许 _MESH_RATIO_EPS 的抖动）
+      * 候选的非流形边、开放边、退化三角形都不得比原版多
+    """
+    if before.watertight and not after.watertight:
+        return False
+    if after.watertight_ratio < before.watertight_ratio - _MESH_RATIO_EPS:
+        return False
+    return (
+        after.non_manifold_edges <= before.non_manifold_edges
+        and after.boundary_edges <= before.boundary_edges
+        and after.degenerate_triangles <= before.degenerate_triangles
+    )
+
+
 def _integrity_rank(
-    metrics: MeshMetrics, spec: DesignSpec | None = None
-) -> tuple[int, int, int, int, int]:
+    metrics: MeshMetrics,
+    spec: DesignSpec | None = None,
+    contract: "ChangeContract | None" = None,
+) -> tuple[int, int, int, int, int, int, int]:
     """尺寸/结构完整性的排序键（越小越好）。
 
     顺序体现优先级，不能随便调：
@@ -2164,7 +2971,10 @@ def _integrity_rank(
       1. 散件数 —— 「不是一件东西」是最根本的错误
       2. 点名尺寸没做到 —— 用户明确说过的数字，做不到就是没听懂需求
       3. 穿腔处数 —— 内部结构缺陷，用户不一定第一眼看得出来
-      4. **网格不封闭**（有开放边/非流形边）—— 排在最后
+      4. **网格不封闭**（有开放边/非流形边）
+      5. 碎三角
+      6. **网格干净度**（连续的流形边占比）—— 排在最后：
+         前面全部持平时，非流形边更少的那一版胜出
 
     第 0 项是实测踩出来补上的：修复环节排在「成型范围重做」之后，
     而它原本只看散件/尺寸/穿腔，**不看模型还放不放得下** ——
@@ -2186,11 +2996,19 @@ def _integrity_rank(
     return (
         1 if metrics.exceeds_build_volume else 0,
         metrics.stray_parts,
-        len(_spec_dimension_problems(spec, metrics)),
+        len(_spec_dimension_problems(spec, metrics, contract)) + len(_hole_problems(spec, metrics))
+        # 声明的间隙量不到与「点名尺寸没做到」同级：都是 AI 自己写下的数字没兑现
+        + len(_gap_problems(metrics)),
         sum(n for _, n in metrics.cavity_islands),
         # 0 = 封闭，1 = 不封闭。用实测字段而不是只看 watertight 标志：
         # 只有「开放边和非流形边都为 0」才算真的能切片。
         0 if (metrics.watertight or (metrics.boundary_edges == 0 and metrics.non_manifold_edges == 0)) else 1,
+        1 if _sliver_problems(metrics) else 0,
+        # 最后一项：网格干净度（连续的流形边占比）。
+        # 为什么要有：上一项是 0/1 的粗粒度，28 条和 287 条非流形边在它眼里等价，
+        # 于是修复循环在「都不封闭」的两版之间随便挑，实测就挑中了更破的那一版。
+        # 放最后，所以它永远不会拿散件/尺寸/穿腔去换网格质量。
+        int(round((1.0 - metrics.watertight_ratio) * 1000)),
     )
 
 
@@ -2201,15 +3019,79 @@ _OVERALL_AXIS_TOKENS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (0, ("width", "wide", "宽度", "总宽", "正面宽")),
     (1, ("depth", "deep", "深度", "总深", "进深", "前后")),
 )
-# 命中这些词的字段是「零件内部尺寸」，不是整体尺寸，一律跳过
+# 命中这些词的字段是「零件内部尺寸」，不是整体尺寸，一律跳过。
+# 注意「直径」不在里面：对圆件（笔筒/杯子/盖子/转接环）**外径就是最主要的整体尺寸**，
+# 一律跳过等于对圆件完全不校验尺寸（实测：用户要 Ø80 的笔筒，出来 92×146，
+# 程序一声不吭）。真正的内部直径（孔径/内径/螺孔）由 _INNER_DIA_MARKERS 排除。
 _LOCAL_DIM_TOKENS = (
     "wall", "thickness", "rib", "gap", "fillet", "chamfer", "radius", "clearance",
-    "diameter", "angle", "count", "hole", "slot", "lip", "clamp", "gusset",
-    "壁厚", "加强筋", "间隙", "圆角", "倒角", "半径", "孔径", "直径", "角度", "数量", "个数",
+    "angle", "count", "hole", "slot", "lip", "clamp", "gusset",
+    "壁厚", "加强筋", "间隙", "圆角", "倒角", "半径", "孔径", "角度", "数量", "个数",
+)
+# 「内孔」语义：这些词说明说的是内部直径，不能拿去跟外形包围盒比
+_INNER_DIA_MARKERS = (
+    "孔", "内径", "内孔", "内直", "内圆", "轴孔", "螺孔",
+    "hole", "inner", "bore", "shaft", "screw", "bolt", "pin", "thread", "socket",
+)
+# 「外形/整体」语义
+_OUTER_MARKERS = ("外径", "外圆", "最大外", "整体直", "outer", "overall", "max")
+# 水平包络：外径对应 max(bbox.x, bbox.y)
+HORIZONTAL_ENVELOPE_AXIS = 3
+
+# 逐轴校正允许的最小倍率。取 1/1.5 是为了与【问题 8】用**同一把尺子**：
+# 「实测超出要求 50%」本来就被判为「不可能是多长了底座」，那反过来看，
+# 需要缩到 2/3 以下才能凑上的目标，就是**尺寸与包围盒对不上**，
+# 该交给 AI 重做（或直接报问题），而不是把整件缩成一团。
+_MIN_SHRINK_FACTOR = 1.0 / 1.5
+
+
+
+# 水平面内的整体尺寸词：宽 / 深 / 长 都算（都是"躺在台面上的两个方向"）。
+# 与 _OVERALL_AXIS_TOKENS 分开维护：那份是**按轴记账**、给逐轴缩放用的，
+# 这里只回答"这条尺寸是不是整体水平尺寸"，不参与缩放。
+_PLANAR_DIM_TOKENS = (
+    "width", "wide", "宽度", "总宽", "正面宽",
+    "depth", "deep", "深度", "总深", "进深", "前后",
+    "length", "long", "长度", "总长", "全长", "纵向",
 )
 
 
-def _spec_declared_dimensions(spec: DesignSpec | None) -> dict[int, tuple[str, float]]:
+def spec_planar_dimensions(spec: DesignSpec | None) -> list[tuple[str, float, str]]:
+    """用户点名的**水平方向**整体尺寸：(标签, 目标值mm, 规格名)。
+
+    为什么需要它（第一版质量基准抓到的覆盖洞）：按轴记账的
+    `_spec_declared_dimensions` 一个轴只留一条，「长 60、宽 40、高 20」
+    里的 长度 从来没被核对过 —— 只做了宽和高的模型也能全绿。
+    需求核对表面向用户，宁可多核对一条也不能假绿。
+    """
+    found: list[tuple[str, float, str]] = []
+    if spec is None:
+        return found
+    for item in getattr(spec, "specs", []) or []:
+        if not getattr(item, "user_specified", False):
+            continue
+        if item.value is None or (item.unit or "mm") not in ("mm", "毫米"):
+            continue
+        try:
+            value = float(item.value)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        haystack = f"{item.name} {item.label}".lower()
+        if any(token in haystack for token in _INNER_DIA_MARKERS):
+            continue
+        if any(token in haystack for token in _LOCAL_DIM_TOKENS):
+            continue
+        if any(token in haystack for token in _OUTER_MARKERS):
+            continue  # 外径走水平包络那条，不重复核对
+        if not any(token in haystack for token in _PLANAR_DIM_TOKENS):
+            continue
+        found.append((item.label or item.name, value, item.name))
+    return found
+
+
+def _spec_declared_dimensions(spec: DesignSpec | None) -> dict[int, tuple[str, float, str]]:
     """从规格里取出「用户明确指定的整体尺寸」，映射到包围盒的轴。
 
     为什么要做：`acceptance` 里的「支架总高等于 100mm」以前只是写给 AI 看的，
@@ -2218,7 +3100,7 @@ def _spec_declared_dimensions(spec: DesignSpec | None) -> dict[int, tuple[str, f
     首次生成没有）。实测端到端日志里已经有「参数 240、实测含底座故不等高」
     这类现象，说明光看参数不行，必须拿实测尺寸比。
     """
-    found: dict[int, tuple[str, float]] = {}
+    found: dict[int, tuple[str, float, str]] = {}
     if spec is None:
         return found
     for item in getattr(spec, "specs", []):
@@ -2233,17 +3115,322 @@ def _spec_declared_dimensions(spec: DesignSpec | None) -> dict[int, tuple[str, f
         if value <= 0:
             continue
         haystack = f"{item.name} {item.label}".lower()
+        if any(token in haystack for token in _INNER_DIA_MARKERS):
+            continue
         if any(token in haystack for token in _LOCAL_DIM_TOKENS):
+            continue
+        # 外径（含只写「直径 / diameter」的）：圆件的主要整体尺寸，
+        # 对应水平方向的最大外形；单独一个轴表达不了，用 HORIZONTAL_ENVELOPE_AXIS。
+        if any(token in haystack for token in _OUTER_MARKERS) or any(
+            token in haystack for token in ("直径", "diameter", "dia")
+        ):
+            found.setdefault(
+                HORIZONTAL_ENVELOPE_AXIS, (item.label or item.name, value, item.name)
+            )
             continue
         for axis, tokens in _OVERALL_AXIS_TOKENS:
             if any(token in haystack for token in tokens):
-                # 同一个轴出现多次时以第一个为准，避免互相覆盖
-                found.setdefault(axis, (item.label or item.name, value))
+                # 同一个轴出现多次时以第一个为准，避免互相覆盖。
+                # 同时带上**规格名**（label 是给用户看的中文，契约里用的是 name）——
+                # 少了它就没法判断"这一项本次是否被授权修改"（实测踩过）。
+                found.setdefault(axis, (item.label or item.name, value, item.name))
                 break
     return found
 
 
-def _spec_dimension_problems(spec: DesignSpec | None, metrics: MeshMetrics) -> list[str]:
+def _spec_declared_holes(spec: DesignSpec | None) -> list[tuple[str, float, str]]:
+    """从规格里取用户明确指定的「孔径/内径」类尺寸（交给射线剖面去核对）。"""
+    found: list[tuple[str, float, str]] = []
+    if spec is None:
+        return found
+    for item in getattr(spec, "specs", []):
+        if not getattr(item, "user_specified", False):
+            continue
+        if item.value is None or (item.unit or "mm") not in ("mm", "毫米"):
+            continue
+        try:
+            value = float(item.value)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        haystack = f"{item.name} {item.label}".lower()
+        if not any(token in haystack for token in _INNER_DIA_MARKERS):
+            continue
+        found.append((item.label or item.name, value, item.name))
+    return found
+
+
+# 声明的间隙/夹口/插槽：AI 自己在源码顶层参数里写了这些尺寸，就必须能在网格里量到。
+# 词表必须**不含 clamp**：`clamp_w` 是夹爪宽度（实体尺寸）而不是空隙，
+# 拿它去要求「量得到 14mm 空档」会把完全正确的模型判成缺陷 ——
+# 假失败比漏报更糟：用户一旦不信这张表，真失败那条也没人看了。
+_GAP_PARAM_TOKENS = (
+    "gap", "clearance", "slot", "mouth", "cradle",
+    "间隙", "缝隙", "空档", "夹口", "卡口", "卡槽", "插槽", "张口", "夹距",
+)
+# 同时命中这些词的参数是在说「实体/数量」而不是空隙，不拿来打分。
+_GAP_PARAM_EXCLUDE = (
+    "wall", "thickness", "count", "radius", "angle", "pitch",
+    "壁厚", "厚度", "数量", "半径", "角度", "螺距", "间距",
+)
+
+
+def _axis_name(axis: int) -> str:
+    return "XYZ"[axis] if 0 <= axis <= 2 else str(axis)
+
+
+def _declared_gaps_from_source(source: str | None) -> list[tuple[str, float, str]]:
+    """从源码顶层参数里提出「声明了的间隙/夹口/插槽」：(标签, mm, 参数名)。
+
+    为什么从**源码**取而不从规格取：实测那版手机夹，规格里几乎全是 null（AI 自己
+    取的值只记在源码里），只有 `clamp_gap = 14;` 这一行是硬事实。判据是**自洽**：
+    不评价设计好坏、不要求用户先说清数字，只问「你自己写的这个数在网格里有吗」。
+
+    只看顶层纯数值赋值（与参数微调同一套解析），表达式赋值不猜。
+    """
+    if not source:
+        return []
+    values = scad_src.extract_top_level_numbers(source)
+    if not values:
+        _model_name, _summary, values = scad_src.extract_metadata(source)
+    if not values:
+        return []
+    labels = scad_src.extract_param_labels(source)
+    found: list[tuple[str, float, str]] = []
+    for name, value in values.items():
+        try:
+            mm = float(value)
+        except (TypeError, ValueError):
+            continue
+        if mm < 3.0 or mm > 500.0:
+            continue
+        label = str(labels.get(name) or "")
+        haystack = f"{name} {label}".lower()
+        if not any(token in haystack for token in _GAP_PARAM_TOKENS):
+            continue
+        if any(token in haystack for token in _GAP_PARAM_EXCLUDE):
+            continue
+        found.append((label or name, mm, name))
+        if len(found) >= 4:
+            break
+    return found
+
+
+def _gap_problems(metrics: MeshMetrics) -> list[str]:
+    """把「声明的间隙在网格里量不到」翻成回喂给 AI 的具体改法。
+
+    与 `_hole_problems` 同样的保守原则：只拿实测事实说话；根本没测（模型过大）
+    时一句都不说，只留需求核对表里的 invalid 项 —— 给 AI 一句「量不到」只会让它去改本来没坏的东西。
+    """
+    declared = list(getattr(metrics, "declared_gaps", []) or [])
+    gaps = getattr(metrics, "interior_gaps", None)
+    if not declared or gaps is None:
+        return []
+    smallest = min(float(mm) for _label, mm, _name in declared)
+    if gaps.max_mm >= smallest * 0.7:
+        return []
+    per_axis = "、".join(f"{_axis_name(i)} {v:.2f}mm" for i, v in enumerate(gaps.per_axis))
+    solid_axis = max(range(len(gaps.longest_material)), key=lambda i: gaps.longest_material[i])
+    names = "、".join(f"{label}({name})={mm:g}mm" for label, mm, name in declared[:4])
+    return [
+        (
+            "【问题 10】你声明了 "
+            + names
+            + f"，但网格实测被材料夹住的空档只有：{per_axis}（三轴最大值 "
+            f"{gaps.max_mm:.2f}mm）—— 这一刀完全没切到实体：编译成功、STL 非空、没有 warning，"
+            f"而沿{_axis_name(solid_axis)}最长有 {gaps.longest_material[solid_axis]:.1f}mm 是连续材料。"
+            "只要求两件事：① 空隙两侧的表面坐标必须直接由该参数决定"
+            "（下侧顶面 = 下侧底 + jaw_h，上侧底面 = 下侧顶面 + clamp_gap），"
+            "并逐轴核对**有没有别的材料横跨这个区域** —— 真实项目实测到的首要成因"
+            "是整片底板/背板把夹口填平（拿它那个源码去化简 `+ jaw_h - jaw_h` 这类"
+            "表达式，编译出来 1116 个面一模一样）：恒等式简对几何毫无影响，"
+            "不要在那里花功夫；"
+            "② 刀具与主体必须在同一坐标系 —— 主体是 linear_extrude 沿 +Z 挤出的，"
+            "刀具若写成 `rotate([-90,0,0]) linear_extrude(2D轮廓)` 会被搬到 z<0 的模型外，"
+            "什么都切不到。这两条都是实测踩过的坑，不是泛泛的建议。"
+        )
+    ]
+
+
+# 哪些实测失败算「硬伤」（必须拖低最终判定）。
+# 故意不包含网格不封闭/穿腔/薄膜这几类：它们驱动修复循环是对的，但拿来把
+# 一个功能完整的模型判成「不能打印」过于锐利 —— CGAL 在相切处留几条非流形边极常见。
+_HARDCHECK_KINDS = ("dimension", "hole", "thread", "feature-gap")
+_HARDCHECK_GROUPS = ("integrity:one-body",)
+_VERDICT_ORDER = {"pass": 0, "warn": 1, "fail": 2}
+
+
+def _hard_failures(suite: "reqtests.ReqSuite | None") -> list[Any]:
+    """从需求核对表里挑出「硬伤」级别的实测失败（只降不升的判据共用一份）。"""
+    if suite is None:
+        return []
+    return [
+        t
+        for t in suite.blocking_failures
+        if t.kind in _HARDCHECK_KINDS or t.group in _HARDCHECK_GROUPS
+    ]
+
+
+def _downgrade_printability(
+    printability: dict[str, Any] | None,
+    suite: "reqtests.ReqSuite | None",
+    visual_review: str = "",
+    remaining: list[str] | None = None,
+) -> str | None:
+    """让最终判定**听实测的**：程序量到的硬失败必须反映到 verdict / score / issues。
+
+    为什么要单独做这一步（实测的假绿）：交付给用户的那版手机夹，夹口这一刀完全没切到
+    实体，而打印性判定仍是 `pass` / 85 分；唯一看出问题的多模态外观复核只被存进
+    `visual_review`，既不参与 verdict，也不上结果卡。判定链自己不给自己的证据付账，
+    用户就只能靠肉眼发现（而肉眼本来就是我们要替代的东西）。
+
+    降级分两档，证据强度不同、结果也不同：
+      * 实测硬失败（尺寸/孔径/螺纹/间隙/散件）→ fail，分数封顶 49，进一条 error
+      * 只有外观复核报问题、或修复后仍有非硬伤残留 → 至少 warn，分数封顶 79
+    只降不升：AI 自己给的分数本来就偏乐观，不能拿这个函数去提高它。
+    返回一句人话说明（供日志），没改动时返回 None。
+    """
+    if not isinstance(printability, dict):
+        return None
+    hard = _hard_failures(suite)
+    visual_bad = bool(visual_review and llm_mod.parse_snapshot_verdict(visual_review))
+    leftovers = [str(p) for p in (remaining or []) if str(p).strip()]
+    if not hard and not visual_bad and not leftovers:
+        return None
+
+    issues = printability.get("issues")
+    if not isinstance(issues, list):
+        issues = []
+    try:
+        score = int(printability.get("score"))
+    except (TypeError, ValueError):
+        score = 70
+    verdict = str(printability.get("verdict") or "pass")
+    notes: list[str] = []
+
+    if hard:
+        issues.insert(
+            0,
+            {
+                "severity": "error",
+                "title": "实测没做到",
+                "detail": "；".join(
+                    f"{t.requirement}：要求 {t.expected or '—'}，实测 {t.actual or '量不到'}"
+                    for t in hard[:4]
+                )[:600],
+                "suggestion": (
+                    hard[0].fix_hint
+                    or "这几条是程序在导出的 STL 上直接量出来的，不是推测。"
+                )[:600],
+            },
+        )
+        verdict = "fail"
+        score = min(score, 49)
+        notes.append(f"{len(hard)} 项实测硬失败已计入判定")
+    elif leftovers:
+        issues.insert(
+            0,
+            {
+                "severity": "warn",
+                "title": "修复后仍有残留",
+                "detail": "；".join(leftovers)[:600],
+                "suggestion": "这几条程序已经定位到具体尺寸/位置，可以再说一句让 AI 只改这一处。",
+            },
+        )
+        if _VERDICT_ORDER.get(verdict, 0) < 1:
+            verdict = "warn"
+        score = min(score, 79)
+        notes.append("残留问题已计入判定")
+
+    if visual_bad:
+        body = "\n".join(
+            line for line in str(visual_review).strip().splitlines()[1:] if line.strip()
+        ) or str(visual_review).strip()
+        issues.insert(
+            0 if not hard else 1,
+            {
+                "severity": "warn",
+                "title": "外观复核发现问题",
+                "detail": body[:600],
+                "suggestion": "渲染图上能看到的结构缺失，程序指标不一定量得出来；可以直接说哪里不对让 AI 改。",
+            },
+        )
+        if _VERDICT_ORDER.get(verdict, 0) < 1:
+            verdict = "warn"
+        score = min(score, 79)
+        notes.append("外观复核报告的问题已计入判定")
+
+    printability["issues"] = issues[:12]
+    printability["verdict"] = verdict
+    printability["score"] = score
+    printability["evidence_note"] = "、".join(notes)
+    return "、".join(notes)
+
+
+def _hole_problems(spec: DesignSpec | None, metrics: MeshMetrics) -> list[str]:
+    """用户点名的孔径 vs 实测孔径剖面（HANDOVER P0）。
+
+    为什么必须实测：参数核对看不到「把孔写成表达式」的改法（如 d = outer - 2*wall），
+    改参数名/参数值都不会改变实际孔径；而 mesh 的射线剖面能量出来。
+
+    判据保守：剖面里**任一高度**匹配声明值即视为做到；剖面全 None（没有居中孔）
+    时不下结论（量不到就不报），避免误报驱动无谓的修复。
+    """
+    declared = _spec_declared_holes(spec)
+    if not declared or not metrics.hole_profile:
+        return []
+    measured = [d for d in metrics.hole_profile if d is not None]
+    if not measured:
+        return []
+    problems: list[str] = []
+    for label, value, _name in declared:
+        tol = max(0.6, value * 0.06)
+        if any(abs(d - value) <= tol for d in measured):
+            continue
+        problems.append(
+            f"【问题 8】用户点名的孔径没做到：规格里「{label}」要求 {value:g}mm，"
+            f"程序用射线法在 6 个高度实测居中孔径为 "
+            f"{'、'.join(f'{d:g}' for d in measured)} mm，没有一个落在 ±{tol:g}mm 容差内。\n"
+            "注意：参数名改对了不等于孔真的变了 —— 若源码把孔写成表达式"
+            "（如 d = outer - 2*wall），改参数不会改变实际孔径。"
+            "请直接核对 difference() 里挖孔那个圆柱的直径是否等于要求值。"
+        )
+    return problems
+
+
+def _scale_mismatch(
+    contract: "ChangeContract",
+    metrics: MeshMetrics,
+    previous_largest: float | None,
+) -> str | None:
+    """「整体缩小到 80%」这类请求，实测尺寸是不是真的按比例变了。
+
+    为什么必须有这条（实测踩到）：缩放是唯一的"所有尺寸一起变"的改动，
+    如果只比参数值，「AI 把 scale(0.8) 包在外面、参数一个没动」和
+    「AI 什么都没做」在参数层面长得一模一样 —— 用户要缩小，模型纹丝不动，
+    作业却报完成。这里用**改动前后的实测最大尺寸之比**兜住它。
+    """
+    factor = getattr(contract, "scale_factor", None)
+    if not factor or not metrics.bbox or not previous_largest:
+        return None
+    largest = max(metrics.bbox)
+    ratio = largest / float(previous_largest)
+    # 容差 ±8%：允许"缩放后加了倒角/圆角导致的微小差异"，但挡住"根本没缩"
+    if abs(ratio - float(factor)) <= max(0.08, float(factor) * 0.1):
+        return None
+    return (
+        f"要求整体缩放到 {float(factor) * 100:.0f}%，实测最大尺寸从 {previous_largest:.1f}mm "
+        f"变成 {largest:.1f}mm（{ratio * 100:.0f}%）—— 缩放没有真正生效"
+    )
+
+
+def _spec_dimension_problems(
+    spec: DesignSpec | None,
+    metrics: MeshMetrics,
+    contract: "ChangeContract | None" = None,
+    declared: dict[int, tuple[str, float, str]] | None = None,
+) -> list[str]:
     """规格里用户点名的整体尺寸，实测有没有做到。
 
     只报「明显做不到」这一个方向（实测 < 声明值的 90%）：
@@ -2251,50 +3438,105 @@ def _spec_dimension_problems(spec: DesignSpec | None, metrics: MeshMetrics) -> l
     实测日志里就有「参数值 240.0，含底座等结构故不等高」。
     反过来实测偏小则一定是没做到，没有合理解释。
 
+    **本次改动授权的项必须按新目标值判，不能拿旧规格否决**（实测踩到的严重 Bug）：
+    规格是项目最初那版（"总高 100mm"）。用户后来说"把高度改成 50mm"，
+    模型真的改成 50mm 之后，这条检查却拿旧规格去判 —— 50 < 100×0.9，
+    于是报「用户点名的尺寸没做到」，接着 AI 修复**把模型改回 100mm**，
+    而作业仍然报"完成"。用户看到的是：说了改高度，模型纹丝不动。
+    隐蔽之处：这条只查"偏小"，所以只有把尺寸**改小**时才暴露（改大不会）。
+
     证据里必须带上**差多少**和**最可能的成因**：只写「要 150mm、实测 123mm」
     时，实测发现 AI 会反复重写同一段公式（它以为自己算对了），
     两轮修复都修不动。所以这里把「参数没真正决定竖直尺寸」这件事点破 ——
     倾斜件的斜长与竖直升高之间隔着一个三角函数，而两次 `rotate` 之后
     挤出方向通常已经不是竖直方向。
     """
-    declared = _spec_declared_dimensions(spec)
+    if declared is None:
+        declared = _spec_declared_dimensions(spec)
     if not declared or not metrics.bbox:
         return []
+    authorized: set[str] = set()
+    targets: dict[str, float] = {}
+    if contract is not None:
+        # 契约里的项名是**规格名**（例如 height），而这里拿到的 label 是给人看的
+        # 中文（「总高」）—— 两边都要归一化后再比，否则豁免永远匹配不上（实测踩过）。
+        for key in (*contract.changed, *contract.unchanged, *contract.frozen):
+            authorized.add(normalize_name(key))
+        targets = {
+            normalize_name(key): float(value)
+            for key, value in contract.target_values.items()
+            if isinstance(value, (int, float))
+        }
     shorts: list[str] = []
+    overshoots: list[str] = []
     vertical_short = False
-    for axis, (label, want) in sorted(declared.items()):
-        got = metrics.bbox[axis]
-        if got < want * 0.9:
+    for axis, (label, want, spec_name) in sorted(declared.items()):
+        keys = {normalize_name(spec_name), normalize_name(label)}
+        if keys & authorized:
+            # 本次授权的项：以用户新给的目标值为准；没解析出目标值就不判它。
+            target = next((targets[key] for key in keys if key in targets), None)
+            if target is None or target <= 0:
+                continue
+            want = target
+        if axis == HORIZONTAL_ENVELOPE_AXIS:
+            got = max(metrics.bbox[0], metrics.bbox[1])
+            axis_name = "水平最大（XY）"
+        else:
+            got = metrics.bbox[axis]
             axis_name = "XYZ"[axis]
+        if got < want * 0.9:
             gap = want - got
             shorts.append(
-                f"{label} 要求 {want:g}mm，实测 {axis_name} 方向只有 {got:.1f}mm"
+                f"{label} 要求 {want:g}mm，实测{axis_name}方向只有 {got:.1f}mm"
                 f"（差 {gap:.1f}mm，只有要求的 {got / want * 100:.0f}%）"
             )
             if axis == 2:
                 vertical_short = True
-    if not shorts:
+        elif got > want * 1.5 and not diameter_is_fit_scope(label, spec_name):
+            # 明显偏大也要报：模型多出底座/托边是正常的（偏大 10~40% 都算正常，
+            # 所以阈值放到 1.5 倍），但**超出 50% 就不可能是"多长了一点"** ——
+            # 实测踩到：要 Ø80 的笔筒，AI 把外壁的筋旋转到了错误的平面，
+            # 出来一个 92×145.8×100 的块料，程序全程沉默、只报"warn"。
+            # 例外：杯径/口径这类**配合尺寸**本来就该比整件小，包围盒只能给它兑下界。
+            overshoots.append(
+                f"{label} 要求 {want:g}mm，实测{axis_name} {got:.1f}mm"
+                f"（超出 {(got / want - 1) * 100:.0f}%，约多 {got - want:.1f}mm）"
+            )
+    if not shorts and not overshoots:
         return []
     advice = (
         "必须由**几何本身**达到，把参数值改大不算 —— 那会让参数表跟你的要求对不上。"
         "请检查是不是把它写成了别的参数的从属值，或者被某个结构尺寸限制了。"
     )
-    if vertical_short:
-        advice += (
-            "\n这一类最常见的成因是**倾斜件**：长度用斜长算出来、"
-            "却按「斜长 × cos(倾角) = 竖高」反推总高，"
-            "而经过两次 `rotate` 之后挤出方向通常**已经不是竖直方向**，"
-            "于是竖直升高与斜长之间差了三角函数关系，总高自然达不到。"
-            "两种稳妥写法（二选一）：\n"
-            "  * 不做倾斜：竖直件直接 `linear_extrude(height = 总高 - 底座高)`；\n"
-            "  * 要倾斜：先把**竖直高度**当已知量建模，再只用一个 `rotate` 倾斜，"
-            "并在注释里写出顶端 Z 坐标的计算式，自己核对一遍。"
+    problems: list[str] = []
+    if shorts:
+        vertical_advice = ""
+        if vertical_short:
+            vertical_advice = (
+                "\n这一类最常见的成因是**倾斜件**：长度用斜长算出来、"
+                "却按「斜长 × cos(倾角) = 竖高」反推总高，"
+                "而经过两次 `rotate` 之后挤出方向通常**已经不是竖直方向**，"
+                "于是竖直升高与斜长之间差了三角函数关系，总高自然达不到。"
+                "两种稳妥写法（二选一）：\n"
+                "  * 不做倾斜：竖直件直接 `linear_extrude(height = 总高 - 底座高)`；\n"
+                "  * 要倾斜：先把**竖直高度**当已知量建模，再只用一个 `rotate` 倾斜，"
+                "并在注释里写出顶端 Z 坐标的计算式，自己核对一遍。"
+            )
+        problems.append(
+            "【问题 3】用户点名的尺寸没有做到："
+            + "；".join(shorts)
+            + "。这是用户在需求里明确给出的数字，" + advice + vertical_advice
         )
-    return [
-        "【问题 3】用户点名的尺寸没有做到："
-        + "；".join(shorts)
-        + "。这是用户在需求里明确给出的数字，" + advice
-    ]
+    if overshoots:
+        problems.append(
+            "【问题 8】用户点名的尺寸**远远超出**要求："
+            + "；".join(overshoots)
+            + "。这不是「多长了一点底座/托边」能解释的，通常是把某个结构画到了"
+            "错误的平面/方向（例如把周向的筋按轴向旋转，于是筋从侧面伸出去）。"
+            "请让几何真的落在要求的尺寸上：外形按该尺寸建模，"
+            "其余结构都必须收在它之内（或明确说明为什么必须超出去）。"
+        )
+    return problems
 
 
 def _cached_largest_dimension(project: Project) -> float | None:
@@ -2334,10 +3576,11 @@ def _implausible_targets(
         例如 100mm 高 → 实测 101mm），改动后却仍停留在原尺寸附近 → 几何没跟上。
     """
     values = scad_src.extract_top_level_numbers(source)
+    labels = scad_src.extract_param_labels(source)
     largest = max(metrics.bbox) if metrics.bbox else 0.0
     problems: list[str] = []
     for name, target in contract.target_values.items():
-        resolved = name if name in values else resolve_param_name(name, values)
+        resolved = name if name in values else resolve_param_name(name, values, labels)
         if resolved is None or resolved not in values:
             continue
         actual = abs(values[resolved])
@@ -2376,18 +3619,38 @@ def _apply_targets(source: str, contract: ChangeContract) -> str | None:
     if not contract.target_values:
         return None
 
+    # 底线：授权改动的名字在源码里是**表达式赋值**时，不许改写别的参数充数。
+    # 例：`height = design_h * 1.5;` —— 把 design_h 写成 150 得到的是 225mm 高，
+    # 而界面会显示「已按你的目标值改动」。宁可放弃兜底，也不交半成品。
+    for raw in contract.changed:
+        if raw in contract.target_values or raw in scad_src.extract_top_level_numbers(source):
+            continue
+        if scad_src.is_assigned(source, raw):
+            return None
+
     # 契约里的目标名可能和源码里的参数名对不上（规格叫 height、源码叫 stand_height）。
     # 契约构建时已经解析过一次，但那时可能还没有可用的参数表，
     # 所以这里对着**真实源码的参数**再解析一次作为兜底。
     actual = scad_src.extract_top_level_numbers(source)
+    labels = scad_src.extract_param_labels(source)
     values: dict[str, float] = {}
     for name, value in contract.target_values.items():
-        resolved = name if name in actual else resolve_param_name(name, actual)
+        resolved = name if name in actual else resolve_param_name(name, actual, labels)
         if resolved is None:
             continue
+        if resolved != name and scad_src.is_assigned(source, name):
+            # 源码里确实有 `name = 表达式;`（不是纯数值赋值）：这时**不能**
+            # 退而改另一个参数，那会改出另一个尺寸，还对外宣称改了目标值。
+            return None
         values[resolved] = value
     if not values:
         return None
+
+    # 跟随项（`contract.follow`）一并按比例改写：总高 100→50 时，加强筋的
+    # 起始/结束高度必须跟着降，否则筋会捅出筒身 —— 那是另一个错模型，
+    # 不是"改动更小"。跟随项只在没被显式指定目标值时参与。
+    for name, value in follow_values(contract, actual, labels).items():
+        values.setdefault(name, value)
 
     rewritten, applied, _ignored = scad_src.apply_params(source, values)
     if not applied or set(applied) != set(values):

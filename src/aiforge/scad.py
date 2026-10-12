@@ -58,10 +58,6 @@ RESERVED = {
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# 单个模型的最大合理包围盒（毫米）。超出即认为不是 3D 打印件。
-MAX_DIMENSION_MM = 2000.0
-MIN_DIMENSION_MM = 0.2
-
 
 def _angle_target(text: str, open_index: int) -> str:
     """取出 `<...>` 里的内容（用于报错信息与零件库白名单比对）。"""
@@ -106,10 +102,86 @@ class ScadValidation:
 
 
 def strip_comments(source: str) -> str:
-    """去掉 // 行注释与 /* */ 块注释，避免注释里的文字触发误判。"""
-    source = re.sub(r"/\*.*?\*/", " ", source, flags=re.DOTALL)
-    source = re.sub(r"//[^\n]*", " ", source)
-    return source
+    """去掉 // 行注释与 /* */ 块注释，避免注释里的文字触发误判。
+
+    必须**一遍扫过、并且认字符串**。旧实现是「先块注释正则、再行注释正则」两遍，
+    两遍都不看字符串，实测两个坑：
+      * 字符串里的 `//` 被当成行注释，把同一行后面的**真代码**整段吃掉 ——
+        `text("1//2"); import("C:/Windows/win.ini");` 能顺利通过 `validate()`
+        （实测 `ok=True`，`use <evil.scad>` 同理）。这是安全边界上的洞：承诺是
+        「只允许生成纯几何模型」，而读本地文件的语句只要躲在这样的字符串后面
+        就能过去。`text()` 刻字是本产品最常见的输出之一，不是构不出的情形。
+      * 行注释里的 `/*` 会被当成块注释开头，一路吞到下一个 `*/`（或落单时什么
+        都不做，行为取决于后面有没有闭合）。
+
+    删掉的注释一律**压成一个空格**（跟旧正则一致），但**换行原样保留**：
+    调用方按行遍历（`extract_top_level_numbers` / `top_level_assignments` 还要按
+    括号深度定层级），`_locate` 报的「第 N 行」也必须跟原文对得上 —— 旧实现把
+    跨行块注释压成一个空格，从那以后的行号全部往上错一位。
+    为什么是“一个空格”而不是“按注释长度补空格”：`jobs.py` 拿
+    `strip_comments(before).strip() == strip_comments(after).strip()` 判「AI 只改了
+    注释、代码没动」，补齐空格会让两段不同长度的注释得出不同的空格数，这个
+    相等判断就会错。
+
+    字符串**内容**这里不抹（留下原样）——抹字符串是 `strip_strings` 的活，
+    多个调用方（jobs / changes / complex_e2e）拿 `strip_comments` 的结果找字面量。
+    """
+    out: list[str] = []
+    total = len(source)
+    i = 0
+    state = ""  # "" 代码 | "line" 行注释 | "block" 块注释 | "str" 字符串
+    while i < total:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < total else ""
+        if state == "":
+            if ch == "/" and nxt == "/":
+                out.append(" ")
+                state = "line"
+                i += 2
+            elif ch == "/" and nxt == "*":
+                out.append(" ")
+                state = "block"
+                i += 2
+            elif ch == '"':
+                out.append(ch)
+                state = "str"
+                i += 1
+            else:
+                out.append(ch)
+                i += 1
+        elif state == "line":
+            # 注释本体丢掉，行尾换行留下（\r 跟着注释一起丢）
+            if ch == "\n":
+                out.append("\n")
+                state = ""
+            i += 1
+        elif state == "block":
+            if ch == "*" and nxt == "/":
+                state = ""
+                i += 2
+            else:
+                if ch == "\n":
+                    out.append("\n")  # 块注释内部的换行必须留着，行号才对得上
+                i += 1
+        else:  # state == "str"：内容原样留着，只是不让里面的 // 与 /* 被当成注释
+            if ch == '"':
+                out.append(ch)
+                state = ""
+                i += 1
+            elif ch == "\\" and nxt and nxt != "\n":
+                out.append(ch)
+                out.append(nxt)  # 转义后的那个字符不算字符串结束（\" 不是收尾引号）
+                i += 2
+            elif ch == "\n":
+                # OpenSCAD 的字符串不跨行：遇到换行就退回代码态，
+                # 否则一个漏写的引号会把后半份代码全当成字符串跳过去。
+                out.append("\n")
+                state = ""
+                i += 1
+            else:
+                out.append(ch)
+                i += 1
+    return "".join(out)
 
 
 def strip_strings(source: str) -> str:
@@ -150,15 +222,27 @@ def validate(source: str) -> ScadValidation:
     cleaned = strip_strings(strip_comments(source))
     lowered = cleaned.lower()
 
+    def _locate(match) -> str:
+        """把命中位置翻成「第 N 行：原文片段」。
+
+        为什么必须给：只说「有系统命令/不安全操作」时，AI 修复两轮都删不干净
+        （实测 glm 偶发产出这类代码）；给出具体行与片段才能精准删除。
+        """
+        line_no = cleaned.count("\n", 0, match.start()) + 1
+        lines = cleaned.splitlines()
+        snippet = lines[line_no - 1].strip()[:120] if lines else ""
+        return f"第 {line_no} 行：{snippet}"
+
     # --- 危险函数 ---------------------------------------------------------
     for name, description in FORBIDDEN_CALLS.items():
-        if re.search(rf"(?<![A-Za-z0-9_$]){re.escape(name)}\s*\(", lowered):
+        hit = re.search(rf"(?<![A-Za-z0-9_$]){re.escape(name)}\s*\(", lowered)
+        if hit:
             issues.append(
                 ScadIssue(
                     severity="error",
                     title="模型代码包含不安全的操作",
-                    detail=f"检测到 {description}。出于安全考虑，本软件只允许生成纯几何模型。",
-                    suggestion="请重新描述需求，不要引用外部文件。",
+                    detail=f"检测到 {description}（{_locate(hit)}）。出于安全考虑，本软件只允许生成纯几何模型。",
+                    suggestion="请删除该调用及其相关代码，只使用 OpenSCAD 内置几何体重新输出完整代码。",
                 )
             )
 
@@ -189,13 +273,27 @@ def validate(source: str) -> ScadValidation:
         )
 
     # --- 显式文件读写 -----------------------------------------------------
-    if re.search(r"\b(?:system|exec|shell)\s*\(", lowered):
+    # 实测误报：`module shell() {…}` 是掏空壳体的**常用合法模块名**，
+    # 旧的 \bshell\s*\( 会把它当成「执行系统命令」拦掉，任何提供商都会中招
+    # （glm 给手机支架写 module shell() 就被连修两轮仍终止）。
+    # OpenSCAD 本身并不能执行系统命令；真正要拦的是「调用了一个未定义的
+    # system/exec/shell」—— 本地已定义的同名 module/function 一律放行。
+    defined_names = set(re.findall(r"\b(?:module|function)\s+([a-z_][a-z0-9_]*)", lowered))
+    sys_hit = None
+    for nm in ("system", "exec", "shell"):
+        if nm in defined_names:
+            continue
+        hit = re.search(rf"\b{nm}\s*\(", lowered)
+        if hit:
+            sys_hit = hit
+            break
+    if sys_hit:
         issues.append(
             ScadIssue(
                 severity="error",
                 title="模型代码尝试执行系统命令",
-                detail="检测到执行系统命令的调用，已拒绝。",
-                suggestion="请重新描述需求。",
+                detail=f"检测到执行系统命令的调用（{_locate(sys_hit)}），已拒绝。",
+                suggestion="请删除该行及其相关调用，只使用 OpenSCAD 内置几何体重新输出完整代码。",
             )
         )
 
@@ -241,10 +339,16 @@ def validate(source: str) -> ScadValidation:
 def extract_metadata(source: str) -> tuple[str | None, str | None, dict[str, float]]:
     """从源码注释与参数区提取模型名、设计说明与参数表。
 
-    约定（由系统提示词强制 AI 遵守）：
+    约定（由系统提示词强制 AI 遵守，见 llm.py 的 SCAD_CONVENTIONS；
+    `parts/catalog.py::render_source` 生成的也是这个顺序）：
         // @name 桌面手机支架
         // @summary 一句话说明
-        // @param height 高度 mm 100 20 300
+        // @param <变量名> <默认数值mm> <说明> [最小] [最大]
+    例如：// @param height 100 支架高度 40 300
+    注意**默认值在说明前面**：下面两个解析函数都取 parts[1] 当数值、
+    `extract_param_labels` 取 parts[2] 当标签。这里以前写的是
+    `// @param height 高度 mm 100 20 300`（说明在前），跟提示词正好相反 ——
+    照着旧注释去「修」解析器，就会把规格名↔参数名那座桥拆掉。
     """
     model_name: str | None = None
     summary: str | None = None
@@ -272,6 +376,54 @@ def extract_metadata(source: str) -> tuple[str | None, str | None, dict[str, flo
         params = extract_top_level_numbers(source)
 
     return model_name, summary, params
+
+
+def extract_param_labels(source: str) -> dict[str, str]:
+    """取出 `// @param 变量名 默认值 说明 …` 里的「变量名 → 说明文字」。
+
+    为什么这是**规格名与源码参数名之间最可靠的一座桥**：
+    规格（`height`）与源码参数（`total_h`）是两次不同的 AI 调用产出的，
+    命名约定经常对不上。硬去猜缩写（`total_h` 里的 `h` 是不是高度？）
+    既容易猜错，也解释不清。而 `@param` 注释里的说明是**生成这份源码的
+    那次 AI 自己写的**，用的词表与规格同源（`total_h` → 「总高」），
+    归一化后就是规格名本身。
+
+    实测背景：规格写 `height=50`、源码写 `total_h=100` 时，改名桥断裂会让
+    一次**完全正确**的改动被同时判成「没改到」和「越权改了 total_h」，
+    最终回退成"什么都没改"，而界面还报成功。
+    """
+    labels: dict[str, str] = {}
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("//"):
+            continue
+        body = stripped[2:].strip()
+        if not body.lower().startswith("@param"):
+            continue
+        parts = body[6:].split()
+        if len(parts) < 3 or not IDENT_RE.match(parts[0]):
+            continue
+        try:
+            float(parts[1])
+        except ValueError:
+            continue
+        labels[parts[0]] = parts[2]
+    return labels
+
+
+def is_assigned(source: str, name: str) -> bool:
+    """源码里是否存在对 `name` 的赋值（**包括非纯数值的表达式赋值**）。
+
+    用来守住一条底线：当 `height = design_h * 1.5;` 这种表达式赋值存在时，
+    不能再把规格里的 `height` 解析成另一个变量（`design_h`）去改写 ——
+    改那个变量得到的是别的尺寸（150 × 1.5 = 225），
+    而界面会显示「已按你的目标值改动」。宁可放弃兜底，也不交半成品。
+    """
+    if not name:
+        return False
+    return re.search(
+        rf"(?m)^[ \t]*{re.escape(name)}[ \t]*=", strip_comments(source)
+    ) is not None
 
 
 TOP_LEVEL_ASSIGN_RE = re.compile(

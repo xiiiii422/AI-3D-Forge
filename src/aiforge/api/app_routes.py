@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -114,7 +115,7 @@ async def open_external(payload: OpenExternalRequest) -> dict[str, Any]:
         raise AppError(
             f"不允许打开该网址（{host}）。",
             code="INTERNAL",
-            hint="本软件只允许打开 DeepSeek 与 OpenSCAD 官方网站。",
+            hint="本软件只打开白名单内的站点：DeepSeek / OpenSCAD 官网、GitHub，以及底部作者主页（抖音、B站）。",
         )
     try:
         webbrowser.open(payload.url, new=2)
@@ -127,27 +128,9 @@ async def open_external(payload: OpenExternalRequest) -> dict[str, Any]:
     return {"ok": True}
 
 
-@router.get("/api/app/shortcuts")
-async def shortcuts() -> dict[str, Any]:
-    """快捷方式创建情况（安装器会在安装时创建，这里提供运行期兜底）。"""
-    from ..shortcuts import describe_shortcuts
-
-    return describe_shortcuts()
-
-
-@router.post("/api/app/shortcuts/repair")
-async def repair_shortcuts() -> dict[str, Any]:
-    from ..shortcuts import create_shortcuts
-
-    result = create_shortcuts()
-    return result
-
-
 @router.post("/api/app/shutdown")
 async def shutdown() -> dict[str, Any]:
     """退出程序：由 server 层注入的回调负责真正结束进程。"""
-    import asyncio
-
     from .. import runtime_state
 
     runtime_state.request_shutdown()

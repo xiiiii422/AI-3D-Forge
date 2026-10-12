@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
-import { scadDownloadUrl, stlDownloadUrl, triggerDownload } from '../api/client';
+import { api, scadDownloadUrl, stlDownloadUrl, threeMfDownloadUrl, triggerDownload } from '../api/client';
 import type { DesignSpec, JobResult, Printability, SpecEventPayload } from '../api/types';
 import { trimNum } from '../hooks/usePrinters';
+import { useSlicers } from '../hooks/useSlicers';
+import { toFriendlyError } from '../hooks/errors';
 import { Button } from './Button';
 import { Accordion } from './Accordion';
 import { ChangeVerdictCard, SpecCard } from './SpecCard';
@@ -11,7 +13,9 @@ import {
   IconChat,
   IconCheck,
   IconDownload,
+  IconExternal,
   IconFileCode,
+  IconFolder,
   IconLayers,
   IconNozzle,
   IconRefresh,
@@ -21,7 +25,9 @@ import {
   IconX,
 } from './Icons';
 import { ProgressBar } from './ProgressBar';
+import { RequirementChecklist } from './RequirementChecklist';
 import { StatusDot } from './StatusDot';
+import { useToast } from './Toast';
 
 export interface ChatEntry {
   id: string;
@@ -175,6 +181,54 @@ function ResultCard({ result }: { result: JobResult }) {
   const printability = result.printability;
   /** 契约 §3A：结果里带着本次生成所依据的打印机（老数据可能没有） */
   const printer = result.printer ?? printability?.printer ?? null;
+  const toast = useToast();
+  const [saving, setSaving] = useState(false);
+  const slicers = useSlicers();
+  const [sending, setSending] = useState(false);
+
+  // 下载：优先弹原生保存框（WebView2 里 `<a download>` 点了无响应）；
+  // 无桌面会话（纯浏览器）或后端不支持时，退回浏览器下载。
+  const save = async (kind: 'stl' | 'scad' | '3mf') => {
+    const urlFor = kind === 'stl' ? stlDownloadUrl : kind === '3mf' ? threeMfDownloadUrl : scadDownloadUrl;
+    const nameFor = kind === 'stl' ? (stl?.filename ?? `${result.name}.stl`) : kind === '3mf' ? `${result.name}.3mf` : `${result.name}.scad`;
+    const fallbackUrl = urlFor(result.project_id);
+    const fallbackName = nameFor;
+    setSaving(true);
+    try {
+      const r = await api.saveProjectFile(result.project_id, kind);
+      if (r.status === 'saved' && r.path) toast.ok(`已保存到 ${r.path}`);
+      else if (r.status === 'no-dialog') triggerDownload(fallbackUrl, fallbackName);
+      // canceled：用户自己关了保存框，不提示
+    } catch {
+      // 后端不支持 /save（如浏览器模式或旧版）→ 退回浏览器下载
+      triggerDownload(fallbackUrl, fallbackName);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /**
+   * 送到切片软件：不弹选择框，直接交给默认目标（切换在「设置 → 切片软件」里做）。
+   * 后端把看到的三种情况都说了实话，这里就照原样转达，不拿「没报错」当成功。
+   */
+  const sendToSlicer = async () => {
+    setSending(true);
+    try {
+      const r = await api.sendToSlicer(result.project_id);
+      if (r.status === 'failed') toast.error(r.detail);
+      // forwarded：它立刻退出了 = 把文件交给了已经开着的窗口，属于正常但不是「我启动了它」
+      else if (r.status === 'forwarded') toast.show(r.detail);
+      else toast.ok(r.detail);
+      if (r.note) toast.warn(r.note);
+    } catch (err) {
+      const friendly = toFriendlyError(err);
+      toast.error(friendly.hint ? `${friendly.message} ${friendly.hint}` : friendly.message);
+      // 列表可能过期了（刚卸载或刚装）：让下一次的按钮状态跟着真实情况走
+      if (friendly.code === 'SLICER_NOT_FOUND') void slicers.reload(true);
+    } finally {
+      setSending(false);
+    }
+  };
 
   const build = printer?.build_volume_mm ?? null;
   const minWall = printer?.constraints.min_wall_mm ?? null;
@@ -341,6 +395,9 @@ function ResultCard({ result }: { result: JobResult }) {
           </div>
         ) : null}
 
+        {/* 逐条需求核对（要求 vs 实测）——用户判断“这版能不能直接用”的依据 */}
+        <RequirementChecklist suite={result.requirement_tests} />
+
         {/* 本次依据的设计契约（只读） */}
         {result.spec && result.spec.specs.length > 0 ? (
           <Accordion title="本次依据的规格">
@@ -359,19 +416,56 @@ function ResultCard({ result }: { result: JobResult }) {
             variant="primary"
             size="sm"
             icon={<IconDownload size={15} />}
-            onClick={() =>
-              triggerDownload(stlDownloadUrl(result.project_id), stl?.filename ?? `${result.name}.stl`)
-            }
-            disabled={!stl}
+            onClick={() => void save('stl')}
+            disabled={!stl || saving}
           >
             下载 STL
           </Button>
           <Button
             size="sm"
             icon={<IconFileCode size={15} />}
-            onClick={() => triggerDownload(scadDownloadUrl(result.project_id), `${result.name}.scad`)}
+            onClick={() => void save('scad')}
+            disabled={saving}
           >
             下载 SCAD
+          </Button>
+          {/* 3MF 声明 mm 单位并带机型/材料元数据，进切片软件不会再“尺寸差 100 倍” */}
+          <Button
+            size="sm"
+            icon={<IconLayers size={15} />}
+            onClick={() => void save('3mf')}
+            disabled={saving || !stl}
+            title="带毫米单位与打印机/材料信息，适合直接拖进 Bambu Studio / OrcaSlicer / Cura"
+          >
+            下载 3MF
+          </Button>
+          {/* 一键送进切片软件：只在真检测到软件时才出现 —— 不放一个点了只会报错的死按钮 */}
+          {slicers.count > 0 && stl ? (
+            <Button
+              size="sm"
+              icon={<IconExternal size={15} />}
+              onClick={() => void sendToSlicer()}
+              loading={sending}
+              disabled={saving}
+              title={
+                slicers.target
+                  ? `用 ${slicers.target.name} 打开这个模型，不用再自己找文件`
+                  : undefined
+              }
+            >
+              送到切片软件
+            </Button>
+          ) : null}
+          {/* 模型文件已经存在项目文件夹里，一键打开比让用户去找路径实用 */}
+          <Button
+            size="sm"
+            variant="ghost"
+            icon={<IconFolder size={15} />}
+            onClick={() => {
+              void api.openFolder({ kind: 'project', project_id: result.project_id }).catch(() => undefined);
+            }}
+          >
+            打开文件夹
           </Button>
         </div>
 

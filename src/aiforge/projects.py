@@ -48,12 +48,27 @@ def safe_name(name: str, fallback: str = "未命名模型") -> str:
     """把用户/模型给出的名字变成合法的 Windows 文件名片段。"""
     cleaned = NAME_SAFE_RE.sub("", (name or "").strip())
     cleaned = cleaned.replace(" ", "").strip(". ")
-    cleaned = cleaned[:MAX_NAME_LEN]
+    # 截断之后还要再剪一次尾巴：实测 `"a"*39 + "." + "b"*8` 切到 40 位正好停在**点号**上，
+    # 而 Windows 的路径规范化会把尾部的 `.` / 空格去掉 —— 于是建出来的目录真名是 39 个 a，
+    # 代码里拿到的名字却带着那个点。读写靠规范化仍能找到它，但任何拿目录名做
+    # 相等比较的代码（`iterdir()` 给的是无点那个）会两边对不上。
+    cleaned = cleaned[:MAX_NAME_LEN].strip(". ")
     if not cleaned:
         cleaned = fallback
     if cleaned.upper() in RESERVED_NAMES:
         cleaned = f"_{cleaned}"
     return cleaned
+
+
+def _project_id(data: dict[str, Any], directory: Path) -> str:
+    """项目的 id：meta.json 里那个；没有就用目录名后 6 位。
+
+    **列表与查找必须用同一个算法**。实测过的形状：meta.json 被手改过或早期
+    版本写坏时没有 `id` —— 旧写法 `list()` 拿「目录名后 6 位」凑一个给用户看，
+    而 `directory_for()` 只比对 meta 里的 `id` 字段（那时是 None），于是这个项目
+    在侧栏里看得见、点进去就 404 —— 用户的感受是「软件把我的项目弄丢了」。
+    """
+    return str(data.get("id") or directory.name[-6:])
 
 
 def atomic_write_text(target: Path, text: str) -> None:
@@ -62,23 +77,6 @@ def atomic_write_text(target: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, target)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-
-
-def atomic_write_bytes(target: Path, data: bytes) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=str(target.parent))
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_name, target)
@@ -154,6 +152,11 @@ class Project:
     @property
     def stl_path(self) -> Path:
         return self.dir / "model.stl"
+
+    @property
+    def three_mf_path(self) -> Path:
+        """切片软件用的 3MF（带毫米单位与打印机/材料元数据）。"""
+        return self.dir / "model.3mf"
 
     @property
     def meta_path(self) -> Path:
@@ -274,7 +277,7 @@ class ProjectStore:
                     data = json.loads(meta.read_text(encoding="utf-8"))
                 except (OSError, ValueError):
                     continue
-                if data.get("id") == project_id:
+                if _project_id(data, entry) == project_id:
                     return entry
         return None
 
@@ -329,7 +332,7 @@ class ProjectStore:
             return None
 
         project = Project(
-            id=str(data.get("id") or directory.name[-6:]),
+            id=_project_id(data, directory),
             name=str(data.get("name") or directory.name),
             dir=directory,
             created_at=str(data.get("created_at") or now_iso()),
@@ -429,14 +432,16 @@ class ProjectStore:
 
     # --- 导出 -----------------------------------------------------------
     def export_copy(self, project: Project, target_dir: Path | None = None) -> dict[str, str | None]:
-        """把 SCAD/STL 复制到 export\\ 目录，便于用户交给切片软件或分享。"""
+        """把 SCAD/STL/3MF 复制到 export\\ 目录，便于用户交给切片软件或分享。"""
         destination = target_dir or project.export_dir
         destination.mkdir(parents=True, exist_ok=True)
         stem = safe_name(project.name, "model")
         scad_target = destination / f"{stem}.scad"
         stl_target = destination / f"{stem}.stl"
+        mf_target = destination / f"{stem}.3mf"
         scad_out: str | None = None
         stl_out: str | None = None
+        mf_out: str | None = None
         try:
             if project.scad_path.is_file():
                 shutil.copy2(project.scad_path, scad_target)
@@ -444,9 +449,12 @@ class ProjectStore:
             if project.stl_path.is_file():
                 shutil.copy2(project.stl_path, stl_target)
                 stl_out = str(stl_target)
+            if project.three_mf_path.is_file():
+                shutil.copy2(project.three_mf_path, mf_target)
+                mf_out = str(mf_target)
         except OSError as exc:
             log.warning("导出副本失败：%s", exc)
-        return {"scad": scad_out, "stl": stl_out, "dir": str(destination)}
+        return {"scad": scad_out, "stl": stl_out, "threemf": mf_out, "dir": str(destination)}
 
     def download_name(self, project: Project, suffix: str) -> str:
         return f"{safe_name(project.name, 'model')}.{suffix}"

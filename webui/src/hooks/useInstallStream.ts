@@ -6,7 +6,6 @@ import type {
   InstallLogEvent,
   InstallProgressEvent,
 } from '../api/types';
-import { toFriendlyError } from './errors';
 
 /** 安装阶段的中文标签（契约 §2.1 的 stage 取值，用户看不到英文原词） */
 const STAGE_LABEL: Record<InstallProgressEvent['stage'], string> = {
@@ -249,9 +248,4 @@ export function useInstallStream(jobId: string | null): UseInstallStreamResult {
     running,
     degraded,
   };
-}
-
-/** 把 browse/locate 的错误也变成人话 */
-export function describeError(err: unknown): string {
-  return toFriendlyError(err).message;
 }

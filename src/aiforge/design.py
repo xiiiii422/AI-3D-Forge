@@ -35,11 +35,21 @@ SPEC_VERSION = 1
 SPEC_ALIASES: dict[str, str] = {
     "height": "height", "h": "height", "高度": "height", "总高": "height", "高": "height",
     "width": "width", "w": "width", "宽度": "width", "宽": "width",
-    "depth": "depth", "d": "depth", "深度": "depth", "深": "depth", "厚度": "depth",
+    "depth": "depth", "d": "depth", "深度": "depth", "深": "depth",
     "length": "length", "l": "length", "长度": "length", "长": "length",
     "diameter": "diameter", "dia": "diameter", "直径": "diameter",
+    # 「外径 / 内径」是口径类尺寸最常见的口语说法，**必须能归一到 diameter**：
+    # 源码里叫 outer_d、规格里叫 outer_diameter、用户嘴里叫"外径"，
+    # 三者要靠同一套词表接上（实测：少了这两条，`outer_diameter → outer_d`
+    # 这座桥就断了，改动会被判成"没改到"，用户看到的还是"改了没反应"）。
+    "外径": "diameter", "内径": "diameter", "外圆": "diameter",
+    "总长": "length", "全长": "length",
     "radius": "radius", "r": "radius", "半径": "radius",
+    # 厚度归到 thickness（以前 厚度 被归到 depth，于是规格里的
+    # `bottom_solid_thickness`（底部实心厚度）和源码标签「底部实心厚度」
+    # 落到了两个不同维度上，底板厚度改没改根本核对不了）。
     "thickness": "thickness", "wall": "wall", "壁厚": "wall", "壁": "wall",
+    "厚度": "thickness",
     "angle": "angle", "角度": "angle", "倾角": "angle",
     "hole": "hole_diameter", "孔径": "hole_diameter", "孔": "hole_diameter",
     "fillet": "fillet", "圆角": "fillet", "倒角": "chamfer", "chamfer": "chamfer",
@@ -250,6 +260,33 @@ class DesignSpec:
             if normalize_name(item.name) in wanted or normalize_name(item.label) in wanted:
                 item.user_specified = True
 
+    def apply_authorized_change(self, targets: dict[str, float]) -> list[str]:
+        """把用户本次授权的改动写进规格本身（返回真正更新的项）。
+
+        为什么必须做（实测踩到的严重 Bug）：规格是项目最初那版（"总高 100mm"）。
+        用户后来说"把高度改成 50mm"，模型确实改成了 50mm —— 但规格没跟着改，
+        于是下一轮几何判定又拿旧的 100mm 去要求模型，把改动**回滚**，
+        用户看到的却是"完成"。**规格必须跟着用户的授权一起走**，
+        否则"改动"和"验收标准"永远互相打架。
+        """
+        updated: list[str] = []
+        for name, value in (targets or {}).items():
+            item = self.find(name)
+            if item is None:
+                continue
+            try:
+                item.value = float(value)
+            except (TypeError, ValueError):
+                continue
+            item.user_specified = True
+            note = f"{item.label or item.name} 已按你的要求改为 {item.value:g}{item.unit or ''}"
+            if note not in self.clarifications:
+                self.clarifications.append(note)
+            updated.append(item.name)
+        if len(self.clarifications) > 12:
+            del self.clarifications[:-12]
+        return updated
+
     # ---------------- 提示词渲染 ----------------
     def to_prompt(self) -> str:
         """渲染成给 AI 看的契约文本。只包含有内容的段落。"""
@@ -455,6 +492,55 @@ def normalize_kind(kind: str) -> str:
     return normalize_text(kind)[:40]
 
 
+# 「直径」这一类尺寸里有一类必须单独挑出来：它说的是**要被容纳/配合的那个东西**
+# （杯径、口径、轮径、轴径、管径、杯口直径、cup_dia…），而不是被打印件自己的外轮廓。
+#
+# 为什么要区分（实测证据）：用户要「杯径 70mm」的水杯架，做出来带底座的整件
+# 水平最大 132mm。以前这条尺寸会被配到「水平包络」上做双向核对，于是同时踩两个坑：
+#   * 修复日志报【问题 8】「超出 89%」—— 一条根本不存在的缺陷，白烧一轮修复，
+#     用户看到的是「它非说我做错了」；
+#   * 更危险的是逐轴校正拿 70/132=0.53 去缩整个模型，而它正好落在旧的 0.5~2.0
+#     放行区间里 —— 真跑起来会把夹口、底座、加强筋连一起缩掉 47%。
+# 包围盒对这类尺寸**只能核对下界**：整件比它大是正常的（座子本来就要包住那个东西），
+# 比它小才说明这个尺寸没做到。
+_DIAMETER_ROOTS = ("直径", "外径", "内径", "半径", "diameter", "dia", "径")
+# 出现这些限定词说明这条直径尺寸讲的就是整件外形（外径 / 总直径 / 最大直径…），
+# 继续双向核对 —— 「要 Ø80 的笔筒、做出 145 的块料」正是靠这条路抓住的。
+_WHOLE_FORM_QUALIFIERS = (
+    "外", "总", "整体", "最大", "本体", "全",
+    "outer", "overall", "max", "full", "body", "part",
+)
+# 单位与无实义后缀：剥掉词根后只剩这些，等同于「没有限定词」
+_DIM_NOISE_TOKENS = ("mm", "cm", "inch", "毫米", "厘米", "英寸", "值", "size", "dim", "d", "x")
+
+
+def diameter_is_fit_scope(*texts: str) -> bool:
+    """这条尺寸名是否在说「要容纳对象的直径」（杯径 / cup_dia），而不是整件外形。
+
+    判定只看词形：把直径词根剥掉，剩下的限定词既不是「外/总/整体/最大」这类整件词、
+    也不是单位噪声，就认定它在说别的东西。
+
+    拿不准时**保守返回 False**（维持原有的双向核对）：少报一条真缺陷的代价，
+    比把整体尺寸校验关掉、或者任由程序缩掉整个模型要小得多。
+    """
+    haystack = " ".join(str(t or "") for t in texts).lower()
+    roots = [root for root in _DIAMETER_ROOTS if root in haystack]
+    if not roots:
+        return False
+    rest = haystack
+    for root in sorted(roots, key=len, reverse=True):
+        rest = rest.replace(root, " ")
+    rest = re.sub(r"[\s_/.,()（）\-:：、]+", " ", rest)
+    leftovers = [token for token in rest.split() if token]
+    if not leftovers:
+        return False  # 光秃秃的「直径 / diameter」：按整件外形处理
+    if any(marker in token for token in leftovers for marker in _WHOLE_FORM_QUALIFIERS):
+        return False
+    if all(token in _DIM_NOISE_TOKENS for token in leftovers):
+        return False
+    return True
+
+
 def _to_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -471,10 +557,6 @@ def _to_float(value: Any) -> float | None:
     except ValueError:
         return None
 
-
-def extract_numbers(text: str) -> list[float]:
-    """从一段文本里取出所有数字（用于核对「用户要求的数值」是否出现在代码里）。"""
-    return [float(m) for m in _NUMBER_RE.findall(text or "")]
 
 
 # --------------------------------------------------------------------------

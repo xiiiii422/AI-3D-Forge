@@ -26,6 +26,7 @@ from .api import (
     printer_routes,
     projects_routes,
     settings_routes,
+    slicer_routes,
 )
 from .api.errors import AppError
 from .paths import frontend_dir
@@ -103,6 +104,10 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def unhandled_handler(_: Request, exc: Exception) -> JSONResponse:
+        # `exc` 在这里**不出现于函数体**不是写漏了：Starlette 要求处理器的签名是
+        # (request, exc)，而 traceback 由下一行的 `log.exception()` 从异常上下文里取
+        # （处理器是在 `except` 块里被 await 的，`sys.exc_info()` 还热着）。
+        # 把它拼进日志只会让同一条异常在日志里出现两遍。
         log.exception("未处理的异常")
         return JSONResponse(
             status_code=500,
@@ -121,6 +126,7 @@ def create_app() -> FastAPI:
     app.include_router(jobs_routes.router)
     app.include_router(projects_routes.router)
     app.include_router(settings_routes.router)
+    app.include_router(slicer_routes.router)
 
     _mount_frontend(app)
     return app

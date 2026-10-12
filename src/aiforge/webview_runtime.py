@@ -9,9 +9,17 @@ Windows 11 与较新的 Windows 10 都自带，但**企业长期服务版、精�
 所以必须在**打开窗口之前**就检测出来，并给出明确的一句话解释 + 一键安装入口。
 
 检测位置（与微软官方推荐一致，覆盖机器级与用户级安装）：
-  1. 注册表 HKLM/HKCU 的 WOW6432Node\\...\\EdgeUpdate\\Clients（Edge 通道）
-  2. 注册表 ...\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}（WebView2 专属 GUID）
-  3. 文件系统回退（注册表被策略清理时仍能命中）
+  1. 注册表 HKLM（含 WOW6432Node）/ HKCU 的
+     ...\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5} 里的 pv
+     —— **只认这一个 GUID**：同一个 Clients 下还并列着 Edge 与「Edge 更新」的 GUID
+     （实测本机：{56EB18F8…} pv=155.0.4283.45 = Microsoft Edge），扫整个列表会把
+     Edge 的版本号当成 WebView2 报给用户，并在**没装**运行时的机器上报出「已就绪」。
+  2. 文件系统回退（注册表被 IT 策略清理时仍能命中）：只认 msedgewebview2.exe 本件，
+     因此扫 Edge\\Application 也是安全的 —— 那个目录里放的是 msedge.exe，匹配不上就跳过。
+
+     **但这条只能算「找到文件」，不能算「系统登记了运行时」**：WebView2 的官方 loader
+     是根据注册表那个 GUID 项找运行时的，本机无法证伪「有文件、无登记」时它能不能
+     命中。因此 `source="filesystem"` 的结论会把这一层差异写给用户，不拿「已就绪」盖过它。
 """
 
 from __future__ import annotations
@@ -22,6 +30,8 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from .procguard import run as guarded_run
 
 log = logging.getLogger(__name__)
 
@@ -61,7 +71,10 @@ def _from_registry() -> tuple[str | None, str | None]:
     except ImportError:
         return None, None
 
-    # 依次查：WebView2 专属 GUID、EdgeUpdate 客户端列表（含 Edge Stable/Beta/Dev）
+    # 只查 WebView2 专属 GUID（机器级两份 + 用户级一份）。
+    # 为什么不再去枚举 Clients 下的其它项：那些是 Edge 本体与「Edge 更新」，
+    # 它们的 pv 是浏览器版本号，拿来当运行时版本既说谎又漏报（本模块存在的意义
+    # 就是在开窗口之前把「其实用不了」告诉用户）。
     keys = [
         (winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}"),
         (winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_CLIENT_GUID}"),
@@ -76,16 +89,12 @@ def _from_registry() -> tuple[str | None, str | None]:
         except OSError:
             continue
 
-    # 机器上装了 Edge（Chromium）时 WebView2 通常也在，但版本号要单独取；
-    # 这里只作为"疑似存在"的判断，最终仍以文件系统为准。
+    # 实测见过这个键存在但 pv 为空的形状（HKCU 下 Edge 那一项就是 pv=None）：
+    # 注册表说不动就交给文件系统那一轮，不拿它凑一个“已就绪”。
     return None, None
 
 
-def _from_filesystem() -> tuple[str | None, str | None]:
-    """在常见安装目录里找 msedgewebview2.exe。
-
-    注册表在受管机器上可能被清理，文件系统回退能救回这种情况。
-    """
+def _filesystem_roots() -> list[Path]:
     roots: list[Path] = []
     for env_name in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
         base = os.environ.get(env_name)
@@ -93,14 +102,44 @@ def _from_filesystem() -> tuple[str | None, str | None]:
             continue
         roots.append(Path(base) / "Microsoft" / "EdgeWebView" / "Application")
         roots.append(Path(base) / "Microsoft" / "Edge" / "Application")
+    return roots
 
-    for root in roots:
+
+def _version_key(name: str) -> tuple:
+    """版本目录名的可比较排序键（点分数字逐段比大小，非数字段排后面）。
+
+    为什么不能用 `sorted(..., key=p.name, reverse=True)`（旧写法）：目录名是字符串，
+    `9` 的 ASCII 比 `1` 大，所以 `99.0.1150.38` 会排在 `154.0.4258.62` 前面 ——
+    同时装了新旧运行时的机器上，报给用户的是**旧那个版本号**；而非版本目录
+    （本机实测 `C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application` 里就有
+    `SetupMetrics`，Edge 目录下还有 `Dictionaries` / `PlatformExperiencesHelper`）
+    首字母比数字大，永远排在最前。那三个本身不含 msedgewebview2.exe 所以会被跳过，
+    但「按字符串倒序拿到的第一个」并不是最新运行时这一件事是真的。
+    """
+    parts: list[tuple[int, int, str]] = []
+    for chunk in name.split("."):
+        digits = ""
+        for char in chunk:
+            if not char.isdigit():
+                break
+            digits += char
+        parts.append((0, int(digits), chunk) if digits else (1, 0, chunk))
+    return tuple(parts)
+
+
+def _from_filesystem(roots: list[Path] | None = None) -> tuple[str | None, str | None]:
+    """在常见安装目录里找 msedgewebview2.exe。
+
+    注册表在受管机器上可能被清理，文件系统回退能救回这种情况。
+    `roots` 只给自检用（合成一个「新旧版本 + 干扰目录」的夹具，不碰真实安装目录）。
+    """
+    for root in roots if roots is not None else _filesystem_roots():
         if not root.is_dir():
             continue
         try:
             candidates = sorted(
                 (item for item in root.iterdir() if item.is_dir()),
-                key=lambda p: p.name,
+                key=lambda p: _version_key(p.name),
                 reverse=True,
             )
         except OSError:
@@ -126,11 +165,15 @@ def detect() -> WebView2Status:
         version, source = _from_filesystem()
 
     if version:
+        # 「注册表登记过」与「只在磁盘上找到了文件」对用户的意义不一样，文案不能混为一谈。
+        where = (
+            f"{version}，注册表已登记" if source == "registry" else f"{version}，只在安装目录里找到了运行时文件（注册表未登记）"
+        )
         return WebView2Status(
             installed=True,
             version=version,
             source=source,
-            detail=f"WebView2 运行时已就绪（{version}）。",
+            detail=f"WebView2 运行时已就绪（{where}）。",
         )
 
     return WebView2Status(
@@ -202,7 +245,7 @@ def check_native_window_ready() -> tuple[bool, str]:
             "软件已改用系统浏览器，功能完全一致。"
         )
 
-    return True, f"原生窗口可用（WebView2 {status.version}）。"
+    return True, f"原生窗口可用（WebView2 {status.version}，来源：{status.source}）。"
 
 
 def try_install() -> tuple[bool, str]:
@@ -218,7 +261,7 @@ def try_install() -> tuple[bool, str]:
     winget = shutil.which("winget")
     if winget:
         try:
-            proc = subprocess.run(
+            proc = guarded_run(
                 [
                     winget, "install", "--id", "Microsoft.EdgeWebView2Runtime", "--exact",
                     "--silent", "--accept-package-agreements", "--accept-source-agreements",
@@ -249,7 +292,7 @@ def try_install() -> tuple[bool, str]:
             with target.open("wb") as handle:
                 for chunk in response.iter_bytes(chunk_size=256 * 1024):
                     handle.write(chunk)
-        proc = subprocess.run(
+        proc = guarded_run(
             [str(target), "/silent", "/install"],
             capture_output=True,
             timeout=900,

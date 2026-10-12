@@ -72,13 +72,21 @@ PARTS: tuple[PartSpec, ...] = (
             PartParam("height", "总高", "mm", 8.4, 4, 30, "滤镜螺纹咬合 3~5mm 即可"),
             PartParam("shoulder_t", "挡肩厚度", "mm", 1.4, 0.6, 5, "挡住滤镜不让它拧穿"),
             PartParam("clearance", "内螺纹单边间隙", "mm", 0.35, 0.15, 0.8, "打印件要留松一点"),
+            PartParam("wall", "最小壁厚", "mm", 2.0, 1.2, 5, "升口径时决定外扩后外径；太薄易裂"),
         ),
         keywords=(
             "滤镜", "转接环", "转接圈", "转接头", "滤镜环", "口径转换", "镜头",
             "螺纹", "螺距", "拧上", "拧进", "接环", "adapter", "filter", "step-up", "step-down",
         ),
         usage="use <aiforge_parts.scad>\nfilter_adapter(male_d = 72, female_d = 67);",
-        verified="scripts/verify_parts.py：封闭、单一实体、Ø72×8.4、牙深 0.458mm、约 8 秒",
+        verified="scripts/verify_parts.py：升/降口径均封闭、单一实体；67→77 实测 Ø81.7×8.4、中心通孔 Ø62、内外牙深 0.458mm",
+        extra_rules=(
+            "口径映射（最常填错，务必照此）：『A 转 B 转接环 / A to B』= male_d=A、female_d=B —— "
+            "male_d 是拧进镜头那端的外螺纹，female_d 是接滤镜那端的内螺纹。"
+            "例：『67 转 77』→ male_d=67、female_d=77；『77 转 67』→ male_d=77、female_d=67。"
+            "升口径（male_d<female_d）时程序会自动把外径扩到 female_d+2*(clearance+wall) 并把大端翻到贴平台，无需额外处理。",
+            "height 建议 ≥8mm：要同时容纳外螺纹咬合、外扩台肩、内螺纹咬合三段，太矮螺纹过短拧不牢。",
+        ),
     ),
     PartSpec(
         id="thread_sleeve",
@@ -174,6 +182,128 @@ def thread_sizes_in(text: str) -> list[float]:
     return found
 
 
+# 「A 转 B」这类**明确的口径转换**表述。出现顺序即 male→female（outer→inner）。
+# 只认这种强结构：像「77mm 滤镜用在 67mm 镜头上」这种两个口径之间夹着别的词的
+# 写法匹配不上 → 返回 None → 回退 AI，避免语序陷阱把 male/female 填反。
+CONVERSION_RE = re.compile(
+    r"(?P<a>\d{2,3}(?:\.\d+)?)\s*(?:mm|毫米)?\s*(?:[×xX*]\s*\d(?:\.\d+)?)?\s*"
+    r"(?:转到|转|换成|到|to|->|→|—|-)\s*"
+    r"(?:[Mm]\s*)?(?P<b>\d{2,3}(?:\.\d+)?)\s*(?:mm|毫米)?\s*(?:[×xX*]\s*\d(?:\.\d+)?)?",
+    re.IGNORECASE,
+)
+
+# 用户显式给的总高（「高10mm」「高度 10」「总高:12」）。
+HEIGHT_RE = re.compile(r"(?:总高|高度|高|厚)\s*[:：]?\s*(\d{1,3}(?:\.\d+)?)\s*(?:mm|毫米)?")
+# 用户显式给的螺距（「M67×0.75」「螺距1.0」）。滤镜螺纹统一 0.75，
+# 一旦出现别的螺距就回退 AI，不硬套 0.75。
+PITCH_RE = re.compile(r"[×xX*]\s*(\d(?:\.\d+)?)|(?:螺距|pitch)\s*[:：]?\s*(\d(?:\.\d+)?)", re.IGNORECASE)
+
+
+def _height_in(requirement: str, spec) -> float | None:
+    """取用户显式给的总高：优先用确认过的规格（用户可能在确认卡片里改过），
+    其次从需求文本里抠。取不到返回 None（用零件默认高）。"""
+    if spec is not None:
+        for item in getattr(spec, "specs", []) or []:
+            if item.value is None:
+                continue
+            if re.search(r"height|高", f"{item.name} {item.label}", re.IGNORECASE):
+                return float(item.value)
+    m = HEIGHT_RE.search(requirement or "")
+    return float(m.group(1)) if m else None
+
+
+def _nonstandard_pitch_in(requirement: str) -> bool:
+    """需求里是否出现了**非 0.75** 的螺距。出现就回退 AI（不硬套标准螺距）。"""
+    for m in PITCH_RE.finditer(requirement or ""):
+        raw = m.group(1) or m.group(2)
+        if raw is None:
+            continue
+        try:
+            pitch = float(raw)
+        except ValueError:
+            continue
+        if abs(pitch - COMMON_FILTER_PITCH) > 1e-6:
+            return True
+    return False
+
+
+def extract_call(requirement: str, spec=None):
+    """需求足够明确时，直接给出「零件 + 参数值」，供程序确定性直出（不靠 AI 填参）。
+
+    返回 None 的情况（都应当回退 AI）：没命中零件；口径转换表述不明确
+    （语序可能颠倒）；出现了非标准螺距；任一参数超出零件允许范围。
+    """
+    if not requirement or not requirement.strip():
+        return None
+    matched = match(requirement, limit=1)
+    if not matched:
+        return None
+    part = matched[0]
+
+    values: dict = {}
+    conv = CONVERSION_RE.search(requirement)
+    if part.id == "filter_adapter":
+        if not conv:
+            return None
+        values = {"male_d": float(conv.group("a")), "female_d": float(conv.group("b"))}
+    elif part.id == "thread_sleeve":
+        if not conv:
+            return None
+        values = {"outer_d": float(conv.group("a")), "inner_d": float(conv.group("b"))}
+    elif part.id == "threaded_cap":
+        sizes = thread_sizes_in(requirement)
+        if not sizes:
+            return None
+        values = {"inner_d": sizes[0]}
+    else:
+        return None
+
+    # 用户显式给了非标准螺距 → 不直出（滤镜螺纹统一 0.75，别的螺距交给 AI 判断）。
+    if _nonstandard_pitch_in(requirement):
+        return None
+    # 用户显式给了总高就照用，否则直出会 silently 用默认高、违背用户意图。
+    height = _height_in(requirement, spec)
+    if height is not None:
+        values["height"] = height
+
+    # 未显式给出的参数用零件默认值（螺距即 COMMON_FILTER_PITCH）。
+    for param in part.params:
+        values.setdefault(param.name, param.default)
+    # 任一参数越界 → 不直出（回退 AI），绝不生成超出验证范围的几何。
+    for param in part.params:
+        value = values.get(param.name)
+        if value is None or value < param.minimum or value > param.maximum:
+            return None
+    return part, values
+
+
+def render_source(spec: PartSpec, values: dict, name: str, summary: str) -> str:
+    """把「零件 + 参数值」渲染成符合 SCAD_CONVENTIONS 的完整源码。
+
+    关键点：@param 行与顶层赋值一一对应，且**调用处引用顶层变量**（而非字面量），
+    这样 params 模式（滑杆调参）改写顶层赋值后调用会跟着变，模型可直接微调。
+    """
+    clean_name = (name or spec.name).strip().splitlines()[0][:40] or spec.name
+    clean_summary = (summary or spec.summary).strip().splitlines()[0][:40] or spec.summary
+    lines = [f"// @name {clean_name}", f"// @summary {clean_summary}"]
+    assigns = []
+    call_args = []
+    for param in spec.params:
+        if param.name not in values:
+            continue
+        value = values[param.name]
+        label = "".join(param.label.split())  # 说明里不留空格，保证 @param 可解析
+        lines.append(
+            f"// @param {param.name} {value:g} {label} {param.minimum:g} {param.maximum:g}"
+        )
+        assigns.append(f"{param.name} = {value:g};")
+        call_args.append(f"{param.name} = {param.name}")
+    lines.extend(assigns)
+    lines.append(f"use <{LIBRARY_NAME}>")
+    lines.append(f"{spec.module}(" + ", ".join(call_args) + ");")
+    return "\n".join(lines) + "\n"
+
+
 def prompt_block(matched: list[PartSpec], requirement: str = "") -> str:
     """把匹配到的零件渲染成提示词块。没有命中就返回空串（保持提示词精简）。"""
     if not matched:
@@ -181,9 +311,9 @@ def prompt_block(matched: list[PartSpec], requirement: str = "") -> str:
     lines: list[str] = [
         "【现成零件库：能用就直接用，不要自己写这些几何】",
         "程序内置了一个**已经实测验证过**的参数化零件库。"
-        f"如果用户要的就是下面某个零件，请直接引用它并填写尺寸，"
-        f"**不要自己用 polyhedron/linear_extrude 去手写螺纹**"
-        f"（手写螺旋几何实测会不封闭或整块几何被丢弃，用户会拿到一个拧不上的光滑圆筒）。",
+        "如果用户要的就是下面某个零件，请直接引用它并填写尺寸，"
+        "**不要自己用 polyhedron/linear_extrude 去手写螺纹**"
+        "（手写螺旋几何实测会不封闭或整块几何被丢弃，用户会拿到一个拧不上的光滑圆筒）。",
         "",
         "用法（把这两行原样放在代码里，模块名与参数名不得改动）：",
         "    use <aiforge_parts.scad>",
@@ -220,13 +350,16 @@ def prompt_block(matched: list[PartSpec], requirement: str = "") -> str:
 
 __all__ = [
     "COMMON_FILTER_PITCH",
+    "CONVERSION_RE",
     "FILTER_SIZES",
     "LIBRARY_NAME",
     "PARTS",
     "PartParam",
     "PartSpec",
+    "extract_call",
     "library_path",
     "match",
     "prompt_block",
+    "render_source",
     "thread_sizes_in",
 ]

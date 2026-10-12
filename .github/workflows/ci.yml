@@ -80,7 +80,8 @@ jobs:
 
       - name: 后端离线自检（跳过依赖 OpenSCAD/图形界面/网络的检查）
         # 跳过的项会逐条打印 [SKIP] 与原因，并单独计数 —— 不会混进"通过"。
-        # 完整 45 项请在本地带 OpenSCAD 的机器上跑（见 docs/DEVELOPMENT.md）。
+        # 完整项数会随功能增长，以本机 `scripts/selfcheck.py`（不带 --offline）
+        # 的实测输出为准，文档里刻意不写死数字。详见 docs/DEVELOPMENT.md。
         run: python scripts/selfcheck.py --offline
 
   # ---------------------------------------------------------------------------

@@ -63,9 +63,13 @@ SHA-256 fbe1e590e1af2af863f5d92bd263eb4644d0ee29352e3ab566366e87a8f6ed12
 - 改用 SHA-256 完整性校验，并在界面上如实说明；
 - 同时提供官网链接，让用户可以完全绕开本软件的自动安装，自行从官网安装。
 
-> 这一点写在 `openscad.authenticate_signature()` 里，它会返回
-> 「OpenSCAD 官方安装包未提供数字签名，已改用 SHA-256 完整性校验。」——
-> 而不是谎称签名有效。
+> 这一点落在 `openscad.verify_download()`：它只会说「已校验文件完整性（SHA-256 与官方
+> 发布值一致）」，官方没给校验值时则如实说「未提供校验值，已记录本机 SHA-256」，
+> 不掺进任何「签名已验证」的说法。
+>
+> （这里曾经写着一个叫 authenticate_signature 的函数：它根本没人调用，只让文档看上去
+> 多了一层并不存在的签名检查能力 —— 本轮当作死代码删掉了。约定：文档里写成
+> `xxx()` 就是声称它现在存在，自检会挨个核对；想记历史就写成不带括号的名字。）
 
 ## 三、更新到新版本时要做的事
 
@@ -76,7 +80,8 @@ OpenSCAD 发布新版本后，按以下步骤更新（`src/aiforge/openscad.py`�
    ```powershell
    Get-FileHash .\OpenSCAD-<版本>-x86-64.zip -Algorithm SHA256
    ```
-3. 更新 `PINNED_VERSION`、`ASSET_ZIP`、`ASSET_INSTALLER` 与 `PINNED_SHA256`。
+3. 更新 `ASSET_ZIP`、`ASSET_INSTALLER` 与 `PINNED_SHA256`（版本号就写在两个资产
+   文件名里，没有单独的版本常量）。
 4. **实测验证**（关键，不能只看文件下载成功）：
    ```powershell
    .\build\venv\Scripts\python.exe main.py --install-openscad

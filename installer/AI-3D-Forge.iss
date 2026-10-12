@@ -24,7 +24,17 @@
 ; ============================================================================
 
 #define AppName "AI 3D Forge"
-#define AppVersion "1.0.0"
+; AppVersion comes from src\aiforge\version.py via build_installer.ps1 (/DAppVersion=...).
+; The literal below is only a fallback for people compiling this file by hand, and it
+; must stay behind #ifndef or the command-line value would be silently overridden.
+; It must NOT be a plausible release number: this file used to carry its own version
+; and it drifted (version.py said 1.0.1 while this said 1.0.0), so the installed app
+; reported the wrong version in Add/Remove Programs. A deliberately wrong sentinel
+; fails loudly instead; scripts\selfcheck.py pins both the #ifndef structure and this
+; exact string (t_installer_metadata).
+#ifndef AppVersion
+  #define AppVersion "0.0.0-hand-compile"
+#endif
 #define AppPublisher "AI 3D Forge"
 #define AppExeName "AI-3D-Forge.exe"
 #define SourceDir "..\build\dist\AI-3D-Forge"

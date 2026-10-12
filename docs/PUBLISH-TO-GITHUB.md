@@ -66,7 +66,10 @@ git push -u origin main
    `https://github.com/<owner>/<repo>/...` 换成真实地址，徽章才会亮；
 2. 在仓库 *Settings → Security* 打开 **Private vulnerability reporting**，
    `SECURITY.md` 里的私密报告入口才真正可用；
-3. 建一个 `v1.0.0` tag 并把安装包作为 Release 附件（见第四节）。
+3. 建一个 tag 并把安装包作为 Release 附件（见第四节）。tag 号**从
+   `src/aiforge/version.py` 的 `APP_VERSION` 取**（`git tag v<版本号>`），
+   不要在这份文档里记一个写死的号 —— 它会漂（这里曾经写着 `v1.0.0`，
+   而实际已发到 1.0.3，照做就会推一个对不上任何构建的 tag）。
 
 ### 仓库页建议填写的内容
 
@@ -118,7 +121,7 @@ git commit --amend --reset-author --no-edit
 ## 五、推送前自查（每条都能自己跑）
 
 ```powershell
-# 1) 后端自检（50 项，秒级，不消耗 AI 额度）
+# 1) 后端自检（94 项，约 1～2 分钟，不消耗 AI 额度；要本机装了 OpenSCAD）
 & build\venv\Scripts\python.exe scripts\selfcheck.py
 
 # 2) 开源文件完整性（必需文件 / README 要点 / 交叉链接）
@@ -186,8 +189,8 @@ git clone <你的仓库> <克隆目录>
 .\scripts\export_source.ps1
 
 # 2) 镜像到仓库（先 dry-run，看清增删改）
-& build\venv\Scripts\python.exe build\work\sync_github_repo.py
-& build\venv\Scripts\python.exe build\work\sync_github_repo.py --apply
+& build\venv\Scripts\python.exe scripts\sync_github_repo.py
+& build\venv\Scripts\python.exe scripts\sync_github_repo.py --apply
 
 # 3) 提交
 cd <仓库目录>
@@ -195,6 +198,12 @@ git add -A
 git commit -m "……"
 ```
 
+仓库目录默认取**与项目同级**的 `AI-3D-Forge-GitHub`；不在同级时用
+`--repo <目录>` 指过去。这个脚本必须在 `scripts/` 里（而不是某个被
+`.gitignore` 排除的临时目录）：否则别人 clone 之后照本节跑，
+第一条命令就指向一个不存在的文件 —— 发布工具自己不在发布物里也是文档骗人。
+
 `sync_github_repo.py` 会跳过 `webui/dist/` 与 `webui/scripts/shots/`
-（生成物，属于 Releases 或本地产物），并在删除文件时打印清单 ——
-删文件前请确认那是**真的**不该再存在，而不是"导出脚本漏了"。
+（生成物，属于 Releases 或本地产物），并把要删的文件**逐条全量**打印（不截断，
+因为这是它唯一会销毁文件的方向）—— 删文件前请确认那是**真的**不该再存在，
+而不是“导出脚本漏了”。

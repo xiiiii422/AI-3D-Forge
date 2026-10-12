@@ -59,29 +59,43 @@ def _build_parser() -> argparse.ArgumentParser:
 def _ensure_utf8_output() -> None:
     """让命令行输出使用 UTF-8，并让子进程继承同样的约定。
 
-    中文 Windows 的控制台默认是 GBK/936。Python 3.13 虽然默认 UTF-8 模式，
-    但 --version / --check 这类命令行输出仍可能被控制台按 GBK 解读而显示成乱码。
-    这里显式把标准流切成 UTF-8，并设置 PYTHONIOENCODING 供子进程继承
-    （对 Windows 这种「子进程输出按 ANSI 代码页编码」的环境尤其重要）。
-    """
-    import io
+    实现不在这里，在 `aiforge.stdio`：应用与 `scripts/*.py` 那十几个命令行脚本
+    需要的是同一件事，两处各写一份早晚会漂移（自检脚本就是因为只有 main.py
+    做了这个兜底，在 GBK 控制台下跑到「设计规格与改动机制」会直接崩掉）。
 
-    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-    for name in ("stdout", "stderr"):
-        stream = getattr(sys, name, None)
-        if stream is None:
-            continue
-        try:
-            if getattr(stream, "encoding", "").lower().replace("-", "") not in ("utf8", "utf8mb4"):
-                buffer = getattr(stream, "buffer", None)
-                if buffer is not None:
-                    setattr(sys, name, io.TextIOWrapper(buffer, encoding="utf-8", errors="replace", line_buffering=True))
-        except (AttributeError, ValueError, OSError):
-            # 无控制台（windowed 模式）时 std 流可能为 None，忽略即可
-            pass
+    为什么必须做：中文 Windows 的控制台默认代码页是 936（GBK），而 Python
+    到 3.13 为止**并没有**默认启用 UTF-8 模式（那是 3.15 才成的），于是 print
+    一个写不进 GBK 的字符（例如明细里的「−」）就报 UnicodeEncodeError。
+    """
+    from aiforge import stdio
+
+    stdio.ensure_utf8_output()
+
+
+def _ensure_console_streams() -> None:
+    """没有控制台标准流时，先尝试挂到父进程的控制台，再退化成可写的空流。
+
+    实现见 `aiforge.stdio.ensure_console_streams`（与脚本共用一份）。
+
+    为什么必须做（打包版实测）：`--noconsole` 打包出来的 exe 在
+    **没有继承管道/控制台句柄**的方式下启动时（双击快捷方式、脚本里
+    `Start-Process`、计划任务），`sys.stdout` / `sys.stderr` 都是 `None`，
+    于是 `--check` / `--version` 里任何一句 `print()` 都会抛
+    `AttributeError: 'NoneType' object has no attribute 'write'`，
+    进程以**退出码 1** 结束，而报错本身也没地方显示 ——
+    用户看到的是"诊断跑完什么都没有、还失败了"。
+
+    Windows 上的正规解法是先 `AttachConsole(ATTACH_PARENT_PROCESS)`：
+    从 cmd / PowerShell 里运行时能直接挂回那个控制台，输出照常可见；
+    挂不上（真没有控制台）再退化成 devnull，保证**不再崩、退出码正确**。
+    """
+    from aiforge import stdio
+
+    stdio.ensure_console_streams()
 
 
 def main(argv: list[str] | None = None) -> int:
+    _ensure_console_streams()
     _ensure_utf8_output()
     args = _build_parser().parse_args(argv)
 
@@ -89,6 +103,13 @@ def main(argv: list[str] | None = None) -> int:
     from aiforge.version import APP_NAME, APP_VERSION, CHANNEL_LABEL, os_label, python_version
 
     logging_setup.setup(console=args.check or args.server or args.install_openscad)
+
+    # 高分辨率适配：必须在任何窗口/GUI 创建之前声明进程 DPI 感知，
+    # 否则 Windows 会把整个界面按 96dpi 渲染再位图拉伸到用户缩放比（150%/200% 屏上发虚）。
+    # DPI 感知一旦有窗口创建就锁定，所以只能放在入口最前面。
+    from aiforge import dpi as _dpi
+
+    _dpi.ensure_dpi_awareness()
 
     # 子进程守护要在**所有入口**上生效，而不是只在"启动服务"那条路上。
     # 实测踩到：`--check` 不经过 start_server，于是「系统诊断」里那条
@@ -123,8 +144,9 @@ def main(argv: list[str] | None = None) -> int:
     from aiforge import single_instance, server
 
     if not single_instance.acquire():
-        pid = single_instance.running_pid()
-        print(f"{APP_NAME} 已经在运行中（进程号 {pid}）。请切换到已打开的窗口。")
+        # 不能只 print：打包版是 `console=False`，stdout 被挂到 devnull，用户看到的
+        # 就是“双击没反应”。这句话由 report_refusal 负责送到看得见的地方。
+        single_instance.report_refusal(headless=bool(args.server or args.browser))
         return 0
 
     try:
@@ -138,39 +160,58 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_check() -> int:
-    """命令行环境自检：给技术支持用的可复制文本输出。"""
+    """命令行环境自检：给技术支持用的可复制文本输出。
+
+    输出同时写一份到 `logs\\check-report.txt`：打包版在"没有控制台句柄"的方式下
+    启动时（双击快捷方式、脚本里 Start-Process），标准流即使挂不上控制台也不会
+    崩，但用户看不到任何东西 —— 有一份报告文件才不会让排障走进死胡同。
+    """
     import asyncio
 
     from aiforge import envcheck, openscad as scad_cli
     from aiforge.paths import paths
     from aiforge.version import APP_NAME, APP_VERSION, CHANNEL_LABEL
 
-    print("=" * 66)
-    print(f"{APP_NAME} {APP_VERSION}（{CHANNEL_LABEL}）环境检测")
-    print("=" * 66)
+    lines: list[str] = []
+
+    def emit(text: str = "") -> None:
+        print(text)
+        lines.append(text)
+
+    emit("=" * 66)
+    emit(f"{APP_NAME} {APP_VERSION}（{CHANNEL_LABEL}）环境检测")
+    emit("=" * 66)
 
     files = paths()
-    print(f"用户配置目录：{files.data_dir}")
-    print(f"项目保存目录：{files.projects_dir}")
-    print(f"运行组件目录：{files.runtime_dir}")
-    print("-" * 66)
+    emit(f"用户配置目录：{files.data_dir}")
+    emit(f"项目保存目录：{files.projects_dir}")
+    emit(f"运行组件目录：{files.runtime_dir}")
+    emit("-" * 66)
 
     report = asyncio.run(envcheck.build_report(use_cache=False, deep=True))
     icons = {"ok": "✓", "warn": "⚠", "fail": "✗", "checking": "…"}
     for item in report["items"]:
-        print(f"{icons.get(item['status'], '?')} {item['title']}: {item['detail']}")
+        emit(f"{icons.get(item['status'], '?')} {item['title']}: {item['detail']}")
         if item.get("action"):
-            print(f"    → {item['action']}")
+            emit(f"    → {item['action']}")
 
-    print("-" * 66)
-    print(f"结论：{report['ok_count']}/{report['total']} 项通过（overall={report['overall']}）")
+    emit("-" * 66)
+    emit(f"结论：{report['ok_count']}/{report['total']} 项通过（overall={report['overall']}）")
 
     exe = scad_cli.resolve_executable()
-    print(f"OpenSCAD 可执行文件：{exe or '未找到'}")
+    emit(f"OpenSCAD 可执行文件：{exe or '未找到'}")
     if exe is None:
-        print("手动安装指引：")
+        emit("手动安装指引：")
         for step in scad_cli.manual_instructions()["steps"]:
-            print(f"  - {step}")
+            emit(f"  - {step}")
+
+    try:
+        report_path = files.log_dir / "check-report.txt"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        emit(f"报告副本：{report_path}")
+    except Exception:  # noqa: BLE001 - 写不了报告不影响检测本身
+        pass
     return 0
 
 

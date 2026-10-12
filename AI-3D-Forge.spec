@@ -99,6 +99,14 @@ hiddenimports += collect_submodules("keyring.backends")
 # ModuleNotFoundError，原生窗口永远起不来、静默退回系统浏览器；而构建机上
 # site-packages 里有它们，一切正常，只在发布版复现。
 # selfcheck 的 t_frozen_webview_deps 有断言守着这件事。
+#
+# 可以排除的得拿证据说：`yaml`（实测在 _internal 里占 0.24 MB）全仓库只有两个
+# 导入方，而且都是跑不到的分支：
+#   * uvicorn/config.py:374 —— 只在 `--config xxx.yml` 时才 import，本项目用代码直传配置；
+#   * starlette/schemas.py:12 —— 在 try/except ImportError 里，只服务 starlette 的
+#     `Route(schema=...)` 文档字符串解析，FastAPI 的 /api/openapi.json 不走它。
+# 为防“打包版才复现”那一类坑，test_install.ps1 现在会在装好的程序里请求
+# /api/openapi.json 并数路由数：少了依赖会在这里炸成 500，而不是默默上线。
 excludes: list[str] = [
     "pytest",
     "numpy",
@@ -109,6 +117,8 @@ excludes: list[str] = [
     "pydoc_data",
     "lib2to3",
     "sqlite3",
+    "yaml",  # 见上方证据：只有两个跑不到的条件导入
+    "_yaml",
 ]
 
 a = Analysis(  # noqa: F821

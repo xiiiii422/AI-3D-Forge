@@ -18,39 +18,3 @@ export function Card({ flush, tight, children, className, ...rest }: CardProps) 
     </div>
   );
 }
-
-interface CardHeadProps {
-  title: ReactNode;
-  hint?: ReactNode;
-  extra?: ReactNode;
-}
-
-export function CardHead({ title, hint, extra }: CardHeadProps) {
-  return (
-    <div className="card-head">
-      <div>
-        <h2>{title}</h2>
-        {hint ? <div className="card-hint">{hint}</div> : null}
-      </div>
-      {extra}
-    </div>
-  );
-}
-
-interface SectionTitleProps {
-  title: ReactNode;
-  sub?: ReactNode;
-  extra?: ReactNode;
-}
-
-export function SectionTitle({ title, sub, extra }: SectionTitleProps) {
-  return (
-    <div className="section-title">
-      <div>
-        <h2>{title}</h2>
-        {sub ? <div className="card-hint">{sub}</div> : null}
-      </div>
-      {extra}
-    </div>
-  );
-}

@@ -93,9 +93,9 @@ cd webui; npm run dev
 ### 1. 后端自检（不消耗 AI 额度，约 1～2 分钟）
 
 ```powershell
-& build\venv\Scripts\python.exe scripts\selfcheck.py            # 完整 50 项
+& build\venv\Scripts\python.exe scripts\selfcheck.py            # 完整 94 项
 & build\venv\Scripts\python.exe scripts\selfcheck.py --offline  # 跳过依赖 OpenSCAD/图形界面/网络的项（CI 用）
-& build\venv\Scripts\python.exe scripts\selfcheck_design.py     # 设计规格与改动机制（131 项子检查）
+& build\venv\Scripts\python.exe scripts\selfcheck_design.py     # 设计规格与改动机制（144 项子检查）
 ```
 
 `--offline` 会把跳过的项**明确打印成 `[SKIP]` 并单独计数**，绝不把没跑的检查算作通过。

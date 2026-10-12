@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import console_utf8  # noqa: F401,E402 —— 必须最先导入：GBK 控制台下 print 中文/符号会弄崩脚本（见 src/aiforge/stdio.py）
 import argparse
 import re
 import sys

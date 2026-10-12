@@ -96,6 +96,50 @@
   --sidebar-w: 264px;
   --panel-w: 400px;
   --viewer-bg: #f2f3f5; /* 预览台中性底（三点布光的台面） */
+
+  /* ---------- 液态玻璃（设置 → 外观 → 液态玻璃） ----------
+     只有这一处允许写颜色；app.css 里只引用下面的令牌。
+     --glass-solid 由 useAppearance.ts 按滑块写入（100% = 不透明，0% = 全透），
+     其它令牌描述材质，不随滑块变化。 */
+  --glass-solid: 75%;
+  /* 浮层的实底下限：弹窗/菜单/提示条背后是整页文字或 3D 场景，滑块拉到多透都
+     不能让字读不动。像素实测（webui/scripts/verify-glass-contrast.mjs，浅底 13px 灰字，
+     「底」取字形外圈 3–11px）：完全实底 → 5.07:1；没有这条下限时，实底 75%（=透明度 25%）
+     就已经掉到 4.14:1，实底 40%（=拖到滑块上限 60%）只剩 1.84:1（要求 4.5:1）。
+     下限取 94%：离纯实底只差 6 个点、不至于死板，同时把整条滑块锁进实测安全区。
+     加下限后实测：弹窗正文 4.86（透明度 25%）/ 4.82（60%）/ 4.78（90%）—— 不随滑块变化。 */
+  --glass-solid-float: max(94%, var(--glass-solid));
+  /* 面板底：把主题面色彩成半透明（mix 到 transparent 等价于降 alpha） */
+  --glass-fill: color-mix(in srgb, var(--surface) var(--glass-solid), transparent);
+  --glass-fill-chrome: color-mix(in srgb, var(--bg) calc(var(--glass-solid) + 8%), transparent);
+  --glass-fill-sub: color-mix(in srgb, var(--bg-sub) calc(var(--glass-solid) + 8%), transparent);
+  /* 厚玻璃：浮层专用（Apple 的 ultra-thin / thin / regular 就是按背后内容密度分档） */
+  --glass-fill-float: color-mix(in srgb, var(--surface) var(--glass-solid-float), transparent);
+  --glass-blur: 26px;
+  /* 浮层背后是密集内容，模糊要更狠一点，把透上来的字笔画揉开 */
+  --glass-blur-float: 34px;
+  --glass-saturate: 1.7;
+  /* 上缘镜面高光：玻璃顶部那一条亮线。iOS 27 把它压得很低，因为高光一重
+     就会和背景文字打架（实测反馈「看不清」的主要来源）。 */
+  --glass-spec: rgb(255 255 255 / 0.6);
+  --glass-edge: color-mix(in srgb, var(--text) 8%, transparent);
+  --glass-inset: inset 0 1px 0 var(--glass-spec);
+  /* 跟随指针的那一团「液态」高光 */
+  --glass-sheen: rgb(255 255 255 / 0.42);
+  --glass-sheen-size: 320px;
+  /* 环境光斑：没有“背景”就没有玻璃。半透面板压在纯色页底上只会看起来发灰，
+     所以玻璃模式下给页底铺三团极淡的彩色光斑（只从 --brand / --bg 派生）。 */
+  --glass-orb-1: color-mix(in srgb, var(--brand) 26%, transparent);
+  --glass-orb-2: color-mix(in srgb, var(--ok) 20%, transparent);
+  --glass-orb-3: color-mix(in srgb, var(--accent) 14%, transparent);
+  /* 表单里那种「凹槽」（设置页的调参块）：普通模式是实面，玻璃模式下它
+     已经在玻璃卡片里，绝不能再叠一层 backdrop-filter（嵌套玻璃互相屏蔽），
+     只能靠降不透明度装作和卡片是同一块玻璃。 */
+  --well-fill: var(--surface-2);
+}
+
+:root[data-appearance='glass'] {
+  --well-fill: color-mix(in srgb, var(--surface-2) 55%, transparent);
 }
 
 /* ==================================================================
@@ -137,10 +181,38 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-pop: 0 2px 6px rgba(0, 0, 0, 0.5), 0 16px 40px rgba(0, 0, 0, 0.5);
   --viewer-bg: #1a1a20;
+
+  /* 深色下的玻璃：白高光要跟着压下去，否则在黑底上会变成刺眼的白边；
+     环境光斑换成更淡的彩色，避免像贴了三块荧光斑 */
+  --glass-spec: rgb(255 255 255 / 0.14);
+  --glass-edge: rgb(255 255 255 / 0.1);
+  --glass-sheen: rgb(255 255 255 / 0.07);
+  --glass-orb-1: color-mix(in srgb, var(--brand) 30%, transparent);
+  --glass-orb-2: color-mix(in srgb, var(--ok) 22%, transparent);
+  --glass-orb-3: color-mix(in srgb, var(--accent) 60%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {
   :root {
     --dur: 1ms;
+  }
+}
+
+/* 系统级「降低透明度」（Windows：设置 → 个性化 → 颜色 → 透明效果；
+   macOS/iOS：辅助功能 → 显示 → 降低透明度）：玻璃退成实底。
+   和 prefers-reduced-motion 同一立场 —— 用户已经说过不要这类效果，
+   就不能拿「他在设置里选了液态玻璃」当理由继续糊上去。
+   Chromium 118+ 支持该媒体特性；不支持的内核会整段忽略（不会报错），
+   所以这里不能当成唯一的可读保险 —— 上限 60% 的硬夹取在后端。 */
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --glass-solid: 100%;
+    --glass-solid-float: 100%;
+    --glass-blur: 0px;
+    --glass-blur-float: 0px;
+    --glass-sheen: transparent;
+    --glass-orb-1: transparent;
+    --glass-orb-2: transparent;
+    --glass-orb-3: transparent;
   }
 }

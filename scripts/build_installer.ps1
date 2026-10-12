@@ -38,6 +38,25 @@ $Work = Join-Path $Root 'build\work'
 $Cache = Join-Path $Root 'build\downloads'
 New-Item -ItemType Directory -Force -Path $Work, $Cache | Out-Null
 
+# --------------------------------------------------------------------------
+# 0. Version: src\aiforge\version.py is the single source of truth.
+#    The installer used to hardcode its own version, and it drifted (version.py
+#    said 1.0.1 while the .iss still said 1.0.0), so shipped installers reported
+#    the wrong version in Add/Remove Programs. Read it once and pass it down.
+# --------------------------------------------------------------------------
+$VersionSource = Join-Path $Root 'src\aiforge\version.py'
+$AppVersion = ''
+if (Test-Path $VersionSource) {
+    $verMatch = [regex]::Match(
+        (Get-Content -Raw -LiteralPath $VersionSource),
+        'APP_VERSION\s*=\s*"([^"]+)"')
+    if ($verMatch.Success) { $AppVersion = $verMatch.Groups[1].Value }
+}
+if (-not $AppVersion) {
+    Write-Host '  [FAIL] cannot read APP_VERSION from src\aiforge\version.py' -ForegroundColor Red
+    exit 1
+}
+
 function Write-Ok   { param([string]$T) Write-Host "  [OK]   $T" -ForegroundColor Green }
 function Write-Warn { param([string]$T) Write-Host "  [WARN] $T" -ForegroundColor Yellow }
 function Write-Err  { param([string]$T) Write-Host "  [FAIL] $T" -ForegroundColor Red }
@@ -95,16 +114,29 @@ function Install-InnoViaWinget {
     Write-Host '  Trying winget (official Windows package manager)...' -ForegroundColor DarkGray
     $common = @('--exact', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
 
-    $global:LASTEXITCODE = 0
-    & $winget.Source install --id JRSoftware.InnoSetup @common 2>&1 |
-        ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-    if ($LASTEXITCODE -eq 0) { return $true }
+    # Same shape that once killed build.ps1 step 2: merging a native command's stderr
+    # into the pipeline while $ErrorActionPreference is 'Stop' turns the first stderr
+    # line into a TERMINATING error (measured; see the Invoke-Native comment in
+    # build.ps1 and the guard t_ps1_native_stderr). winget on
+    # this machine was only ever seen writing to stdout, so this is shape hygiene here,
+    # not a bug that has fired -- which is also why it stays a local dance instead of a
+    # second copy of the helper for two calls.
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $global:LASTEXITCODE = 0
+        & $winget.Source install --id JRSoftware.InnoSetup @common 2>&1 |
+            ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        if ($LASTEXITCODE -eq 0) { return $true }
 
-    Write-Host '  Inno Setup 6 unavailable; trying Inno Setup 7...' -ForegroundColor DarkGray
-    $global:LASTEXITCODE = 0
-    & $winget.Source install --id JRSoftware.InnoSetup.7 @common 2>&1 |
-        ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-    return ($LASTEXITCODE -eq 0)
+        Write-Host '  Inno Setup 6 unavailable; trying Inno Setup 7...' -ForegroundColor DarkGray
+        $global:LASTEXITCODE = 0
+        & $winget.Source install --id JRSoftware.InnoSetup.7 @common 2>&1 |
+            ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $prevPref
+    }
 }
 
 function Get-InnoDownloadUrl {
@@ -190,7 +222,7 @@ Write-Host '  Compiling installer...' -ForegroundColor Cyan
 $compileLog = Join-Path $Work 'iscc.log'
 Push-Location (Join-Path $Root 'installer')
 try {
-    $isccProc = Start-Process -FilePath $iscc -ArgumentList @('/Qp', 'AI-3D-Forge.iss') `
+    $isccProc = Start-Process -FilePath $iscc -ArgumentList @('/Qp', "/DAppVersion=$AppVersion", 'AI-3D-Forge.iss') `
         -NoNewWindow -Wait -PassThru `
         -RedirectStandardOutput $compileLog -RedirectStandardError (Join-Path $Work 'iscc.err.log')
     $isccCode = $isccProc.ExitCode
@@ -232,7 +264,7 @@ Write-Host "  SHA-256: $hash" -ForegroundColor DarkGray
 
 $manifest = [ordered]@{
     product  = 'AI 3D Forge'
-    version  = '1.0.0'
+    version  = $AppVersion
     setup    = 'AI-3D-Forge-Setup.exe'
     size_mb  = $setupSize
     sha256   = $hash

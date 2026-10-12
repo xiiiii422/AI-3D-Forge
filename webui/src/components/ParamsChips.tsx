@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { JobParam } from '../api/types';
+import { groupParams, shouldGroup } from '../lib/paramGroups';
 import { Button } from './Button';
 import { IconSliders } from './Icons';
 
@@ -14,6 +15,11 @@ interface ParamsChipsProps {
 /**
  * 参数微调：把 result.params 渲染成内联数字输入。
  * [应用参数] 只调用 POST /api/projects/{id}/params（不经过 AI），秒级重编译。
+ *
+ * 参数不少于 5 个且跨类时才分栏展示（规则见 lib/paramGroups）：
+ * 本机 11 个带参数表的真实项目是 8~16 个参数、中位数 12（最多的 16 个），
+ * 全平铺时用户为了改一个「壁厚」要逐个读标签。
+ * 分栏后每类一个标题，改动过的类标题描边变橙并带一个点，长表单里也能一眼回到改的地方。
  */
 export function ParamsChips({ params, disabled, applying, onApply }: ParamsChipsProps) {
   const initial = useMemo(() => {
@@ -41,6 +47,37 @@ export function ParamsChips({ params, disabled, applying, onApply }: ParamsChips
     if (p.min !== null && value < p.min) value = p.min;
     if (p.max !== null && value > p.max) value = p.max;
     return value;
+  };
+
+  const grouped = shouldGroup(params);
+  const groups = useMemo(() => groupParams(params), [params]);
+
+  // 芯片的 DOM 不分栏/分栏两种布局下完全一样（verify-flow 靠 .chip-label 定位）
+  const renderChip = (p: JobParam) => {
+    const value = draft[p.name] ?? p.value;
+    const isDirty = value !== p.value;
+    return (
+      <label className="chip" key={p.name}>
+        <span className="chip-label" title={`${p.label}（${p.name}）`}>
+          {p.label}
+        </span>
+        <span className={`chip-input${isDirty ? ' is-dirty' : ''}`}>
+          <input
+            type="number"
+            inputMode="decimal"
+            aria-label={`${p.label}${p.unit ? `，单位${p.unit}` : ''}`}
+            value={Number.isFinite(value) ? value : ''}
+            min={p.min ?? undefined}
+            max={p.max ?? undefined}
+            step="any"
+            disabled={disabled}
+            onChange={(e) => setDraft((prev) => ({ ...prev, [p.name]: Number(e.target.value) }))}
+            onBlur={(e) => setDraft((prev) => ({ ...prev, [p.name]: clamp(p, e.target.value) }))}
+          />
+          {p.unit ? <span className="chip-unit">{p.unit}</span> : null}
+        </span>
+      </label>
+    );
   };
 
   return (
@@ -73,34 +110,36 @@ export function ParamsChips({ params, disabled, applying, onApply }: ParamsChips
         </div>
       </div>
 
-      <div className="params-grid">
-        {params.map((p) => {
-          const value = draft[p.name] ?? p.value;
-          const isDirty = value !== p.value;
-          return (
-            <label className="chip" key={p.name}>
-              <span className="chip-label" title={`${p.label}（${p.name}）`}>
-                {p.label}
-              </span>
-              <span className={`chip-input${isDirty ? ' is-dirty' : ''}`}>
-                <input
-                  type="number"
-                  inputMode="decimal"
-                  aria-label={`${p.label}${p.unit ? `，单位${p.unit}` : ''}`}
-                  value={Number.isFinite(value) ? value : ''}
-                  min={p.min ?? undefined}
-                  max={p.max ?? undefined}
-                  step="any"
-                  disabled={disabled}
-                  onChange={(e) => setDraft((prev) => ({ ...prev, [p.name]: Number(e.target.value) }))}
-                  onBlur={(e) => setDraft((prev) => ({ ...prev, [p.name]: clamp(p, e.target.value) }))}
-                />
-                {p.unit ? <span className="chip-unit">{p.unit}</span> : null}
-              </span>
-            </label>
-          );
-        })}
-      </div>
+      {grouped ? (
+        <div className="params-groups">
+          {groups.map((group) => {
+            const groupChanged = group.items.some((p) => dirtyNames.includes(p.name));
+            return (
+              <div
+                className={`params-group${groupChanged ? ' is-changed' : ''}`}
+                role="group"
+                aria-label={group.label}
+                key={group.id}
+              >
+                <div className="params-group-title">
+                  {group.label}
+                  <span className="params-group-count">{group.items.length}</span>
+                  {groupChanged ? (
+                    <>
+                      <span className="params-group-flag" aria-hidden="true" />
+                      {/* 状态不能只靠颜色（橙描边 + 橙点）传达 */}
+                      <span className="sr-only">已改动，未应用</span>
+                    </>
+                  ) : null}
+                </div>
+                <div className="params-grid">{group.items.map((p) => renderChip(p))}</div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="params-grid">{params.map((p) => renderChip(p))}</div>
+      )}
     </section>
   );
 }

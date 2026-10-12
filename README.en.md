@@ -72,6 +72,8 @@ refuses to hand you something it can prove is unprintable.
 | **Natural-language edits** | “Make it 150 mm tall” — only the named parameter changes, and the app verifies exactly what moved |
 | **Parameter tweaking** | Recompile in seconds by editing a number; no AI usage |
 | **Build-volume safety net** | If it does not fit your printer, the AI redoes it, and if it still does not fit the app scales it down deterministically |
+| **Dimensions in the preview** | Draws the three overall dimension lines (width / depth / height) with labels that track the camera; click any edge to see just that edge's length |
+| **3MF and one-click send to slicer** | Same geometry as the STL but **declares millimetres** and carries printer/material metadata (no more “imported 10× too big”); when a local slicer is detected, one button opens it |
 | **Version history** | Every project keeps revisions you can roll back to |
 | **One-file delivery** | Installer with automatic 3D-engine setup; uninstall/upgrade never touches your projects |
 
@@ -101,7 +103,8 @@ refuses to hand you something it can prove is unprintable.
 ⑦ Two rendered views → vision review + printability review against your printer
         │
         ▼
-⑧ Preview, iterate in plain language, tweak parameters, download STL/SCAD
+⑧ Preview (with dimension callouts), iterate in plain language, tweak parameters,
+   download 3MF/STL/SCAD — or send the model straight to your slicer
 ```
 
 ## System requirements
@@ -201,7 +204,10 @@ The server binds to `127.0.0.1` only — other machines on your LAN cannot reach
 ## Screenshots
 
 All screenshots live in [`docs/images/`](docs/images/) (light theme, sample data from
-the mock backend — no real accounts). A dark theme is available in **Settings → Appearance**.
+the mock backend — no real accounts). **Settings → Appearance** adds a dark theme and an
+optional *liquid glass* material (translucent panels, background blur, a highlight that
+tracks the pointer, adjustable transparency). Popovers, menus and toasts deliberately
+stay thick glass, so they never fade into unreadability along with the slider.
 
 ## Your data and privacy
 

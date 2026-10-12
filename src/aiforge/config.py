@@ -16,12 +16,24 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from .paths import APP_NAME, paths
+from .paths import paths
 
 log = logging.getLogger(__name__)
 
 KEYRING_SERVICE = "AI-3D-Forge"
 KEYRING_USER = "deepseek-api-key"
+# 智谱单独一个凭据槽：混合模式需要「DeepSeek 付费生成 + 智谱免费复核」两把 Key 共存。
+KEYRING_USER_GLM = "glm-api-key"
+
+
+def provider_of_base(base_url: str) -> str:
+    """按 base_url 判提供商（与 llm.detect_provider 同语义；config 不能反向 import llm）。"""
+    url = (base_url or "").lower()
+    if "deepseek" in url:
+        return "deepseek"
+    if "bigmodel.cn" in url or "zhipu" in url:
+        return "glm"
+    return "openai"
 
 # 读配置一律用 utf-8-sig：它写出的字节与 utf-8 完全相同（不带 BOM），
 # 但读的时候能容忍 BOM。为什么必须容忍：用户完全可能用记事本之类
@@ -44,6 +56,13 @@ class ApiSettings:
     model: str = DEFAULT_MODEL
     timeout_s: int = 180
     max_retries: int = 2
+    # 「混合·性价比」模式：生成/修改用主模型（付费质量档），
+    # 规格解析/打印性评审/AI 复核改用这个免费档（同 base_url 同 Key，只换模型）。
+    # 空串 = 不启用混合，全部走主模型。
+    economy_model: str = ""
+    # 经济档的服务商地址（可与主提供商不同，如主=DeepSeek 付费、经济=智谱免费）。
+    # 空串 = 经济档与主提供商同地址。
+    economy_base_url: str = ""
 
 
 @dataclass
@@ -80,10 +99,57 @@ class BehaviorSettings:
     telemetry: bool = False  # 永不上报，保留字段以明示隐私立场
 
 
+# 外观材质：'solid' = 实面（默认），'glass' = 液态玻璃（半透 + 背景模糊 + 高光描边）。
+APPEARANCES = ("solid", "glass")
+# 玻璃透明度（百分比，0 = 完全不透明）。上限不是拍脑袋定的，是拿截图像素实测出来的
+# （口径与数据：webui/scripts/verify-glass-contrast.mjs → webui/scripts/shots/contrast-report.json）：
+#   * 普通面板（卡片/侧栏/工作台）上的文字，即使拖到 90% 也还在 4.5:1 以上
+#     （最低读数 5.07:1）—— 所以「超过 60% 字就读不动」这句话是错的，不写在这里。
+#   * 随透明度真实恶化的是「底纹泄漏」：面板底亮度散布从 0（实底）涨到 0.072（60%）、
+#     0.094（90%）—— 再往右面板就不是一块干净的底了。这是观感判断，不冒充 WCAG。
+#   * 会真的掉到 4.5:1 以下的是**浮层**（背后压着整页文字的弹窗/菜单）：拿掉下面那条
+#     下限复测（NO_FLOAT_FLOOR=1），透明度 25% 时弹窗正文 4.14:1、60% 时只剩 1.84:1。
+#     因此浮层在 CSS 里另有一层不透明度下限
+#     （tokens.css 的 --glass-solid-float: max(94%, …)，由 scripts/selfcheck.py 守着），
+#     实测读数不再随滑块变化（4.78~4.86:1）。
+# 读数口径：「底」只取字形外圈 3–11px 那一圈（排除 2px 抗锯齿晕圈），不是整个裁切框 ——
+# 拿远一点的开关/色块当「字底下的底」会把实底基线也量成不合格。
+# 宁可让用户拿不到那种“好看但读不了”的档位。
+GLASS_TRANSPARENCY_MIN = 0
+GLASS_TRANSPARENCY_MAX = 60
+GLASS_TRANSPARENCY_DEFAULT = 25
+
+
+def clamp_glass_transparency(value: Any) -> int:
+    """把透明度收成合法整数；无法解析时回到默认值（不是 0，也不是抛错）。"""
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return GLASS_TRANSPARENCY_DEFAULT
+    return max(GLASS_TRANSPARENCY_MIN, min(GLASS_TRANSPARENCY_MAX, number))
+
+
 @dataclass
 class UiSettings:
     theme: str = "light"  # light | dark | system
+    # 界面材质与玻璃透明度：只影响观感，不影响任何功能布局
+    appearance: str = "solid"  # solid | glass
+    glass_transparency: int = GLASS_TRANSPARENCY_DEFAULT
     last_project_id: str | None = None
+
+
+@dataclass
+class SlicerSettings:
+    """切片软件（「送到切片软件」用）。
+
+    default_id 存的是检测结果的 id（如 bambu_studio）；软件被卸载后
+    slicers.resolve 会当作没设过，不会拿一个无效 id 去启动。只存 id，
+    **不存路径** —— 路径每次从注册表/安装目录实扫，免得升级换了目录还指旧路。
+    """
+
+    default_id: str | None = None
+    # 自动检测总有漏网的机器，留一个手动添加的主程序路径（只接受 .exe）
+    custom_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -95,6 +161,7 @@ class AppConfig:
     printer: PrinterSettings = field(default_factory=PrinterSettings)
     behavior: BehaviorSettings = field(default_factory=BehaviorSettings)
     ui: UiSettings = field(default_factory=UiSettings)
+    slicers: SlicerSettings = field(default_factory=SlicerSettings)
 
     # ---------------- 序列化 ----------------
     def to_dict(self) -> dict[str, Any]:
@@ -117,6 +184,7 @@ class AppConfig:
             ("printer", PrinterSettings),
             ("behavior", BehaviorSettings),
             ("ui", UiSettings),
+            ("slicers", SlicerSettings),
         ):
             section = raw.get(name)
             if isinstance(section, dict):
@@ -138,6 +206,18 @@ class SecretStore:
     def __init__(self, secret_file: Path) -> None:
         self._file = secret_file
         self._backend: str | None = None
+        # 后端必须**按提供商分开记**：两把 Key 本来就允许存在不同地方
+        # （混合模式：DeepSeek 付费那把进凭据管理器、智谱免费那把落本地文件）。
+        # 共用一个字段时，「上一次读/写的是哪把」会决定「这一把存在哪儿」的回答：
+        # 本机实测 deepseek 写进凭据管理器、glm 落文件之后，`backend_for()`（deepseek）
+        # 回答的是 config_file —— 而设置页与诊断页拿的就是这个值，于是告诉用户
+        # 「Key 在本机配置文件里」，用户按这个说法去删/改根本找不到那把 Key。
+        self._backend_by_provider: dict[str, str] = {}
+
+    def _remember(self, provider: str, backend: str) -> str:
+        self._backend = backend
+        self._backend_by_provider[provider] = backend
+        return backend
 
     # --- 后端探测 -------------------------------------------------------
     def _keyring(self):
@@ -158,107 +238,138 @@ class SecretStore:
             return None
 
     # --- 读写 -----------------------------------------------------------
-    def get(self) -> str | None:
-        """按「用户在界面里的选择优先」的顺序取 Key。
+    def get(self, provider: str | None = None) -> str | None:
+        """按提供商取 Key（默认 deepseek）。优先级：凭据管理器 > 配置文件 > 环境变量。
 
-        优先级：Windows 凭据管理器 > 本地配置文件 > 环境变量。
-        刻意把环境变量放在最后：用户在设置里显式保存/清除的 Key 才是他真正的意图，
-        不能被开发机或工具残留的环境变量悄悄覆盖（否则会出现「清除了却还在用」的怪现象）。
-        环境变量只作为「没有保存过任何 Key」时的兜底，方便自动化测试与高级用户。
+        环境变量按提供商区分（deepseek 读 DEEPSEEK_API_KEY/AIFORGE_API_KEY，
+        glm 读 GLM_API_KEY）—— 混合模式两把 Key 靠这个共存。
+        刻意把环境变量放最后：用户显式保存/清除的 Key 才是真意图。
         """
+        prov = provider or "deepseek"
+        kr_user = KEYRING_USER_GLM if prov == "glm" else KEYRING_USER
         kr = self._keyring()
         if kr is not None:
             try:
-                value = kr.get_password(KEYRING_SERVICE, KEYRING_USER)
+                value = kr.get_password(KEYRING_SERVICE, kr_user)
                 if value:
-                    self._backend = "credential_manager"
+                    self._remember(prov, "credential_manager")
                     return value
             except Exception as exc:  # noqa: BLE001
                 log.info("读取凭据管理器失败：%s", exc)
 
-        data = self._read_file()
+        data = self._read_file(prov)
         if data:
-            self._backend = "config_file"
+            self._remember(prov, "config_file")
             return data
 
-        env = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("AIFORGE_API_KEY")
+        if prov == "glm":
+            env = os.environ.get("GLM_API_KEY")
+        else:
+            env = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("AIFORGE_API_KEY")
         if env and env.strip():
-            self._backend = "env"
+            self._remember(prov, "env")
             return env.strip()
         return None
 
-    def set(self, value: str | None) -> str:
-        """写入 Key；传空值表示清除。返回实际使用的存储后端。"""
+    def set(self, value: str | None, provider: str | None = None) -> str:
+        """写入 Key（按提供商分槽）；传空值表示清除该槽。返回实际使用的存储后端。"""
+        prov = provider or "deepseek"
+        kr_user = KEYRING_USER_GLM if prov == "glm" else KEYRING_USER
         value = (value or "").strip()
         kr = self._keyring()
         if kr is not None:
             try:
                 if value:
-                    kr.set_password(KEYRING_SERVICE, KEYRING_USER, value)
+                    kr.set_password(KEYRING_SERVICE, kr_user, value)
                 else:
                     try:
-                        kr.delete_password(KEYRING_SERVICE, KEYRING_USER)
+                        kr.delete_password(KEYRING_SERVICE, kr_user)
                     except Exception:  # noqa: BLE001 - 不存在即视为已清除
                         pass
-                self._clear_file()
-                self._backend = "credential_manager"
-                return self._backend
+                self._clear_file(prov)
+                return self._remember(prov, "credential_manager")
             except Exception as exc:  # noqa: BLE001
                 log.warning("写入凭据管理器失败（%s），改用本地文件", exc)
 
-        self._write_file(value)
-        self._backend = "config_file"
-        return self._backend
+        self._write_file(value, prov)
+        return self._remember(prov, "config_file")
 
     @property
     def backend(self) -> str:
-        if self._backend:
-            return self._backend
-        if os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("AIFORGE_API_KEY"):
+        return self.backend_for()
+
+    def backend_for(self, provider: str | None = None) -> str:
+        prov = provider or "deepseek"
+        remembered = self._backend_by_provider.get(prov)
+        if remembered:
+            return remembered
+        if prov == "glm":
+            if os.environ.get("GLM_API_KEY"):
+                return "env"
+        elif os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("AIFORGE_API_KEY"):
             return "env"
         # 探测一次
-        if self._read_file():
+        if self._read_file(prov):
             return "config_file"
         try:
             import keyring
             from keyring.backends import Windows
 
+            kr_user = KEYRING_USER_GLM if prov == "glm" else KEYRING_USER
             if isinstance(keyring.get_keyring(), Windows.WinVaultKeyring):
-                return "credential_manager"
+                if keyring.get_password(KEYRING_SERVICE, kr_user):
+                    return "credential_manager"
         except Exception:  # noqa: BLE001
             pass
         return "config_file"
 
-    # --- 文件后端（受限权限，仅当前用户可读）----------------------------
-    def _read_file(self) -> str | None:
+    # --- 文件后端（受限权限，仅当前用户可读；两把 Key 共存于一个文件）------
+    @staticmethod
+    def _file_key(provider: str) -> str:
+        return "glm_api_key" if provider == "glm" else "deepseek_api_key"
+
+    def _read_file(self, provider: str | None = None) -> str | None:
         try:
             if not self._file.exists():
                 return None
             raw = json.loads(self._file.read_text(encoding=CONFIG_ENCODING))
-            value = raw.get("deepseek_api_key")
+            value = raw.get(self._file_key(provider or "deepseek"))
             return str(value) if value else None
         except (OSError, ValueError, AttributeError):
             return None
 
-    def _write_file(self, value: str) -> None:
-        if not value:
+    def _write_file(self, value: str, provider: str | None = None) -> None:
+        prov = provider or "deepseek"
+        existing: dict = {}
+        if self._file.exists():
+            try:
+                existing = json.loads(self._file.read_text(encoding=CONFIG_ENCODING))
+            except (OSError, ValueError):
+                existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+        if value:
+            existing[self._file_key(prov)] = value
+        else:
+            existing.pop(self._file_key(prov), None)
+        remaining = {k: v for k, v in existing.items() if k != "_comment" and v}
+        if not remaining:
             self._clear_file()
             return
         self._file.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(
-            {"_comment": "本文件仅保存在本机用户目录，不会随软件升级或卸载删除。", "deepseek_api_key": value},
-            ensure_ascii=False,
-            indent=2,
-        )
-        _atomic_write(self._file, payload)
+        existing.setdefault("_comment", "本文件仅保存在本机用户目录，不会随软件升级或卸载删除。")
+        _atomic_write(self._file, json.dumps(existing, ensure_ascii=False, indent=2))
         _harden_permissions(self._file)
 
-    def _clear_file(self) -> None:
-        try:
-            if self._file.exists():
-                self._file.unlink()
-        except OSError:
-            pass
+    def _clear_file(self, provider: str | None = None) -> None:
+        if provider is None:
+            try:
+                if self._file.exists():
+                    self._file.unlink()
+            except OSError:
+                pass
+            return
+        self._write_file("", provider)
 
 
 def _harden_permissions(path: Path) -> None:
@@ -272,14 +383,15 @@ def _harden_permissions(path: Path) -> None:
     try:
         import subprocess
 
+        from .procguard import run as guarded_run  # 与 subprocess 一样局部导入：本模块被很早引用
+
         user = os.environ.get("USERNAME", "")
         if not user:
             return
-        subprocess.run(
+        guarded_run(
             ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F", "SYSTEM:F", "Administrators:F"],
             capture_output=True,
             timeout=15,
-            check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception:  # noqa: BLE001
@@ -355,10 +467,14 @@ class ConfigStore:
     # --- 便捷访问 -------------------------------------------------------
     @property
     def api_key(self) -> str | None:
-        return self.secrets.get()
+        return self.secrets.get(provider_of_base(self.config.api.base_url))
+
+    def api_key_for(self, base_url: str) -> str | None:
+        """混合模式用：按给定 base_url 取对应提供商的 Key。"""
+        return self.secrets.get(provider_of_base(base_url))
 
     def set_api_key(self, value: str | None) -> str:
-        backend = self.secrets.set(value)
+        backend = self.secrets.set(value, provider_of_base(self.config.api.base_url))
         return backend
 
     @staticmethod
@@ -384,7 +500,3 @@ def store(refresh: bool = False) -> ConfigStore:
         paths(refresh=refresh)
         _store = ConfigStore()
     return _store
-
-
-def app_title() -> str:
-    return APP_NAME

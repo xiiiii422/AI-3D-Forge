@@ -50,13 +50,25 @@ function boxQuads(x0, y0, z0, x1, y1, z1) {
   ];
 }
 
-/** 三角形集合 → 二进制 STL Buffer */
+/**
+ * mock 的几何用 Y 向上书写（画 box/圆柱直观），但真实交付的 STL 是 OpenSCAD 口径的
+ * **Z 向上**（本机 8 个真实项目实测：min.z ≈ 0、z 跨度 = 总高）。
+ * 出文件与算度量都走同一个映射，否则预览的轴向语义在 mock 与真实环境里不一致，
+ * 验收会放过「模型躺倒」「高标到深度轴」这类错 —— 实测就真的一直没看出来。
+ * (x, y, z) → (x, -z, y) 是纯旋转（行列式 +1），不会镜像几何。
+ */
+const toZUp = (p) => [p[0], -p[2], p[1]];
+
+/** 三角形集合 → 二进制 STL Buffer（输出 Z 向上，与 OpenSCAD 一致） */
 function trianglesToStl(triangles) {
   const buffer = Buffer.alloc(84 + triangles.length * 50);
   buffer.write('AI 3D Forge mock model (binary STL)', 0, 80, 'ascii');
   buffer.writeUInt32LE(triangles.length, 80);
   let offset = 84;
-  for (const [p0, p1, p2] of triangles) {
+  for (const [q0, q1, q2] of triangles) {
+    const p0 = toZUp(q0);
+    const p1 = toZUp(q1);
+    const p2 = toZUp(q2);
     // 法线
     const ux = p1[0] - p0[0];
     const uy = p1[1] - p0[1];
@@ -87,12 +99,16 @@ function trianglesToStl(triangles) {
   return buffer;
 }
 
-/** 由三角形集合算尺寸与体积（mm / mm³） */
+/** 由三角形集合算尺寸、体积与表面积（mm / mm³ / mm²）；轴序与写出的 STL 一致（Z 向上） */
 function measure(triangles) {
   const min = [Infinity, Infinity, Infinity];
   const max = [-Infinity, -Infinity, -Infinity];
   let volume = 0;
-  for (const [p0, p1, p2] of triangles) {
+  let area = 0;
+  for (const [qp0, qp1, qp2] of triangles) {
+    const p0 = toZUp(qp0);
+    const p1 = toZUp(qp1);
+    const p2 = toZUp(qp2);
     for (const p of [p0, p1, p2]) {
       for (let i = 0; i < 3; i += 1) {
         if (p[i] < min[i]) min[i] = p[i];
@@ -104,10 +120,23 @@ function measure(triangles) {
         p0[1] * (p1[0] * p2[2] - p1[2] * p2[0]) +
         p0[2] * (p1[0] * p2[1] - p1[1] * p2[0])) /
       6;
+    // 三角形面积 = ½|AB × AC|（耗材估算要的是真实表面积，不能用包围盒糊）
+    const ux = p1[0] - p0[0];
+    const uy = p1[1] - p0[1];
+    const uz = p1[2] - p0[2];
+    const vx = p2[0] - p0[0];
+    const vy = p2[1] - p0[1];
+    const vz = p2[2] - p0[2];
+    area +=
+      0.5 *
+      Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
   }
   return {
     bbox: { x: max[0] - min[0], y: max[1] - min[1], z: max[2] - min[2] },
+    bbox_min: min.map((v) => Number(v.toFixed(2))),
+    bbox_max: max.map((v) => Number(v.toFixed(2))),
     volume_mm3: Math.abs(volume),
+    surface_area_mm2: area,
     triangles: triangles.length,
   };
 }
@@ -206,12 +235,19 @@ function storageBox(p) {
 }
 
 const PARAM_DEFS = {
+  // 参数表照真实项目写：除了外形尺寸，还有穿线孔、挡边高度、圆角、防滑柱数量……
+  // 正好覆盖分栏的五个类别，验收脚本要靠它验证分栏（真实项目里参数最多的
+  // 也是这个「桌面手机支架」：16 个）。
   phone_stand: [
     { name: 'width', label: '宽度', value: 80, unit: 'mm', min: 40, max: 200 },
     { name: 'height', label: '高度', value: 100, unit: 'mm', min: 50, max: 260 },
     { name: 'depth', label: '底座深度', value: 70, unit: 'mm', min: 40, max: 180 },
-    { name: 'thickness', label: '板厚', value: 5, unit: 'mm', min: 2, max: 15 },
+    { name: 'lip_height', label: '前挡边高度', value: 12, unit: 'mm', min: 6, max: 30 },
     { name: 'angle', label: '倾角', value: 65, unit: '°', min: 30, max: 85 },
+    { name: 'thickness', label: '板厚', value: 5, unit: 'mm', min: 2, max: 15 },
+    { name: 'cable_hole_diameter', label: '穿线孔直径', value: 8, unit: 'mm', min: 4, max: 20 },
+    { name: 'fillet_radius', label: '圆角半径', value: 2, unit: 'mm', min: 0, max: 8 },
+    { name: 'grip_post_count', label: '防滑柱数量', value: 6, unit: '个', min: 2, max: 12 },
   ],
   flower_pot: [
     { name: 'diameter', label: '外径', value: 80, unit: 'mm', min: 30, max: 300 },
@@ -232,6 +268,112 @@ const KINDS = {
   flower_pot: { build: flowerPot, title: '多肉花盆', summary: '直筒花盆，壁厚均匀、底部带排水面，适合多肉与小型绿植。' },
   storage_box: { build: storageBox, title: '收纳盒', summary: '无盖收纳盒，四壁等厚、底面平整，可直接打印或加装盖子。' },
 };
+
+// 由 aiforge.threemf 生成的合法 3MF（10×20×30 长方体，声明 unit=millimeter），
+// 用于 mock 的 /api/projects/{id}/3mf —— 保证验收脚本拿到的是真能解开的包。
+const MOCK_3MF_B64 =
+  'UEsDBBQAAAAIAEyzM13uVq7YxwAAAEYBAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbIWQTWrDMBCF9z6F0DbYchMopdjOoklPkB5gkMc/RBoJaRzS22ectBQKpcvH++Z9MM3+6p26YMpzoFY/VbVWSDb0M42t/ji9ly963xXN6TNiVsJSbvXEHF+NyXZCD7kKEUmaISQPLDGNJoI9w4hmW9fPxgZiJC553dBdoVRzwAEWx+p4leahTuiyVm8PdtW1GmJ0swWW3lyo/yUqvySVXN6ZPM0xbwTQ5i+JDz26fyz+Z3nXe6BlAMtLkoeUkteBb0dj7m/pihtQSwMEFAAAAAgATLMzXdMqNku1AAAACAEAAAsAAABfcmVscy8ucmVsc2WPzQrCQAyE732KJXeb1oKIdOtFBK9SH2DZpj/Y/WF3FX17oyBYvARCMt/M1PuHmcWdQpyclVDmBQiy2nWTHSRc2uNqC/smq880q8QvcZx8FKyxUcKYkt8hRj2SUTF3nixfeheMSryGAb3SVzUQrotig+GXAU0mxAIrWhUGShKwOmDVGdfRnH8miFMngeUcrn16+nM2kw4uuj7l2pm3Vtlbr3S6Ba7B5mWFRfllAnIfXBRqshdQSwMEFAAAAAgATLMzXVIyyDB3AQAAugQAABAAAAAzRC8zZG1vZGVsLm1vZGVspZTLboMwEEX3/QrL+2AeeVQREHXTVStVavIBjpk0bv2IjEFJv742jlRQgpoqbLjAmZlrzCVfHaVALZiaa1XgJIoxAsV0xdVHgTfr58kjXpUPudQVCNQobgssuRBcggWDkateCupZUJPNe3dD1QXeW3tYElKzPUhaR5Izo2u9sxHTkmSVpKrZUWYb4+YQpg2QNE5mJE6xG2ag1o1hUDutt5/ALOKVM4eRPR3AGfBmMFJUdhfsyxdJqPfu5JZieSj1Eo7oWOA4iv2B0amnv381GdDJHXj6N38H3qez/7q5peAG/rb+pLcP1nD3hYiBRm3iWmHUpt2+tplr1hVeA9IAZJfANACzAMxHgUUAZqMjsgAsRoFzh+klkARgPjoiGZgcX+Z0dBXxYERyCWSDF3XFQzbwEJZJ+htDzvkhIXBe9WPo4k4ramlPnvO35lYALn0MfZMx7JW6/wWnApdvL08DsK+3DRdVmXMLEgUjIfikzEl45nkf//IHUEsBAhQAFAAAAAgATLMzXe5WrtjHAAAARgEAABMAAAAAAAAAAAAAAIABAAAAAFtDb250ZW50X1R5cGVzXS54bWxQSwECFAAUAAAACABMszNd0yo2S7UAAAAIAQAACwAAAAAAAAAAAAAAgAH4AAAAX3JlbHMvLnJlbHNQSwECFAAUAAAACABMszNdUjLIMHcBAAC6BAAAEAAAAAAAAAAAAAAAgAHWAQAAM0QvM2Rtb2RlbC5tb2RlbFBLBQYAAAAAAwADALgAAAB7AwAAAAA=';
+
+/** mock 内置一台通用 FDM，供 /api/printers* 返回（前端机型胶囊/设置页需要） */
+const MOCK_PRINTER = {
+  id: 'generic-fdm-220',
+  name: '通用 FDM 打印机 220×220×250',
+  manufacturer: 'Generic',
+  nozzle_mm: 0.4,
+  build_x: 220,
+  build_y: 220,
+  build_z: 250,
+  build_volume_mm: { x: 220, y: 220, z: 250, volume_cm3: 12.1 },
+  nozzle_options: [0.4, 0.6],
+  layer_min_mm: 0.08,
+  layer_max_mm: 0.32,
+  max_speed_mm_s: 150,
+  max_accel_mm_s2: 2000,
+  max_flow_mm3_s: 12,
+  has_heated_bed: true,
+  max_bed_temp_c: 100,
+  max_hotend_temp_c: 260,
+  enclosure: false,
+  materials: ['PLA', 'PETG', 'TPU'],
+  filament_diameter_mm: 1.75,
+  extruder: 'direct',
+  bed_leveling: 'abl',
+  bed_surface: 'PEI',
+  kinematics: 'cartesian',
+  recommended_max_overhang_deg: 45,
+  recommended_max_bridge_mm: 10,
+  dimensional_tolerance_mm: 0.2,
+  notes: 'mock 内置机型',
+  builtin: true,
+  sources: '经验值',
+  updated_at: '',
+  constraints: {
+    min_wall_mm: 1.2,
+    min_hole_mm: 0.8,
+    min_feature_mm: 0.8,
+    max_overhang_deg: 45,
+    max_bridge_mm: 10,
+    min_layer_mm: 0.08,
+    max_layer_mm: 0.32,
+  },
+  checklist: ['壁厚 ≥1.2mm', '孔径 ≥0.8mm', '悬垂 ≤45°'],
+  recommended_fn_examples: { '50mm': 96, '150mm': 128 },
+};
+
+/**
+ * 切片软件：形状严格照 src/aiforge/slicers.py 的 describe()。
+ * 两条数据就是本机实测结果（Bambu Studio 来自「已安装程序」的 DisplayIcon、
+ * OrcaSlicer 来自「常见安装目录」，文件关联那一条在本机是空的）——
+ * mock 不编“更干净”的样子，否则界面验出来的是假环境里才有的布局。
+ * MOCK_SLICERS=none 起一台“什么都没装”的机器，用来验负分支。
+ */
+const MOCK_SLICER_NAMES = [
+  'Bambu Studio',
+  'OrcaSlicer',
+  'PrusaSlicer',
+  'UltiMaker Cura',
+  'SuperSlicer',
+  'Creality Print',
+  'ElegooSlicer',
+  'Anycubic Slicer',
+  'CHITUBOX',
+  'Lychee Slicer',
+];
+
+const slicerState = {
+  none: process.env.MOCK_SLICERS === 'none',
+  found: [
+    {
+      id: 'bambu_studio',
+      name: 'Bambu Studio',
+      exe: 'D:\\Bambu Studio\\bambu-studio.exe',
+      version: '02.08.02.61',
+      source_label: '已安装程序',
+      running: false,
+    },
+    {
+      id: 'orcaslicer',
+      name: 'OrcaSlicer',
+      exe: 'D:\\orcaslicer\\orca-slicer.exe',
+      version: null,
+      source_label: '常见安装目录',
+      running: false,
+    },
+  ],
+};
+
+function slicersDescribe() {
+  const items = slicerState.none ? [] : slicerState.found;
+  const wanted = state.settings.default_slicer;
+  // 与真后端同一道把关：记过的软件没检测到时回到「没有默认」，而不是发一个幽灵 id
+  const defaultId = wanted && items.some((s) => s.id === wanted) ? wanted : null;
+  return {
+    slicers: items,
+    default_id: defaultId,
+    count: items.length,
+    recognized_names: MOCK_SLICER_NAMES,
+  };
+}
 
 function buildModel(kind, params) {
   const def = KINDS[kind] ? kind : 'phone_stand';
@@ -269,6 +411,10 @@ function parseScadParams(scad) {
 const state = {
   /** 修改类作业的核对结论：ok=改得干净 / bad=没改到位还顺手改坏别处 */
   verdictKind: process.env.MOCK_VERDICT === 'bad' ? 'bad' : 'ok',
+  /** 「送到切片软件」的返回场景：ok / forwarded / failed / none（错误分支靠它验） */
+  slicerScenario: 'ok',
+  /** 这台机器有没有 WebView2：默认没（否则页面顶部那条回退横幅永远验不到） */
+  windowRuntimeInstalled: false,
   settings: {
     api_key_set: false,
     api_key_masked: null,
@@ -278,12 +424,21 @@ const state = {
     openscad_path: null,
     data_dir: 'C:\\Users\\dev\\AppData\\Roaming\\AI-3D-Forge',
     projects_dir: 'C:\\Users\\dev\\Documents\\AI-3D-Forge\\Projects',
+    // 日志与配置不同目录（漫游 vs 可重建），设置页「文件位置」要显出来
+    log_dir: 'C:\\Users\\dev\\AppData\\Local\\AI-3D-Forge\\logs',
     keep_stl_history: true,
     auto_install_openscad: true,
     first_run_done: !FIRST_RUN,
     theme: 'light',
+    // 与真后端同一套默认值与约束（见 src/aiforge/config.py）：
+    // 假后端不镜像校验，界面就只能验出「自己骗自己」的绿灯。
+    appearance: 'solid',
+    glass_transparency: 25,
     confirm_spec: true,
     announce_in_chat: true,
+    // 送到切片软件：只存 id，路径每次实扫（与 config.py 的 SlicerSettings 一致）
+    default_slicer: null,
+    slicer_custom_paths: [],
   },
   openscad: {
     found: false,
@@ -336,8 +491,126 @@ function getModel(project) {
   return entry;
 }
 
-function projectSummary(p) {
+/** 材料密度表（与 src/aiforge/printers.py 的 MATERIAL_DENSITY 同一组数字） */
+const MATERIAL_DENSITY = { PLA: 1.24, 'PLA-CF': 1.21, PETG: 1.27, ABS: 1.04, ASA: 1.07, TPU: 1.21, PA: 1.14 };
+
+/**
+ * 耗材用量估算，算法照 src/aiforge/mesh.py::estimate_usage：
+ *   外壳体积 ≈ 表面积 × 壁厚（壁厚 = 墙圈数 × 走线宽度），内部按填充率。
+ *
+ * 为什么 mock 必须自己算一份：假后端此前根本不产 usage，
+ * 「预计耗材」那一整块界面在验收里永远不出现（实测：重开项目时结果卡
+ * 只显示 0.0 × 0.0 × 0.0 / 0 B，就是因为 /metrics 这条路 mock 没有）。
+ */
+function estimateUsage(
+  metrics,
+  {
+    material = 'PLA',
+    wallLines = 2,
+    lineWidth = 0.4,
+    infillPct = 15,
+    filamentDiameter = 1.75,
+  } = {},
+) {
+  const density = Math.max(0.01, MATERIAL_DENSITY[material] ?? 1.24);
+  const solidCm3 = metrics.volume_mm3 / 1000.0;
+  const shellThickness = Math.max(0, wallLines * lineWidth);
+  const shellCm3 = Math.min((metrics.surface_area_mm2 * shellThickness) / 1000.0, solidCm3);
+  const coreCm3 = Math.max(0, solidCm3 - shellCm3);
+  const printedCm3 = shellCm3 + coreCm3 * Math.min(1, Math.max(0, infillPct / 100.0));
+  // mock 的两个夹具都没有悬垂（花盆直壁、支架靠背自支撑），支撑量按 0 算
+  const supportCm3 = 0;
+  const supportPrintedCm3 = 0;
+  const crossSection = Math.PI * (filamentDiameter / 2) ** 2;
+  const totalCm3 = printedCm3 + supportPrintedCm3;
+  const grams = totalCm3 * density;
+  const r = (v, n) => Number(v.toFixed(n));
+  const notes = [
+    `按「${wallLines} 层墙 × ${lineWidth}mm 走线 + ${infillPct}% 填充」估算；换切片参数会变。`,
+    '支撑量由悬垂面往下打射线量到下方表面得到，仍是偏大的上界，不是切片精确值。',
+    '该朝向不需要支撑。',
+  ];
+  if (solidCm3 > 0 && printedCm3 / solidCm3 < 0.35) {
+    const pct = ((printedCm3 / solidCm3) * 100).toFixed(0);
+    notes.push(`实体等效体积为 ${solidCm3.toFixed(1)}cm³，按填充估算约为它的 ${pct}%。`);
+  }
+  return {
+    material,
+    density_g_cm3: r(density, 3),
+    model_solid_cm3: r(solidCm3, 2),
+    model_printed_cm3: r(printedCm3, 2),
+    model_grams: r(printedCm3 * density, 1),
+    support_cm3: r(supportCm3, 2),
+    support_grams: r(supportPrintedCm3 * density, 1),
+    total_grams: r(grams, 1),
+    // 上限按实体等效（100% 填充）——备料用这个，与后端口径一致
+    total_grams_upper: r((solidCm3 + supportPrintedCm3) * density, 1),
+    filament_length_m: crossSection ? r((totalCm3 * 1000.0) / crossSection / 1000.0, 2) : 0,
+    support_ratio_pct: solidCm3 > 0 ? r((supportCm3 / solidCm3) * 100, 1) : 0,
+    filament_diameter_mm: filamentDiameter,
+    assumptions: { wall_lines: wallLines, line_width_mm: lineWidth, infill_pct: infillPct },
+    notes,
+  };
+}
+
+/**
+ * GET /api/projects/{id}/metrics 的载荷。
+ *
+ * 真实后端由 api/projects_routes.py 现场分析 STL 得出，形状是
+ * MeshMetrics.to_dict() + size_bytes / material / requirement_tests。
+ * 这条路 mock 之前完全没有，导致「重开历史项目 → 合成结果卡」整条路径
+ * 测不到，界面上就是一堆 0。
+ */
+function projectMetricsPayload(p) {
   const model = getModel(p);
+  const bbox = model.metrics.bbox;
+  const thin = Math.min(...Object.values(p.params).filter((v) => v > 0 && v < 40));
+  const usage = estimateUsage(model.metrics);
+  return {
+    triangles: model.metrics.triangles,
+    vertices: model.metrics.triangles * 3,
+    bbox: {
+      x: Number(bbox.x.toFixed(2)),
+      y: Number(bbox.y.toFixed(2)),
+      z: Number(bbox.z.toFixed(2)),
+    },
+    bbox_min: model.metrics.bbox_min,
+    bbox_max: model.metrics.bbox_max,
+    volume_mm3: Number(model.metrics.volume_mm3.toFixed(2)),
+    volume_cm3: Number((model.metrics.volume_mm3 / 1000).toFixed(3)),
+    surface_area_mm2: Number(model.metrics.surface_area_mm2.toFixed(2)),
+    watertight: true,
+    watertight_ratio: 1,
+    boundary_edges: 0,
+    non_manifold_edges: 0,
+    degenerate_triangles: 0,
+    sits_on_plate: Math.abs(model.metrics.bbox_min[2]) < 0.05,
+    solid_parts: 1,
+    stray_parts: 0,
+    stray_details: [],
+    cavity_islands: [],
+    wall: null,
+    hole_diameter_mm: null,
+    hole_profile: [],
+    support: null,
+    orientation_hint: null,
+    usage,
+    issues: [],
+    // 以下这几项是 /metrics 路由从文件与缓存里补的（MeshMetrics 本身不含）
+    size_bytes: model.stl.length,
+    material: usage.material,
+    material_density: usage.density_g_cm3,
+    within_build_volume:
+      bbox.x <= MOCK_PRINTER.build_x + 0.01 &&
+      bbox.y <= MOCK_PRINTER.build_y + 0.01 &&
+      bbox.z <= MOCK_PRINTER.build_z + 0.01,
+    min_dimension_mm: Number(thin.toFixed(2)),
+    meets_min_wall: thin >= 1.2,
+    requirement_tests: requirementTests(p, bbox, thin, model.metrics.triangles),
+  };
+}
+
+function projectSummary(p) {
   return {
     id: p.id,
     name: p.name,
@@ -370,6 +643,113 @@ function projectDetail(p) {
       stl_path: `${state.settings.projects_dir}\\${p.name}\\model.stl`,
       export_dir: `${state.settings.projects_dir}\\${p.name}\\exports`,
     },
+    // 真实后端的项目详情里带着上次实测数据（重开项目时的耗材估算只认这一项）
+    metrics: projectMetricsPayload(p),
+  };
+}
+
+/**
+ * 需求核对表（形状与 src/aiforge/reqtests.py 逐字段一致）。
+ *
+ * mock 必须也产这份数据：界面只有拿到 requirement_tests 才渲染那一块，
+ * 假后端不产它，界面验收就永远测不到这条路径（真后端跑一次既慢又花钱）。
+ */
+function requirementTests(project, bbox, thin, triangles) {
+  const wallMin = 1.2;
+  const dim = (group, name, want, got) => {
+    const dev = want ? ((got - want) / want) * 100 : 0;
+    const tol = Math.max(wallMin / 5, want * 0.02);
+    return {
+      group: `dim:${name}`,
+      requirement: `${group}（实测）`,
+      kind: 'dimension',
+      status: Math.abs(got - want) <= tol ? 'pass' : 'fail',
+      expected: `${want}mm`,
+      actual: `${Number(got.toFixed(1))}mm`,
+      deviation_pct: Number(dev.toFixed(2)),
+      tolerance_mm: Number(tol.toFixed(2)),
+      fix_hint: Math.abs(got - want) <= tol ? '' : '让该尺寸直接由对应参数决定，不要只写某一段的高度。',
+      advisory: false,
+    };
+  };
+  const tests = [
+    {
+      group: 'integrity:one-body',
+      requirement: '模型是一整件（不需要自己拼）',
+      kind: 'integrity',
+      status: 'pass',
+      expected: '1 个实体',
+      actual: '1 个实体（散件 0 个）',
+      deviation_pct: null,
+      tolerance_mm: null,
+      fix_hint: '',
+      advisory: false,
+    },
+    {
+      group: 'integrity:watertight',
+      requirement: '网格封闭（切片软件能判断内外）',
+      kind: 'integrity',
+      status: 'pass',
+      expected: '封闭、开放边 ≤10 条',
+      actual: '封闭=是，开放边 0 条',
+      deviation_pct: null,
+      tolerance_mm: null,
+      fix_hint: '',
+      advisory: false,
+    },
+    dim('总高', 'height', Number(project.params.height) || Number(bbox.z) || 0, Number(bbox.z) || 0),
+    {
+      group: 'print:min-wall',
+      requirement: `壁厚 ≥${wallMin}mm`,
+      kind: 'print',
+      status: thin < wallMin ? 'fail' : 'pass',
+      expected: `≥${wallMin}mm`,
+      actual: `p05 ${Number(thin.toFixed(2))}mm`,
+      deviation_pct: null,
+      tolerance_mm: null,
+      fix_hint: thin < wallMin ? '加厚壁或加筋；壁厚由那个参数决定。' : '',
+      advisory: true,
+    },
+    {
+      group: 'print:triangle-budget',
+      requirement: '面数在切片软件舒服的范围',
+      kind: 'print',
+      status: 'pass',
+      expected: '≤400000 三角面',
+      actual: `${(triangles ?? 0).toLocaleString('zh-CN')} 三角面`,
+      deviation_pct: null,
+      tolerance_mm: null,
+      fix_hint: '',
+      advisory: true,
+    },
+    {
+      group: 'semantic:feature-1',
+      requirement: '结构符合需求描述（如把手、孔位）',
+      kind: 'semantic',
+      status: 'manual',
+      expected: '结构存在且位置正确',
+      actual: '程序无法测量，已由外观复核/人工确认',
+      deviation_pct: null,
+      tolerance_mm: null,
+      fix_hint: '',
+      advisory: false,
+    },
+  ];
+  const scored = tests.filter((t) => t.status !== 'manual');
+  const groups = new Set(scored.map((t) => t.group));
+  const badGroups = new Set(scored.filter((t) => t.status !== 'pass').map((t) => t.group));
+  const counts = tests.reduce(
+    (acc, t) => ({ ...acc, [t.status]: (acc[t.status] || 0) + 1 }),
+    { pass: 0, fail: 0, invalid: 0, manual: 0 },
+  );
+  return {
+    pass_rate: badGroups.size === 0 ? 1 : 0,
+    requirement_score: groups.size ? Number(((groups.size - badGroups.size) / groups.size).toFixed(4)) : 1,
+    invalid_ratio: 0,
+    counts,
+    groups: groups.size,
+    manual: counts.manual || 0,
+    tests,
   };
 }
 
@@ -381,6 +761,7 @@ function jobResult(project, job) {
   }));
   const bbox = model.metrics.bbox;
   const thin = Math.min(...Object.values(project.params).filter((v) => v > 0 && v < 40));
+  const usage = estimateUsage(model.metrics);
   const issues = [];
   if (project.kind === 'phone_stand') {
     issues.push({
@@ -432,6 +813,18 @@ function jobResult(project, job) {
       bbox_mm: bbox,
       watertight: true,
       watertight_ratio: 1,
+      /* 契约 §3A：作业结果里的 stl 必须带这一组打印机相关字段。
+         之前 mock 只给前 9 项，「预计耗材」「能不能放进这台机器」在
+         假后端下根本没数据可渲染，这两块界面从来没被验收跑过。 */
+      material: usage.material,
+      material_density: usage.density_g_cm3,
+      within_build_volume:
+        bbox.x <= MOCK_PRINTER.build_x + 0.01 &&
+        bbox.y <= MOCK_PRINTER.build_y + 0.01 &&
+        bbox.z <= MOCK_PRINTER.build_z + 0.01,
+      min_dimension_mm: Number(thin.toFixed(2)),
+      meets_min_wall: thin >= 1.2,
+      usage,
     },
     printability: {
       score,
@@ -443,6 +836,8 @@ function jobResult(project, job) {
       issues,
       metrics_note: `最小特征尺寸约 ${thin.toFixed(1)}mm，建议喷嘴 0.4mm、层高 0.2mm。`,
     },
+    // 逐条需求核对（真实后端由 aiforge/reqtests.py 产出，mock 必须同形状）
+    requirement_tests: requirementTests(project, bbox, thin, model.metrics.triangles),
     diagnostics: [
       `引擎: OpenSCAD ${state.openscad.version ?? '2021.01'}`,
       `编译: 成功（${(model.metrics.triangles / 100).toFixed(0)} 个面片）`,
@@ -541,11 +936,11 @@ function mockSpec(project) {
   // project.params 是「参数名 → 值」的对象（与真实后端一致），不是数组
   const bag = project.params || {};
   const value = (name) => (typeof bag[name] === 'number' ? bag[name] : null);
-  const item = (name, label, given) => ({
+  const item = (name, label, given, unit = 'mm') => ({
     name,
     label,
     value: value(name),
-    unit: 'mm',
+    unit,
     min: 20,
     max: 300,
     user_specified: given,
@@ -558,7 +953,7 @@ function mockSpec(project) {
       item('height', '支架高度', true),
       item('width', '底座宽度', true),
       item('thickness', '底座厚度', false),
-      item('angle', '屏幕倾角', false),
+      item('angle', '屏幕倾角', false, '°'),
     ],
     features: ['背部挡板', '前唇防滑', '底部平整可站立'],
     prohibitions: ['不要镂空底座'],
@@ -890,12 +1285,40 @@ const server = http.createServer(async (req, res) => {
     if (path === '/api/app/health') {
       return sendJson(res, 200, { ok: true, version: '1.0.0', uptime_s: process.uptime() });
     }
+    /* 缺 WebView2 的那台机器长什么样：用户手册 §2.2 承诺的「顶部说明 + 一键安装」
+       全靠这两条才能验（真实开发机装了 WebView2，横幅分支永远跑不到）。 */
+    if (path === '/api/app/window-runtime' && method === 'GET') {
+      const on = state.windowRuntimeInstalled;
+      return sendJson(res, 200, {
+        installed: on,
+        version: on ? '150.0.4078.65' : null,
+        source: on ? 'registry' : 'none',
+        detail: on
+          ? '原生窗口可用。'
+          : '这台电脑缺少微软的 WebView2 运行时，软件改用系统浏览器打开界面。',
+        install_hint: on ? '' : '点「一键安装」会走系统自带的 winget；也可以自己到微软官网下载。',
+        download_url: 'https://developer.microsoft.com/microsoft-edge/webview2/',
+        bootstrapper_url: 'https://go.microsoft.com/fwlink/p/?LinkId=2124703',
+      });
+    }
+    if (path === '/api/app/window-runtime/install' && method === 'POST') {
+      state.windowRuntimeInstalled = true;
+      return sendJson(res, 200, { ok: true, message: 'WebView2 运行时已安装完成。' });
+    }
     // 仅供体检脚本使用：切换修改类作业的核对结论（ok / bad）
     if (path === '/api/mock/verdict' && method === 'POST') {
       const body = await readBody(req);
       state.verdictKind = body.kind === 'bad' ? 'bad' : 'ok';
       console.log(`   [mock] 核对结论切换为 ${state.verdictKind}`);
       return sendJson(res, 200, { ok: true, kind: state.verdictKind });
+    }
+    // 仅供体检脚本使用：切换「送到切片软件」的返回场景（ok / forwarded / failed / none）
+    if (path === '/api/mock/slicer' && method === 'POST') {
+      const body = await readBody(req);
+      const allowed = ['ok', 'forwarded', 'failed', 'none'];
+      state.slicerScenario = allowed.includes(body.scenario) ? body.scenario : 'ok';
+      console.log(`   [mock] 送出场景切换为 ${state.slicerScenario}`);
+      return sendJson(res, 200, { ok: true, scenario: state.slicerScenario });
     }
     if (path === '/api/app/open-folder' && method === 'POST') {
       const body = await readBody(req);
@@ -1214,6 +1637,35 @@ const server = http.createServer(async (req, res) => {
       for (const field of ['base_url', 'model', 'keep_stl_history', 'auto_install_openscad', 'theme', 'openscad_path']) {
         if (field in body) state.settings[field] = body[field];
       }
+      if (body.appearance === 'solid' || body.appearance === 'glass') {
+        state.settings.appearance = body.appearance;
+      }
+      if (body.glass_transparency !== undefined && body.glass_transparency !== null) {
+        const raw = Number(body.glass_transparency);
+        state.settings.glass_transparency = Number.isFinite(raw)
+          ? Math.max(0, Math.min(60, Math.round(raw)))
+          : 25;
+      }
+      // 默认切片软件：照真后端同样把关（只认现在检测得到的 id，"" = 清空），
+      // 否则前端验不出“选了个存不住的幽灵 id”这条错误分支。
+      if ('default_slicer' in body) {
+        const wanted = String(body.default_slicer ?? '').trim();
+        if (!wanted) {
+          state.settings.default_slicer = null;
+        } else if (!slicersDescribe().slicers.some((s) => s.id === wanted)) {
+          return sendError(res, 409, '这个切片软件当前没检测到。', 'SLICER_NOT_FOUND', '重新检测一次，或换个目标。');
+        } else {
+          state.settings.default_slicer = wanted;
+        }
+      }
+      if (Array.isArray(body.slicer_custom_paths)) {
+        const cleaned = [];
+        for (const raw of body.slicer_custom_paths) {
+          const text = String(raw ?? '').trim();
+          if (text && !cleaned.includes(text)) cleaned.push(text);
+        }
+        state.settings.slicer_custom_paths = cleaned;
+      }
       return sendJson(res, 200, state.settings);
     }
     if (path === '/api/settings/api-key/test' && method === 'POST') {
@@ -1241,6 +1693,133 @@ const server = http.createServer(async (req, res) => {
     if (path === '/api/settings/first-run/complete' && method === 'POST') {
       state.settings.first_run_done = true;
       return sendJson(res, 200, { ok: true });
+    }
+    // 下载保存：mock 无原生对话框 → 告知前端退回浏览器下载
+    if (/^\/api\/projects\/[^/]+\/save$/.test(path) && method === 'POST') {
+      return sendJson(res, 200, { status: 'no-dialog' });
+    }
+
+    /* ---------- 3A. 打印机（mock 内置一台通用 FDM） ---------- */
+    if (path === '/api/printers' && method === 'GET') {
+      return sendJson(res, 200, {
+        selected_id: MOCK_PRINTER.id,
+        selected_material: 'PLA',
+        default_id: MOCK_PRINTER.id,
+        materials: MOCK_PRINTER.materials,
+        printers: [MOCK_PRINTER],
+      });
+    }
+    if (path === '/api/printers/selected' && method === 'GET') {
+      return sendJson(res, 200, {
+        printer: MOCK_PRINTER,
+        material: 'PLA',
+        material_options: MOCK_PRINTER.materials,
+        note: '',
+      });
+    }
+    if (path === '/api/printers/select' && method === 'POST') {
+      const body = await readBody(req);
+      return sendJson(res, 200, {
+        printer: MOCK_PRINTER,
+        material: body.material || 'PLA',
+        previous: null,
+      });
+    }
+
+    /* ---------- 4A. 切片软件（送到切片软件） ---------- */
+    if (path === '/api/slicers' && method === 'GET') {
+      return sendJson(res, 200, slicersDescribe());
+    }
+    if (path === '/api/slicers/pick' && method === 'POST') {
+      // mock 没有原生对话框：照“用户选中了一个 exe”的效果假装一次，让 added 分支可验
+      // （与 /api/openscad/browse 同一套做法）。MOCK_SLICER_PICK=0 走 canceled。
+      if (process.env.MOCK_SLICER_PICK === '0') {
+        return sendJson(res, 200, { status: 'canceled', ...slicersDescribe() });
+      }
+      const exe = 'D:\\PrusaSlicer\\prusa-slicer.exe';
+      if (!slicerState.found.some((s) => s.exe === exe)) {
+        slicerState.found.push({
+          id: 'prusa_slicer',
+          name: 'PrusaSlicer',
+          exe,
+          version: null,
+          source_label: '手动指定',
+          running: false,
+        });
+      }
+      if (!state.settings.slicer_custom_paths.includes(exe)) {
+        state.settings.slicer_custom_paths = [...state.settings.slicer_custom_paths, exe];
+      }
+      slicerState.none = false;
+      return sendJson(res, 200, { status: 'added', path: exe, ...slicersDescribe() });
+    }
+    const sendMatch = /^\/api\/projects\/([^/]+)\/send-to-slicer$/.exec(path);
+    if (sendMatch && method === 'POST') {
+      const project = state.projects.find((p) => p.id === sendMatch[1]);
+      if (!project) return sendError(res, 404, '找不到这个项目。', 'INTERNAL', '它可能已经被删除。');
+      const body = await readBody(req).catch(() => ({}));
+      const items = slicerState.none ? [] : slicerState.found;
+      const wanted = String(body.slicer ?? '').trim();
+      const scenario = state.slicerScenario;
+      const target = scenario === 'none' ? null : wanted ? items.find((s) => s.id === wanted) : items[0] ?? null;
+      if (!target) {
+        // 文案照真后端 slicers.resolve()：错误分支要验的就是用户会看到的那一句
+        return sendError(
+          res,
+          409,
+          '没有检测到切片软件。请先安装 Bambu Studio / OrcaSlicer / PrusaSlicer / Cura 其中之一，或在「设置 → 切片软件」里手动指定它的主程序。',
+          'SLICER_NOT_FOUND',
+          '在「设置 → 切片软件」里点「手动指定主程序」也能接上。',
+        );
+      }
+      const file = `C:\\Users\\dev\\Documents\\AI-3D-Forge\\Projects\\${project.id.slice(0, 8)}\\slicer\\${project.name}-r${String(project.revision).padStart(2, '0')}.3mf`;
+      const base = {
+        pid: 41236,
+        detached: true,
+        slicer: target.id,
+        slicer_name: target.name,
+        file,
+        exe: target.exe,
+        kind: '3mf',
+        source_label: target.source_label,
+      };
+      target.running = true;
+      if (scenario === 'failed') {
+        return sendJson(res, 200, {
+          ...base,
+          status: 'failed',
+          detail: `${target.name} 启动后立即退出（退出码 1）`,
+          exit_code: 1,
+        });
+      }
+      if (scenario === 'forwarded') {
+        return sendJson(res, 200, {
+          ...base,
+          status: 'forwarded',
+          detail: `${target.name} 已经在运行，文件已交给它的现有窗口`,
+          exit_code: 0,
+        });
+      }
+      return sendJson(res, 200, {
+        ...base,
+        status: 'started',
+        detail: `已启动 ${target.name}（进程 ${base.pid}）`,
+        exit_code: null,
+      });
+    }
+
+    // 3MF：真实字节（由 src/aiforge/threemf.py 生成的 10×20×30 长方体，12 面/8 顶点），
+    // 用于验收“下载 3MF”按钮不会退成 404。
+    const mfMatch = /^\/api\/projects\/[^/]+\/3mf$/.exec(path);
+    if (mfMatch && method === 'GET') {
+      const buf = Buffer.from(MOCK_3MF_B64, 'base64');
+      res.writeHead(200, {
+        'Content-Type': 'model/3mf',
+        'Content-Length': buf.length,
+        'Content-Disposition': 'attachment; filename="model.3mf"',
+        'Cache-Control': 'no-store',
+      });
+      return res.end(buf);
     }
 
     /* ---------- 4. 项目 ---------- */
@@ -1273,6 +1852,15 @@ const server = http.createServer(async (req, res) => {
         modelCache.delete(project.id);
         return sendJson(res, 200, { ok: true });
       }
+    }
+    /* GET /api/projects/{id}/metrics —— 真实后端会现场重分 STL，
+       前端「重开历史项目时合成结果卡」完全依赖这条路；缺了它，
+       卡片上就是「尺寸 0.0 × 0.0 × 0.0 / 文件大小 0 B」。 */
+    const metricsMatch = /^\/api\/projects\/([^/]+)\/metrics$/.exec(path);
+    if (metricsMatch && method === 'GET') {
+      const project = state.projects.find((p) => p.id === metricsMatch[1]);
+      if (!project) return sendError(res, 404, '找不到这个项目。', 'INTERNAL');
+      return sendJson(res, 200, projectMetricsPayload(project));
     }
     const downloadMatch = /^\/api\/projects\/([^/]+)\/(stl|stl\/raw|scad|thumbnail)$/.exec(path);
     if (downloadMatch) {

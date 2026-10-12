@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -10,9 +11,9 @@ from pydantic import BaseModel, Field
 
 from .. import envcheck
 from .. import openscad as scad_cli
-from ..config import store
+from ..config import APPEARANCES, clamp_glass_transparency, provider_of_base, store
 from ..llm import test_api_key
-from ..paths import APP_SLUG, free_space_gb, paths
+from ..paths import free_space_gb, paths
 from ..version import APP_VERSION, CHANNEL_LABEL
 from .errors import AppError
 
@@ -27,14 +28,24 @@ ALLOWED_EXTERNAL_HOSTS = {
     "www.openscad.org",
     "files.openscad.org",
     "github.com",
+    # 底部作者账号栏（SocialFooter）指向的域名。白名单必须同步加上：
+    # 原生窗口（WebView2）拦截新窗口，前端 window.open 兜底也打不开，
+    # 白名单漏一条的后果是「点了没反应」而不是报错弹窗。
+    # 自检「底部入口链接可达」会逐个 URL 校验这里，防止只改前端不改这里。
+    "douyin.com",
+    "www.douyin.com",
+    "bilibili.com",
+    "www.bilibili.com",
+    "space.bilibili.com",
 }
 
 
 def _serialize() -> dict[str, Any]:
     cfg = store()
     files = paths()
+    prov = provider_of_base(cfg.config.api.base_url)
     key = cfg.api_key
-    backend = cfg.secrets.backend
+    backend = cfg.secrets.backend_for(prov)
     from ..printers import registry as printer_registry
 
     preg = printer_registry()
@@ -43,9 +54,12 @@ def _serialize() -> dict[str, Any]:
 
     # Key 来自环境变量时，界面上的「清除」清不掉它（环境变量不归本软件管）。
     # 与其让用户困惑，不如如实说明来源与办法。
-    env_var = "DEEPSEEK_API_KEY" if os.environ.get("DEEPSEEK_API_KEY") else (
-        "AIFORGE_API_KEY" if os.environ.get("AIFORGE_API_KEY") else None
-    )
+    if prov == "glm":
+        env_var = "GLM_API_KEY" if os.environ.get("GLM_API_KEY") else None
+    else:
+        env_var = "DEEPSEEK_API_KEY" if os.environ.get("DEEPSEEK_API_KEY") else (
+            "AIFORGE_API_KEY" if os.environ.get("AIFORGE_API_KEY") else None
+        )
     note: str | None = None
     if backend == "env" and env_var:
         note = (
@@ -60,23 +74,34 @@ def _serialize() -> dict[str, Any]:
         "api_key_source_note": note,
         "base_url": cfg.config.api.base_url,
         "model": cfg.config.api.model,
+        "economy_model": cfg.config.api.economy_model,
+        "economy_base_url": cfg.config.api.economy_base_url,
         "timeout_s": cfg.config.api.timeout_s,
         "openscad_path": cfg.config.openscad.path,
         "openscad_version": cfg.config.openscad.version,
         "openscad_auto_install": cfg.config.openscad.auto_install,
         "data_dir": str(files.data_dir),
         "projects_dir": str(files.projects_dir),
+        # 日志不在 data_dir（那是漫游的 APPDATA）而在可重建的 LOCALAPPDATA；
+        # 界面要告诉用户日志在哪，就只能把真实路径发过去（它可以被环境变量改）。
+        "log_dir": str(files.log_dir),
         "runtime_dir": str(files.runtime_dir),
         "keep_stl_history": cfg.config.behavior.keep_stl_history,
         "open_in_browser": cfg.config.behavior.open_in_browser,
         "auto_install_openscad": cfg.config.openscad.auto_install,
         "first_run_done": cfg.config.first_run_done,
         "theme": cfg.config.ui.theme,
+        # 界面材质：solid = 实面，glass = 液态玻璃（透明度可调）
+        "appearance": cfg.config.ui.appearance,
+        "glass_transparency": cfg.config.ui.glass_transparency,
         "last_project_id": cfg.config.ui.last_project_id,
         # 目标打印机（生成与检查的基准）
         "printer_id": active_printer.id,
         "printer_name": active_printer.name,
         "printer_material": active_material,
+        # 送到切片软件：只存 id，路径每次实扫（升级换目录不会指旧路）
+        "default_slicer": cfg.config.slicers.default_id,
+        "slicer_custom_paths": list(cfg.config.slicers.custom_paths),
         # 生成流程上的两个「要不要先跟用户对一下」开关
         "announce_in_chat": cfg.config.printer.announce_in_chat,
         "confirm_spec": cfg.config.printer.confirm_spec,
@@ -98,17 +123,25 @@ class SettingsUpdate(BaseModel):
     api_key: str | None = Field(None, description="传入则写入；空字符串表示清除")
     base_url: str | None = None
     model: str | None = None
+    economy_model: str | None = None
+    economy_base_url: str | None = None
     timeout_s: int | None = None
     openscad_path: str | None = None
     keep_stl_history: bool | None = None
     open_in_browser: bool | None = None
     auto_install_openscad: bool | None = None
     theme: str | None = None
+    appearance: str | None = Field(None, description="界面材质：solid（实面）| glass（液态玻璃）")
+    glass_transparency: int | None = Field(
+        None, description="玻璃透明度百分比；后端夹到合法区间（上限受对比度约束）"
+    )
     last_project_id: str | None = None
     printer_id: str | None = None
     printer_material: str | None = None
     announce_in_chat: bool | None = None
     confirm_spec: bool | None = None
+    default_slicer: str | None = Field(None, description='送到切片软件的默认目标 id；"" 表示取消')
+    slicer_custom_paths: list[str] | None = Field(None, description="手动指定的切片软件主程序列表（整表替换）")
 
 
 @router.put("/api/settings")
@@ -127,6 +160,10 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, Any]:
         api_updates["base_url"] = payload.base_url.strip().rstrip("/") or "https://api.deepseek.com"
     if payload.model is not None:
         api_updates["model"] = payload.model.strip() or "deepseek-chat"
+    if payload.economy_model is not None:
+        api_updates["economy_model"] = payload.economy_model.strip()
+    if payload.economy_base_url is not None:
+        api_updates["economy_base_url"] = payload.economy_base_url.strip().rstrip("/")
     if payload.timeout_s is not None:
         api_updates["timeout_s"] = max(30, min(600, payload.timeout_s))
     if api_updates:
@@ -135,8 +172,10 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, Any]:
     if payload.openscad_path is not None:
         path = payload.openscad_path.strip()
         if path and not os.path.isfile(path):
-            from .errors import AppError
-
+            # 这里以前写的是 `from .errors import AppError`（函数内导入），它会把
+            # AppError 变成**整个函数的局部变量**，于是本函数里每一处 raise AppError
+            # 都先撞 UnboundLocalError → 用户只看到一个 500「软件内部出现了意外问题」。
+            # 模块顶部已经导过一次，函数内绝对不要再导。
             raise AppError(
                 "指定的 OpenSCAD 路径不存在。",
                 code="OPENSCAD_MISSING",
@@ -162,6 +201,10 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, Any]:
     ui_updates: dict[str, Any] = {}
     if payload.theme in ("light", "dark", "system"):
         ui_updates["theme"] = payload.theme
+    if payload.appearance in APPEARANCES:
+        ui_updates["appearance"] = payload.appearance
+    if payload.glass_transparency is not None:
+        ui_updates["glass_transparency"] = clamp_glass_transparency(payload.glass_transparency)
     if payload.last_project_id is not None:
         ui_updates["last_project_id"] = payload.last_project_id or None
     if ui_updates:
@@ -192,6 +235,36 @@ async def update_settings(payload: SettingsUpdate) -> dict[str, Any]:
         flow_updates["confirm_spec"] = payload.confirm_spec
     if flow_updates:
         cfg.update("printer", flow_updates)
+
+    # 送到切片软件：默认项必须现在就能在检测结果里找到（存一个将来才出现的 id 没意义，
+    # 那个 id 还会在软件被卸载后变成幽灵默认值）。None = 不改；"" = 清空。
+    if payload.default_slicer is not None:
+        from .. import slicers as slicers_mod
+
+        wanted = payload.default_slicer.strip()
+        if not wanted:
+            cfg.config.slicers.default_id = None
+        elif not any(item.id == wanted for item in await asyncio.to_thread(slicers_mod.scan)):
+            raise AppError(
+                "这个切片软件当前没检测到。",
+                code="SLICER_NOT_FOUND",
+                hint="请先在「设置 → 切片软件」里点「重新检测」。",
+                status_code=409,
+            )
+        else:
+            cfg.config.slicers.default_id = wanted
+        cfg.save()
+
+    if payload.slicer_custom_paths is not None:
+        cleaned: list[str] = []
+        for raw in payload.slicer_custom_paths:
+            text = str(raw).strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+        cfg.update("slicers", {"custom_paths": cleaned})
+        from .. import slicers as slicers_mod
+
+        slicers_mod.invalidate_cache()
 
     cfg.save()
     return _serialize()
@@ -226,48 +299,3 @@ async def complete_first_run() -> dict[str, Any]:
     cfg.save()
     envcheck.invalidate_cache()
     return {"ok": True}
-
-
-@router.post("/api/settings/reset-wizard")
-async def reset_wizard() -> dict[str, Any]:
-    """重新打开首次向导（用于演示或重新配置）。"""
-    cfg = store()
-    cfg.config.first_run_done = False
-    cfg.save()
-    envcheck.invalidate_cache()
-    return {"ok": True}
-
-
-@router.get("/api/settings/storage")
-async def storage_info() -> dict[str, Any]:
-    files = paths()
-    projects = []
-    total = 0
-    try:
-        from .. import projects as projects_mod
-
-        for project in projects_mod.store().list():
-            size = 0
-            try:
-                for item in project.dir.rglob("*"):
-                    if item.is_file():
-                        size += item.stat().st_size
-            except OSError:
-                pass
-            total += size
-            projects.append({"id": project.id, "name": project.name, "size_bytes": size})
-    except OSError:
-        pass
-    return {
-        "data_dir": str(files.data_dir),
-        "projects_dir": str(files.projects_dir),
-        "runtime_dir": str(files.runtime_dir),
-        "log_dir": str(files.log_dir),
-        "projects_total_bytes": total,
-        "projects": projects,
-        "free_gb": {
-            "data": free_space_gb(files.data_dir),
-            "projects": free_space_gb(files.projects_dir),
-        },
-        "note": f"用户数据保存在你的用户目录（{APP_SLUG}），卸载或升级软件都不会删除。",
-    }

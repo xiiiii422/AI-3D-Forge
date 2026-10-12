@@ -150,12 +150,6 @@ async def detect(refresh: bool = True) -> dict[str, Any]:
     return info.to_dict()
 
 
-@router.get("/api/openscad/candidates")
-async def candidates() -> dict[str, Any]:
-    found = await asyncio.to_thread(scad_cli.discover, True)
-    return {"candidates": [c.to_dict() for c in found]}
-
-
 class LocateRequest(BaseModel):
     path: str = Field(..., description="用户选择的 openscad.exe 路径，或包含它的目录")
 
@@ -345,8 +339,3 @@ async def test_cli() -> dict[str, Any]:
         "duration_ms": int(elapsed * 1000),
         "diagnostics": None if ok else "请查看「系统诊断」中的 3D 引擎一项。",
     }
-
-
-@router.get("/api/openscad/manual")
-async def manual() -> dict[str, Any]:
-    return scad_cli.manual_instructions()

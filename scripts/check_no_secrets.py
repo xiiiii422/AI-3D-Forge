@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import console_utf8  # noqa: F401,E402 —— 必须最先导入：GBK 控制台下 print 中文/符号会弄崩脚本（见 src/aiforge/stdio.py）
 import argparse
 import re
 import subprocess
@@ -79,7 +80,19 @@ FORBIDDEN_PATH_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("日志/临时文件", re.compile(r"(?i)\.(log|tmp|bak|pyc|pyo)$")),
     ("安装包 / 压缩产物", re.compile(r"(?i)\.(exe|msi|zip|7z|stl|3mf)$")),
     ("私钥文件", re.compile(r"(?i)\.(pem|p12|pfx|key)$")),
+    # 视频/音频：产品是桌面应用，仓库里没有任何正当理由出现这类文件。
+    # 实测踩到：根目录一个无关文件夹里躺着 43MB 的 mp4，`git add -A` 一次
+    # 就把它写进历史（.gitignore 已补，但守卫是第二道 —— 白名单式的
+    # .gitignore 也会被人手改，而这里的规则没人会顺手删）。
+    ("视频/音频文件", re.compile(r"(?i)\.(mp4|mov|avi|mkv|webm|flv|wmv|m4v)$")),
+    ("音频文件", re.compile(r"(?i)\.(mp3|wav|flac|aac|ogg|m4a)$")),
 ]
+
+# 单个文件的体积上限：仓库里最大的合法文件是 scripts/selfcheck.py（约 400KB），
+# 截图约 150KB。留一倍以上余量取 1MB —— 超它的一定是误入的生成物或媒体。
+# 为什么要这条：.gitignore 是白名单式的，靠人维护；一个漏配的规则就等于
+# 把大文件写进历史，而**历史里的体积删不掉**（改 .gitignore 已经太晚）。
+MAX_TRACKED_BYTES = 1024 * 1024
 
 # 这些「看似违规」的文件是项目自身的一部分
 PATH_ALLOWLIST = (
@@ -97,9 +110,19 @@ def shipped_files() -> list[Path]:
     也能得到正确的集合，而且自动尊重 .gitignore（截图产物、安装包、
     构建目录都不会被误报成"提交了生成物"）。
 
+    `core.quotepath=false` 不是可选项，删掉它这条守卫就成了假绿灯：
+    git 默认把非 ASCII 路径转义成 `"\\346\\226\\207..."` 这样的八进制串，
+    还原出来的 Path 在磁盘上根本不存在 → `is_file()` 为假 → **中文名文件被
+    静默丢掉**。实测踩到：`README-开发者.md`（188 KB）与 `README-用户.md`
+    从来没进过扫描集合，而报告照样打印"已扫描 180 个文本文件"。
+    也就是说，一个写在这两份文件里的真 Key 能一路绿灯发到公开仓库。
+
     没有 git 时退回目录遍历，并显式跳过同一批目录。
     """
-    tracked = _git(["ls-files", "--cached", "--others", "--exclude-standard"], cwd=ROOT)
+    tracked = _git(
+        ["-c", "core.quotepath=false", "ls-files", "--cached", "--others", "--exclude-standard"],
+        cwd=ROOT,
+    )
     if tracked:
         files = []
         for line in tracked.splitlines():
@@ -210,8 +233,51 @@ def scan_paths(quiet: bool) -> list[str]:
                 # webui/scripts/shots 之类由 .gitignore 排除，不属于"被提交"的集合
                 problems.append(f"{rel}: {label} —— 这类文件不该进仓库")
                 break
+        # 体积：历史里的大文件删不掉，所以必须在入库前拦。
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > MAX_TRACKED_BYTES:
+            problems.append(
+                f"{rel}: 单文件 {size / 1024 / 1024:.1f} MB，超过 "
+                f"{MAX_TRACKED_BYTES // 1024 // 1024} MB 上限 —— 不该进仓库"
+            )
     if not quiet:
         print(f"  已检查 {len(files)} 个文件路径")
+    return problems
+
+
+def self_test() -> list[str]:
+    """守卫自己的自检：确认「非 ASCII 文件名」真的进了扫描集合。
+
+    为什么必须写这一条：本脚本是开源前最后一道密钥闸门，而它**曾经**对
+    两份中文名文档完全失明（`core.quotepath` 默认转义成八进制 → 路径在磁盘上
+    不存在 → 被当作"不是文件"跳过）。这类缺陷的特征是**静默**：扫描照样打印
+    "已扫描 N 个文本文件"、结论照样是 NO_SECRET_FOUND，没有任何地方变红。
+
+    所以这里做两件事（阴性在前，防止把合法写法判成错）：
+      1. 阴性对照 —— 转义形式的路径**不该**被当成已存在的文件；
+      2. 阳性对照 —— 仓库里真实存在的中文名文件**必须**出现在扫描集合里。
+    只做第 2 条会误报（万一哪天仓库真的没有中文名文件），
+    只做第 1 条则等于什么都没验 —— 两条都在才叫"验过"。
+    """
+    problems: list[str] = []
+
+    # (1) 阴性：八进制转义路径还原出来在磁盘上不存在，不该混进扫描集合。
+    escaped = '"2\\346\\234\\21020\\346\\227\\245(1)/2\\346\\234\\21020\\346\\227\\245(1).mp4"'
+    if (ROOT / escaped).is_file():
+        problems.append(f"转义路径竟然存在于磁盘上，_git() 的解码假设已变：{escaped}")
+
+    # (2) 阳性：磁盘上真实存在的中文名文件，必须出现在扫描集合里。
+    if not (ROOT / ".git").exists():
+        return problems  # 不是 git 仓库时 shipped_files() 走目录遍历，本来就覆盖得到
+    scanned_names = {p.name for p in shipped_files()}
+    for path in sorted(ROOT.glob("*.md")):
+        if not path.name.isascii() and path.name not in scanned_names:
+            problems.append(
+                f"{path.name}: 中文名文件没进扫描集合（core.quotepath 又变回 true 了？）"
+            )
     return problems
 
 
@@ -269,6 +335,8 @@ def main() -> int:
 
     problems: list[str] = []
     scanned = 0
+    # 扫描器自己的失效必须先报出来：它要是瞎了，后面所有"没发现问题"都没意义。
+    problems.extend(self_test())
     if args.paths_only:
         problems.extend(scan_paths(args.quiet))
     else:

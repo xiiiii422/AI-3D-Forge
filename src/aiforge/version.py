@@ -10,16 +10,20 @@ from datetime import datetime
 from .paths import is_frozen
 
 # 语义化版本：正式发布版
-APP_VERSION = "1.0.0"
+# 1.0.1：修「说改 A 结果什么都没改」的三处根因（规格不跟随、规格名↔源码参数名
+#        无桥、契约把「加个孔」听成「外径加 10mm」）——见 README-开发者.md §72~§74
+# 1.0.2：滤镜转接环可用性与几何兜底、三档使用模式（免费/付费/混合性价比）、
+#        下载改弹保存对话框、对话串台与历史项目无下载按钮修复 —— 见 CHANGELOG.md
+# 1.0.3：小而美一轮：删 38 个死名字与 8 条 /api；修单实例锁两个结构缺陷（「进程号
+#        None」与锁位飘移）、subprocess 解码假通过；被拒时先唤回已有窗口 —— 见 CHANGELOG.md
+APP_VERSION = "1.0.3"
 # 版本阶段：dev=开发版 / beta=测试版 / release=正式发布版
 APP_CHANNEL = os.environ.get("AIFORGE_CHANNEL", "release")
 # 构建号：打包时由 scripts\\build.ps1 写入环境变量，源码运行时回退到时间戳
 BUILD_ID = os.environ.get("AIFORGE_BUILD_ID", "dev-" + datetime.now().strftime("%Y%m%d"))
 
 APP_NAME = "AI 3D Forge"
-APP_NAME_CN = "AI 3D 打印设计工具"
 APP_PUBLISHER = "AI 3D Forge"
-APP_URL = "https://openscad.org/downloads.html"
 
 # 需求第三十三节：Python 版本要求
 REQUIRED_PYTHON = (3, 10)

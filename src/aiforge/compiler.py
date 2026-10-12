@@ -13,14 +13,14 @@ import logging
 import os
 import re
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from . import openscad as scad_cli
 from . import scad as scad_src
-from .mesh import MeshMetrics, StlError, analyze, read_triangles
+from .mesh import MeshMetrics
 
 log = logging.getLogger(__name__)
 
@@ -102,10 +102,119 @@ class CompileResult:
     message: str = ""
     hint: str | None = None
     fatal: str | None = None  # 致命错误原文（给 AI 自动修复用）
+    # 针对这类报错的**可执行改法**（给 AI 修复用，不直接展示给用户）。
+    # 为什么单列：`CGAL error in CGALUtils::applyUnion3D: assertion violation`
+    # 这种原文对 AI 几乎是噪音 —— 实测自动修复拿着它改两轮还是同样的错。
+    # 把它翻译成「共面重合 / 零厚度 / 非流形」三条常见成因与具体改法，
+    # 修复才有方向。
+    advice: str | None = None
     # 「几何被静默丢掉」的警告原文（编译成功也可能非空）。
     # 调用方必须据此提示用户并让 AI 修正 —— 否则会交出一个形状不对、
     # 却显示「生成成功」的模型。
     dropped_geometry: list[str] = field(default_factory=list)
+
+
+# 已知报错 → 可执行改法。键是原文里的特征片段（大小写不敏感）。
+_KNOWN_FAILURES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("cgal error", "cgaltools", "assertion violation"),
+        "这是 CGAL 布尔运算（union/difference/intersection）失败，按出现频率排查：\n"
+        "  1) 两个实体**面完全重合**（例如两个等高的圆柱顶面贴在一起、"
+        "挖孔圆柱的端面与本体端面共面）—— 把相减/相加的实体沿该方向错开 0.01mm；\n"
+        "  2) 零厚度或退化实体（高度为 0 的 linear_extrude、半径为 0 的 cylinder、"
+        "两个相同的实体做 difference）；\n"
+        "  3) 参与布尔的 polyhedron / hull / minkowski 网格自相交或非流形。\n"
+        "改法：给所有 extrude 一个正的高度、把共面的面错开 0.01mm、"
+        "避免用 2D 图形直接参与 3D 布尔。",
+    ),
+    (
+        ("not a valid 2-manifold", "may not be a valid 2-manifold"),
+        "网格不封闭（不是 2-流形）：常见于把 2D 图形混进 3D 布尔、"
+        "或 difference 把实体挖穿后留下零厚度薄片。"
+        "改法：所有参与布尔的都必须是 3D 实体；挖穿时让刀具两端各伸出 0.01mm。",
+    ),
+    (
+        ("current top level object is not a 3d object", "not a 3d object"),
+        "顶层对象不是三维实体：多半是只画了 2D 图形（circle/square/polygon）"
+        "而忘了 linear_extrude / rotate_extrude。",
+    ),
+    (
+        ("parser error", "syntax error"),
+        "语法错误：检查括号与分号是否配对、模块名/参数名是否拼错、"
+        "是否在变换块里定义了 module。",
+    ),
+    (
+        # AI 自己发明变量名是实测过的常见失败（把提示词里的中文尺寸词直接当变量用、
+        # 或把参数名改了大小写）。OpenSCAD 变量名区分大小写，拼错就是未定义。
+        ("unknown variable", "undefined variable", "no such variable", "unknown module"),
+        "用了未定义的变量或模块：OpenSCAD 区分大小写，逐字校对名字；"
+        "确认赋值/定义写在使用之前（顶层变量必须先于引用），"
+        "并且名字只用了 ASCII 字母与下划线；若意图是调用固定零件库，"
+        "先确认文件顶部有 use <aiforge_parts.scad>。",
+    ),
+    (
+        ("object may not be a valid 2-manifold and may need repair",
+         "simple: not a valid 2-manifold"),
+        "实体不是流形：请用 3D 基本体构造，不要用 2D 图形做 union。",
+    ),
+    (
+        ("is not closed", "not closed"),
+        "polyhedron 的面列表不封闭：检查 points/faces 是否漏了端面或重复索引、"
+        "法向是否一致；手写螺旋/螺纹极易踩这个坑 —— 优先改用程序自带的固定零件库"
+        "（use <aiforge_parts.scad>），它们的 polyhedron 已实测封闭。",
+    ),
+    (
+        ("self-intersection", "self intersecting", "self-intersecting"),
+        "网格自相交：多见于 hull/minkowski 包住了互相穿插的实体，或 polyhedron 顶点顺序错乱。"
+        "改法：先让参与体彼此只重叠不相穿，或把复杂包络拆成多次 union。",
+    ),
+    (
+        ("top level object is empty", "no top level object", "empty geometry"),
+        "顶层几何为空：检查是否定义了 module 却忘记调用、或 difference 把整体挖没、"
+        "或 for 循环范围为空（如 [0 : n-1] 里 n=0）。",
+    ),
+    (
+        ("bad_alloc", "out of memory"),
+        "内存不足：降低 $fn（曲面分段）、减少 minkowski/hull 的参与体数量、"
+        "或把大阵列拆成几次 union。",
+    ),
+    (
+        ("nan",),
+        "坐标出现 NaN：检查除零、对负数开方、或引用了未定义变量参与运算"
+        "（如 radius = d/2 而 d 没赋值）。",
+    ),
+)
+
+
+#: 必须**按整词**匹配的特征片段。短片段直接做子串匹配会命中无关文本：
+#: 本机实测 `"nan" in "error: unknown variable 'nano_gap'"` 为真，于是
+#: 「变量名拼错」被翻译成「坐标出现 NaN：检查除零、对负数开方」——
+#: 自动修复循环照着错的病因改两轮，用户等到的还是同一个错。
+_WORD_BOUNDARY_NEEDLES = frozenset({"nan"})
+
+
+def _needles_match(needles: tuple[str, ...], lowered: str) -> bool:
+    for needle in needles:
+        if needle in _WORD_BOUNDARY_NEEDLES:
+            if re.search(rf"(?<![\w$]){re.escape(needle)}(?![\w$])", lowered):
+                return True
+        elif needle in lowered:
+            return True
+    return False
+
+
+def explain_failure(text: str | None) -> str | None:
+    """把 OpenSCAD/CGAL 的原始报错翻译成**可执行的改法**（给 AI 修复用）。
+
+    返回 None 表示这条报错不在已知清单里（那就只把原文交给 AI）。
+    """
+    if not text:
+        return None
+    lowered = text.lower()
+    for needles, advice in _KNOWN_FAILURES:
+        if _needles_match(needles, lowered):
+            return advice
+    return None
 
 
 def parse_diagnostics(output: str) -> list[Diagnostic]:
@@ -136,20 +245,6 @@ def first_error(diagnostics: list[Diagnostic]) -> str | None:
         if item.severity == "error":
             return item.text
     return None
-
-
-def _ensure_ascii_workdir() -> Path:
-    """OpenSCAD 在中文路径下可用，但为规避个别系统上的编码问题，
-    仍优先使用纯 ASCII 的临时工作目录（TMP 覆盖或 USERPROFILE 下）。
-    这里给出一个稳定的工作根目录。"""
-    from .paths import paths
-
-    root = paths().cache_dir
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        root = Path(tempfile.gettempdir())
-    return root
 
 
 def build_scad_source(
@@ -343,6 +438,7 @@ def compile_to_stl(
         message = "模型代码存在语法或几何错误，OpenSCAD 无法生成模型。"
         if error_text:
             message = f"{message}（{error_text}）"
+        fatal_text = error_text or output.strip()[-800:]
         return CompileResult(
             ok=False,
             stl_path=None,
@@ -351,7 +447,8 @@ def compile_to_stl(
             diagnostics=diagnostics,
             message=message,
             hint="可以让 AI 根据错误信息自动修复，或调整需求描述后重新生成。",
-            fatal=error_text or output.strip()[-800:],
+            fatal=fatal_text,
+            advice=explain_failure(fatal_text) or explain_failure(output),
         )
 
     return CompileResult(
@@ -365,14 +462,16 @@ def compile_to_stl(
     )
 
 
-def analyze_stl(stl_path: Path, limits: Any | None = None):
+def analyze_stl(stl_path: Path, limits: Any | None = None, declared_gaps: list | None = None):
     """分析生成的 STL，失败时抛出 StlError（由上层翻译为用户提示）。
 
     limits 为 mesh.AnalysisLimits（按目标打印机推导），不传则用通用默认值。
+    declared_gaps 只有 jobs 能从源码里提出来；非空时 mesh.analyze 会去量内部空隙
+    （夹口/插槽这类减法特征到底切出来没有）。
     """
     from .mesh import analyze as _analyze
 
-    return _analyze(stl_path, limits) if limits is not None else _analyze(stl_path)
+    return _analyze(stl_path, limits, declared_gaps)
 
 
 def make_thumbnail_svg(metrics: MeshMetrics | None, name: str, size: int = 320) -> str:
@@ -457,11 +556,3 @@ def estimate_mass_g(metrics: MeshMetrics, density_g_cm3: float = 1.24) -> float:
     需要给用户看的数字用 `mesh.estimate_usage()`，它会给出区间、支撑量和线材长度。
     """
     return round(metrics.volume_cm3 * density_g_cm3, 2)
-
-
-def triangle_count_of(stl_path: Path) -> int:
-    try:
-        points, _ = read_triangles(stl_path)
-        return len(points) // 3
-    except StlError:
-        return 0

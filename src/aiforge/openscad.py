@@ -25,7 +25,7 @@ from typing import Callable, Iterator
 
 from .config import store
 from .paths import APP_SLUG, paths
-from .procguard import run as guarded_run
+from .procguard import Popen as guarded_popen, run as guarded_run
 
 log = logging.getLogger(__name__)
 
@@ -34,9 +34,6 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 OFFICIAL_SITE = "https://openscad.org/downloads.html"
 OFFICIAL_MIRROR = "https://files.openscad.org"
-OFFICIAL_GITHUB = "https://github.com/openscad/openscad/releases/download"
-
-PINNED_VERSION = "2021.01"
 
 # 官方发布文件的 SHA-256（2025 年实测自官方源 files.openscad.org，见 docs/OPENSCAD-SOURCES.md）
 # 任一字节不符即拒绝安装 —— 这是「不把未经验证的二进制装进用户电脑」的技术保证。
@@ -409,8 +406,15 @@ def discover(deep: bool = True) -> list[Candidate]:
     return candidates
 
 
-def detect(deep: bool = True, prefer_deep: bool = True) -> OpenScadInfo:
-    """完整检测：找到副本 → 选中最佳 → 真实执行 CLI 自检。"""
+def detect(deep: bool = True) -> OpenScadInfo:
+    """完整检测：找到副本 → 选中最佳 → 真实执行 CLI 自检。
+
+    这里以前还挂着一个 `prefer_deep: bool = True`：它承诺「多个副本时优先选深扫
+    出来的那一个」，但函数体里一行都没用过它，全部调用方（main.py / envcheck /
+    两条 API 路由 / 自检）也只传 `deep` —— 挂着形参的装饰性承诺比没有承诺更坏：
+    下一个人会以为改这个开关能影响选型。选型规则实际只有一条（见下面的 sort_key
+    与 `verified[0]`），要加「优先深扫」就得先说清哪个才算深扫出来的副本。
+    """
     info = OpenScadInfo()
     candidates = discover(deep=deep)
     info.candidates = candidates
@@ -555,31 +559,6 @@ def verify_download(path: Path, asset: str, expected: str | None = None) -> tupl
         f"期望：{pinned}\n实际：{actual}\n"
         "这通常意味着下载被中断或被网络中的第三方篡改，请重试或改为手动安装。"
     )
-
-
-def authenticate_signature(path: Path) -> tuple[bool, str]:
-    """检查数字签名（官方未签名时如实说明，不谎称已签名）。"""
-    if os.name != "nt":
-        return False, "非 Windows 平台，跳过签名检查。"
-    try:
-        script = (
-            f"$s = Get-AuthenticodeSignature -FilePath '{path}'; "
-            "if ($s.Status -eq 'Valid') { Write-Output ('VALID|' + $s.SignerCertificate.Subject) } "
-            "else { Write-Output ('NONE|' + $s.Status) }"
-        )
-        proc = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        out = (proc.stdout or "").strip()
-        if out.startswith("VALID|"):
-            return True, f"数字签名有效（{out[6:]}）。"
-        return False, "OpenSCAD 官方安装包未提供数字签名，已改用 SHA-256 完整性校验。"
-    except Exception as exc:  # noqa: BLE001
-        return False, f"数字签名检查不可用（{exc}）。已改用 SHA-256 校验。"
 
 
 ProgressFn = Callable[[str, float | None, str, dict[str, object]], None]
@@ -920,13 +899,11 @@ def install_with_installer(progress: ProgressFn | None = None, silent: bool = Tr
         if _is_admin():
             args.append("/D=" + str(Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "OpenSCAD"))
         try:
-            proc = subprocess.run(
-                [str(installer), *args],
-                timeout=600,
-                check=False,
-                creationflags=CREATE_NO_WINDOW,
-                **_popen_kwargs(),
-            )
+            # 走 procguard：安装程序（以及它自己派生的子进程）留在作业里，
+            # 用户中途关掉本软件不会留下一个没人管的安装在后台跑。
+            # 注意别重复传 creationflags：`_popen_kwargs()` 里已经有一份，
+            # 写两处会在参数绑定阶段就 TypeError（安装一行都跑不到）。
+            proc = guarded_run([str(installer), *args], timeout=600, **_popen_kwargs())
             log.info("安装程序退出码：%s", proc.returncode)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise OpenScadError(
@@ -936,7 +913,7 @@ def install_with_installer(progress: ProgressFn | None = None, silent: bool = Tr
             ) from exc
     else:
         # 交互式：让用户自己点下一步（UAC 由安装程序自己申请）
-        subprocess.Popen([str(installer)], shell=False)
+        guarded_popen([str(installer)])
 
     # 等待安装完成并再次检测（第四十四节：安装后必须再次检测安装结果）
     import time

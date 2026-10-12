@@ -18,7 +18,9 @@
 
 from __future__ import annotations
 
+import console_utf8  # noqa: F401,E402 —— 必须最先导入：GBK 控制台下 print 中文/符号会弄崩脚本（见 src/aiforge/stdio.py）
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -41,9 +43,17 @@ FAILED: list[tuple[str, str]] = []
 SKIPPED: list[tuple[str, str]] = []
 OFFLINE = False
 
+# 打印一律走 _SAFE_PRINT（为什么要走，见下面 check() 里的说明）。
+# 兜底模块没加载成功时退回原生 print：至少不能因为找一个辅助函数再叠一个 AttributeError。
+_SAFE_PRINT = getattr(console_utf8, "safe_print", print)
+
 # `--offline` 时跳过的检查：需要真实 OpenSCAD 二进制、Windows 注册表/图形界面，
 # 或者会访问网络。CI（ubuntu / 无 OpenSCAD 的 windows）用这个模式。
 # 注意：跳过的项会**单独计数并逐条打印原因**，绝不混进"通过"。
+# 键名必须能在下面注册的检查里找到 —— 「文档里的自检项数与真源一致」会当场查死键。
+# （这里曾有 `"快捷方式解析"`：`shortcuts.py` 连同两个没人调的端点被删了，检查项
+#  也没了，但这一行还留着。它在 --offline 下永远匹配不到任何东西，却会骗过任何
+#  拿 `len(OFFLINE_SKIPS)` 算「跳了几项」的人 —— 文档里那个数就是这么错的。）
 OFFLINE_SKIPS: dict[str, str] = {
     "WebView2 运行时检测": "需要 Windows 注册表与系统组件",
     "应用图标资源": "图标由 build.ps1 生成，离线环境没有构建产物",
@@ -54,10 +64,11 @@ OFFLINE_SKIPS: dict[str, str] = {
     "SCAD → STL 编译": "需要 OpenSCAD 把 SCAD 编译成 STL",
     "安装失败不破坏已有环境": "需要模拟一次真实的 OpenSCAD 安装",
     "子进程不变量守护": "依赖 Windows 作业对象（非 Windows 上语义不同）",
+    "守护存活双向保证": "依赖 Windows 作业对象（要验的是“工人被内核带走”）",
     "几何完整性自动修复": "需要真实几何数据（由 OpenSCAD 产出）",
     "固定零件库可编译": "需要对每个零件真实编译（依赖 OpenSCAD）",
+    "孔径射线实测": "需要 OpenSCAD 编译带孔/实心对照模型",
     "模型外观复核": "需要渲染模型（依赖 OpenSCAD）",
-    "快捷方式解析": "需要 Windows .lnk 解析",
     "接口响应形状": "部分断言依赖已构建的前端产物 webui/dist",
 }
 
@@ -66,21 +77,24 @@ def check(name: str, fn) -> None:
     if OFFLINE and name in OFFLINE_SKIPS:
         reason = OFFLINE_SKIPS[name]
         SKIPPED.append((name, reason))
-        print(f"  [SKIP] {name} —— {reason}（CI 离线模式；发布前请跑完整版）")
+        _SAFE_PRINT(f"  [SKIP] {name} —— {reason}（CI 离线模式；发布前请跑完整版）")
         return
     try:
         result = fn()
         PASSED.append(f"{name}" + (f" —— {result}" if result else ""))
-        print(f"  [OK]   {name}" + (f" —— {result}" if result else ""))
+        _SAFE_PRINT(f"  [OK]   {name}" + (f" —— {result}" if result else ""))
     except Exception as exc:  # noqa: BLE001
         FAILED.append((name, f"{type(exc).__name__}: {exc}"))
-        print(f"  [FAIL] {name} —— {type(exc).__name__}: {exc}")
+        # 为什么不能直接用 print：失败分支上的那行字里带异常消息，而那正是最容易
+        # 出现打不出字符的地方（实测：GBK 控制台下这里报 UnicodeEncodeError，
+        # 整个自检中途死掉，连「哪几项失败 / 退出码」都看不到了）。
+        _SAFE_PRINT(f"  [FAIL] {name} —— {type(exc).__name__}: {exc}")
         if os.environ.get("AIFORGE_SELFCHECK_TRACE") == "1":
             traceback.print_exc()
 
 
 def section(title: str) -> None:
-    print(f"\n=== {title} ===")
+    _SAFE_PRINT(f"\n=== {title} ===")
 
 
 # --------------------------------------------------------------------------
@@ -91,6 +105,7 @@ def t_imports() -> str:
         "aiforge",
         "aiforge.paths",
         "aiforge.version",
+        "aiforge.stdio",
         "aiforge.config",
         "aiforge.logging_setup",
         "aiforge.single_instance",
@@ -102,7 +117,6 @@ def t_imports() -> str:
         "aiforge.llm",
         "aiforge.jobs",
         "aiforge.projects",
-        "aiforge.shortcuts",
         "aiforge.server",
         "aiforge.app",
         "aiforge.api.env",
@@ -168,7 +182,71 @@ def t_scad_validation() -> str:
     ):
         result = scad.validate(fine)
         assert result.ok, f"不该误拦正常代码：{fine!r} -> {result.issues}"
-    return "安全拦截（含 include/use 读文件）/ 参数提取 / BOM 剥离 均正确"
+
+    # 系统命令/危险函数的报错必须带「行号+片段」，修复提示才能精准删除
+    bad = "cube([1,1,1]);\nsystem(\"rm -rf /\");\n"
+    result = scad.validate(bad)
+    assert not result.ok, "系统命令必须被拦截"
+    detail = "；".join(i.detail for i in result.issues if i.severity == "error")
+    assert "第 2 行" in detail and "system" in detail, detail
+    # 但本地已定义的同名 module（如掏空壳常用的 shell）是合法代码，不能误拦
+    fine_shell = "module shell() { difference() { cube(10); cube(8); } }\nshell();\n"
+    result = scad.validate(fine_shell)
+    assert result.ok, f"module shell() 不该被误拦 -> {result.issues}"
+
+    # ---- 字符串里的 // 不是注释：不许它把同一行后面的真代码吃掉 ----
+    # 实测（修复前）：`strip_comments` 是「先块注释正则、再行注释正则」两遍，
+    # 两遍都不看字符串，于是下面两条能**顺利通过安全校验**（ok=True）：
+    #     text("1//2"); import("C:/Windows/win.ini");
+    #     text("a//b"); use <evil.scad>;
+    # 跟本文件开头承诺的「拒绝能让 OpenSCAD 读写本地文件的语句」不符；而
+    # `text()` 刻字是本产品最常见的输出之一，不是构不出的情形。
+    for sneaky in (
+        'text("1//2"); import("C:/Windows/win.ini");\ncube([1,1,1]);',
+        'text("a//b"); use <evil.scad>;\ncube([1,1,1]);',
+        'text("/*"); import("evil.stl"); /* 尾\ncube([1,1,1]);',
+    ):
+        result = scad.validate(sneaky)
+        assert not result.ok, f"字符串里的 // 把同行代码吃掉了，必须拦：{sneaky!r}"
+
+    # 反过来：注释里出现不成对的引号 / 行注释里写 /*，都不该把后面的代码带倒。
+    # （旧实现同样在这里错：先把整行删掉再抹字符串，就不会遇到不成对引号；
+    # 一旦顺序反过来而不做成一遍扫描，这些就是新产生的误拦。）
+    for fine in (
+        '// 不要用 "import(" 这种写法\ncube([1,1,1]);',
+        "// 见 /* 的说明\ncube([1,1,1]);",
+        'text("AI 3D Forge", size=5);\ncube([1,1,1]);',
+        'text("1//2");\ncube([1,1,1]);',
+    ):
+        result = scad.validate(fine)
+        assert result.ok, f"不该误拦正常代码：{fine!r} -> {result.issues}"
+
+    # 删注释必须保住行号：跨行块注释不能把后面的代码「往上摊」，
+    # 否则报给 AI 的「第 N 行」指到别的行，修复两轮都删不干净。
+    blocky = '/* 说明\n   第二行 */\nsystem("dir");\n'
+    assert len(scad.strip_comments(blocky).splitlines()) == len(blocky.splitlines()), (
+        "strip_comments 改变了行数 —— 按行遍历的调用方（extract_top_level_numbers / "
+        "top_level_assignments）会跟 _locate 报的行号一起错位"
+    )
+    result = scad.validate(blocky)
+    detail = "；".join(i.detail for i in result.issues if i.severity == "error")
+    assert not result.ok and "第 3 行" in detail, f"行号必须跟原文对齐：{detail}"
+
+    # 注释压成**一个空格**而不是按长度补空格：jobs.py 拿
+    # `strip_comments(before).strip() == strip_comments(after).strip()` 判「AI 只改了
+    # 注释、代码没动」；按长度补空格会让两段不同长度的注释得出不同空格数，
+    # 这个相等判断就错 —— 只改注释的返工会被当成真改动。
+    short = 'cube(10); // 短\nheight = 5;\n'
+    long_ = 'cube(10); // 长得多的说明了又长一点\nheight = 5;\n'
+    assert scad.strip_comments(short).strip() == scad.strip_comments(long_).strip(), (
+        "同一行代码 + 不同长度的注释，删注释后应当逐字相等："
+        f"{scad.strip_comments(short)!r} vs {scad.strip_comments(long_)!r}"
+    )
+
+    return (
+        "安全拦截（含 include/use 读文件）/ 报错带行号片段 / 合法 module shell 不误拦 / "
+        "字符串里的 // 与 /* 不吃同行代码 / 注释里的不成对引号不误拦 / 删注释保行号 均正确"
+    )
 
 
 def t_scad_params() -> str:
@@ -813,6 +891,58 @@ def t_stl_robustness() -> str:
     else:
         raise AssertionError("坐标是无穷大的 ASCII STL 必须报错")
 
+    # 4b) **ASCII 被截断**也必须报错。二进制那条路早就有「头部声明 N 面、
+    #     实际只有 M 面」的自校验，而 ASCII 没有 —— 它不是小众格式：本产品的
+    #     OpenSCAD 默认就写 ASCII（实测一个圆管是 171,329 字节 / 1,024 个 facet）。
+    #     写一半被中断的 ASCII 文件能被解析器**完好地**读出一堆合法坐标：
+    #     没有 NaN、没有错位，只是后面的面没了 —— 于是残缺网格被当成正常模型
+    #     送去分析，孔径判据直接翻面（实测同一 SCAD：一轮 512 面 hole=None，
+    #     另一轮 1024 面 hole=17.60）。
+    #     三条守卫各验一条，另加一条**阳性对照**（完整文件必须照常解析）。
+    facets3 = "".join(
+        f"facet normal 0 0 0\nouter loop\nvertex {i} 0 0\nvertex {i + 1} 0 0\n"
+        f"vertex {i} 1 0\nendloop\nendfacet\n"
+        for i in range(3)
+    )
+    full_ascii = f"solid t\n{facets3}endsolid t\n"
+    ok_path = work / "ascii_ok.stl"
+    ok_path.write_text(full_ascii, encoding="utf-8")
+    points, is_ascii = mesh.read_triangles(ok_path)
+    assert is_ascii and len(points) == 9, (is_ascii, len(points))
+
+    # i) 切在 facet 中间：删掉一个 vertex 行 → 顶点数不是 3 的倍数
+    #    （故意只删一行：删多了会连带触发其它条件，那样就分不清是哪条守卫拦的）
+    cut_at = full_ascii.rindex("vertex ")
+    mid_text = full_ascii[:cut_at] + full_ascii[full_ascii.index("\n", cut_at) + 1:]
+    mid_path = work / "ascii_mid.stl"
+    mid_path.write_text(mid_text, encoding="utf-8")
+    try:
+        mesh.read_triangles(mid_path)
+    except mesh.StlError as exc:
+        assert "3 的倍数" in exc.message, exc.message
+    else:
+        raise AssertionError("切掉半个三角面的 ASCII STL 必须报错，不能静悄悄少算一面")
+
+    # ii) 只丢一个 facet 关键字：顶点数仍是 3 的倍数，靠「面数对不上」才能发现
+    mism_path = work / "ascii_mismatch.stl"
+    mism_path.write_text(full_ascii.replace("facet normal", "#", 1), encoding="utf-8")
+    try:
+        mesh.read_triangles(mism_path)
+    except mesh.StlError as exc:
+        assert "实际只读到" in exc.message, exc.message
+    else:
+        raise AssertionError("facet 数与顶点数矛盾的 ASCII STL 必须报错")
+
+    # iii) 刚好切在边界上、且缺 endsolid：前两条都查不出来，只能靠收尾行
+    tailmiss_path = work / "ascii_no_endsolid.stl"
+    tailmiss_path.write_text(f"solid t\n{facets3}", encoding="utf-8")
+    try:
+        mesh.read_triangles(tailmiss_path)
+    except mesh.StlError as exc:
+        assert "endsolid" in exc.message, exc.message
+    else:
+        raise AssertionError("缺 endsolid 收尾的 ASCII STL 必须报错（那就是没写完）")
+
     # 5) 朝向变换必须逐位等于「逐个分量现算」的语义。
     #    这一条钉住的是性能改动：原来每个分量都现建一次 {"x":0,...} 字典再做字符串
     #    操作，一个面 36 次，100 万面上就是 3600 万次（占整条链路 45% 的时间）。
@@ -836,7 +966,7 @@ def t_stl_robustness() -> str:
         ("-z", "-x", "y"),
     )
     for axes in orientations:
-        normals, centroids, drop = mesh._transform_faces(axes, [], [sample], [sample])
+        normals, centroids, drop = mesh._transform_faces(axes, [sample], [sample])
         expected = reference(axes, sample)
         assert normals[0] == expected, (axes, normals[0], expected)
         # 单个点落到平台上之后高度必然是 0，且 drop 就是它在原朝向下的高度
@@ -859,7 +989,7 @@ def t_stl_robustness() -> str:
     one, stray, _details = mesh._count_parts(flat, len(tetra))
     assert (one, stray) == (1, 0), f"共顶点的四面体应焊成 1 个零件，实际 {(one, stray)}"
 
-    return "损坏 STL（NaN/inf/截断）明确报错、尾部竞态仍容忍、朝向变换语义逐位不变"
+    return "损坏 STL（NaN/inf/二进制截断/ASCII 截断）明确报错、尾部竞态仍容忍、朝向变换语义逐位不变"
 
 
 def t_analysis_heartbeat() -> str:
@@ -890,11 +1020,13 @@ def t_analysis_heartbeat() -> str:
 
     job = jobs.create_job(project_id="heartbeat-test", revision=1, mode="create")
     original = compiler.analyze_stl
+    forwarded: list = []
 
-    def slowed(path, limits=None):
+    def slowed(path, limits=None, declared_gaps=None):
         # 50ms 的分析 + 10ms 心跳 = 至少 4 次心跳，确定性足够
+        forwarded.append(declared_gaps)
         time_mod.sleep(0.05)
-        return original(path, limits)
+        return original(path, limits, declared_gaps)
 
     compiler.analyze_stl = slowed  # type: ignore[assignment]
     try:
@@ -903,14 +1035,275 @@ def t_analysis_heartbeat() -> str:
                 job, cube, mesh.AnalysisLimits(), heartbeat_s=0.01
             )
         )
+        # 传源码时必须把「源码里声明的间隙」一起送去实测 —— 这是「夹口那一刀完全
+        # 没切到实体」唯一的揭穿路径；接线断掉不会报错，只会默默退回全绿。
+        asyncio.run(
+            jobs._analyze_with_heartbeat(
+                job,
+                cube,
+                mesh.AnalysisLimits(),
+                source="clamp_gap = 14;\ncube(10);\n",
+                heartbeat_s=0.01,
+            )
+        )
     finally:
         compiler.analyze_stl = original  # type: ignore[assignment]
 
     assert metrics.triangles == 12, metrics.triangles
+    assert forwarded[0] is None, f"不传 source 时不该做空隙实测（白白多跑一遍射线扫描）：{forwarded[0]}"
+    assert forwarded[1] and forwarded[1][0][2] == "clamp_gap", f"source 里的声明间隙没被透传：{forwarded[1]}"
     beats = [m.text for m in job.messages if "仍在分析" in m.text]
     assert beats, "长分析期间必须推心跳，否则前端看门狗会把正常作业取消掉"
     assert any("秒" in text for text in beats), beats
-    return f"长分析心跳正常（{len(beats)} 次），不会被看门狗误杀"
+    return f"长分析心跳正常（{len(beats)} 次），不会被看门狗误杀；声明间隙已透传到实测"
+
+
+def t_fit_scope_dimension() -> str:
+    """「杯径 70」这类**配合尺寸**不许当成整件外形去核对，更不许据此缩整个模型。
+
+    实测现场（复杂模型端到端：水杯架）：规格 label 就是「杯径」，name 是 cup_dia
+    这种形式，程序把它配到了「水平包络」上，于是同时踩两个坑：
+      * 修复日志报【问题 8】「要求 70mm，实测水平最大（XY）132.0mm（超出 89%）」——
+        一条根本不存在的缺陷，白烧一轮修复，用户看到的是「它非说我做错了」；
+      * 逐轴校正算出 70/132 = 0.53，而它正好落在旧的 0.5~2.0 放行区间里 ——
+        真跑起来会把夹口、底座、加强筋连整体缩掉 47%。
+
+    两头都得钉住：真正的外形尺寸（外径/总高）偏大照报、该缩仍要能缩；
+    配合尺寸**偏小**照报（整件连 70 都不到，那个杯径必然是没做到的）。
+    """
+    from aiforge import jobs, mesh, reqtests
+    from aiforge.design import DesignSpec, SpecItem, diameter_is_fit_scope
+
+    # ---- 词形判定：只认「剥掉直径词根后还剩个主体名」的这种形式 ----
+    for label, name in (
+        ("杯径", "cup_dia"), ("口径", "mouth_diameter"),
+        ("杯口直径", "cup_opening_dia"), ("轮径", "wheel_dia"),
+    ):
+        assert diameter_is_fit_scope(label, name), f"{label}/{name} 是在说被容纳的东西"
+    for label, name in (
+        ("外径", "outer_diameter"), ("直径", "diameter"), ("总直径", "total_dia"),
+        ("最大外径", "max_outer_dia"), ("高度_mm", "height_mm"), ("壁厚", "wall_thickness"),
+    ):
+        assert not diameter_is_fit_scope(label, name), f"{label}/{name} 是整件外形或不是直径"
+
+    fit_spec = DesignSpec(
+        kind="水杯架",
+        specs=[SpecItem(name="cup_dia", label="杯径", value=70.0, unit="mm", user_specified=True)],
+    )
+    declared = jobs._spec_declared_dimensions(fit_spec)
+    assert declared[jobs.HORIZONTAL_ENVELOPE_AXIS][1] == 70.0, declared
+
+    holder = mesh.MeshMetrics(
+        triangles=776, solid_parts=1, bbox=(132.0, 63.0, 95.0), watertight=True, watertight_ratio=1.0
+    )
+    assert jobs._spec_dimension_problems(fit_spec, holder) == [], "座子比杯径大是正常的，不许报缺陷"
+    assert jobs._integrity_rank(holder, fit_spec)[2] == 0, "误报还在的话，采纳判据会白烧一轮修复"
+
+    # 需求核对表也不许判红，但要说实话：包围盒证明不了这个尺寸做到了
+    suite = reqtests.evaluate(
+        metrics=holder, requirement="能放 70mm 的水杯", declared_dimensions=declared
+    )
+    dim_tests = [t for t in suite.tests if t.kind == "dimension"]
+    assert dim_tests and all(t.status != reqtests.FAIL for t in dim_tests), [
+        (t.status, t.actual) for t in dim_tests
+    ]
+    assert not jobs._hard_failures(suite), "配合尺寸偏大不该拖红整张核对表"
+    assert "外观复核" in dim_tests[0].actual, dim_tests[0].actual
+
+    # 反方向（偏小）仍然是真缺陷：整件 50 放不下 70 的杯子
+    tiny = mesh.MeshMetrics(
+        triangles=776, solid_parts=1, bbox=(50.0, 40.0, 90.0), watertight=True, watertight_ratio=1.0
+    )
+    short_problems = jobs._spec_dimension_problems(fit_spec, tiny)
+    assert len(short_problems) == 1 and "只有 50.0mm" in short_problems[0], short_problems
+
+    # ---- 确定性逐轴缩放：不许拿配合尺寸去缩整件 ----
+    runner = jobs.GenerationRunner.__new__(jobs.GenerationRunner)
+    source = "cup_dia = 70;\ncube([132, 63, 95]);\n"
+    assert (
+        runner._axis_dimension_fix(source, holder, fit_spec) is None  # noqa: SLF001
+    ), "0.53 的倍率会把水杯架连夹口带底座缩掉 47%"
+    # 放大方向放行：整件连 70 都不到，按比例放大是合理的确定性兜底
+    grown = runner._axis_dimension_fix(source, tiny, fit_spec)  # noqa: SLF001
+    assert grown and "scale([1.400000, 1.400000, 1.000000])" in grown, grown
+
+    # ---- 保住原有覆盖：真正的外形尺寸两头都照旧 ----
+    outer = DesignSpec(
+        kind="圆形笔筒",
+        specs=[
+            SpecItem(name="outer_diameter", label="外径", value=80.0, unit="mm", user_specified=True),
+            SpecItem(name="height", label="总高", value=100.0, unit="mm", user_specified=True),
+        ],
+    )
+    blob = mesh.MeshMetrics(
+        triangles=776, solid_parts=1, bbox=(92.3, 145.8, 100.0), watertight=True, watertight_ratio=1.0
+    )
+    blob_problems = jobs._spec_dimension_problems(outer, blob)
+    assert len(blob_problems) == 1 and "外径 要求 80mm" in blob_problems[0], blob_problems
+    # 0.714 这种「多了一截、确实该缩」的合法校正必须仍然生效
+    legit = runner._axis_dimension_fix(source, mesh.MeshMetrics(bbox=(80.0, 80.0, 140.0)), spec=outer)  # noqa: SLF001
+    assert legit and "scale([1.000000, 1.000000, 0.714286])" in legit, legit
+    # 而缩到 2/3 以下（外径 80 vs 实测 170 → 0.588）属于需求理解错了：只报问题，不乱缩
+    refused = jobs._spec_dimension_problems(outer, mesh.MeshMetrics(bbox=(80.0, 80.0, 170.0)))
+    assert refused, "超出 50% 的外形尺寸仍然要报"
+    assert (
+        runner._axis_dimension_fix(source, mesh.MeshMetrics(bbox=(80.0, 80.0, 170.0)), spec=outer)  # noqa: SLF001
+        is None
+    ), "要缩到 2/3 以下才能凑上的目标不该由程序硬缩"
+    return (
+        "配合尺寸（杯径/口径/cup_dia）不再驱动【问题 8】与整件缩小（0.53 被拒）、"
+        "偏小仍报；外径/总高双向核对与 0.714 合法校正保持不变"
+    )
+
+
+def t_declared_gap_verdict() -> str:
+    """声明了的间隙/夹口在网格里量不到时，判定链必须一路把它拖成 fail。
+
+    为什么单独钉这一条（实测的完整假绿链条）：交付给用户的手机夹源码写着
+    `clamp_gap = 14`，而 difference 的刀具被 `rotate([-90,0,0])` 搬到了 z<0 的
+    模型外 —— 夹口那一刀**完全没切到实体**。但编译成功、STL 非空、没有 warning，
+    零件数 1、封闭、包围盒对、壁厚甚至因为「根本没有腔」而显得充足，
+    需求核对 9 项全绿、打印性判定 pass / 85 分。唯一看出问题的是外观复核，
+    而它当时既不参与 verdict，也不上结果卡。
+
+    这里用两份**合成网格**（40mm 实心块 / 同样大小但中间挖一个 16mm 空腔）
+    把判据钉死：不编译、不依赖 OpenSCAD，所以 CI 离线也一定跑到；而它验的正是
+    那条链的四个环节 —— 测得到吗 → 打分 → 回喂 AI 的措辞 → 最终判定降级。
+    反例（有空腔时不许降级）同样重要：假失败会把本来正常的模型打成不可打印。
+    """
+    from aiforge import jobs, mesh, reqtests
+
+    def box(lo, hi):
+        """一个长方体的 12 个三角面（顶点拉平的三元组列表）。"""
+        x0, y0, z0 = lo
+        x1, y1, z1 = hi
+        v = [
+            (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+            (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
+        ]
+        faces = [
+            (0, 1, 2), (0, 2, 3), (4, 6, 5), (4, 7, 6),
+            (0, 4, 5), (0, 5, 1), (1, 5, 6), (1, 6, 2),
+            (2, 6, 7), (2, 7, 3), (3, 7, 4), (3, 4, 0),
+        ]
+        out: list = []
+        for a, b, c in faces:
+            out.extend((v[a], v[b], v[c]))
+        return out
+
+    def metrics_of(triangles):
+        m = mesh.MeshMetrics(
+            triangles=len(triangles) // 3, vertices=8, watertight=True, solid_parts=1, stray_parts=0
+        )
+        m.bbox_min = (min(p[0] for p in triangles), min(p[1] for p in triangles), min(p[2] for p in triangles))
+        m.bbox_max = (max(p[0] for p in triangles), max(p[1] for p in triangles), max(p[2] for p in triangles))
+        m.bbox = tuple(hi - lo for hi, lo in zip(m.bbox_max, m.bbox_min))
+        return m
+
+    declared = [("夹口张开", 14.0, "clamp_gap")]
+    tris_solid = box((0.0, 0.0, 0.0), (40.0, 40.0, 40.0))
+    tris_void = tris_solid + box((15.0, 12.0, 15.0), (25.0, 28.0, 25.0))
+    solid, voided = metrics_of(tris_solid), metrics_of(tris_void)
+    for m, tris in ((solid, tris_solid), (voided, tris_void)):
+        m.declared_gaps = list(declared)
+        m.interior_gaps = mesh.measure_interior_gaps(tris, m.triangles, m, min_gap_mm=14.0)
+    assert solid.interior_gaps and voided.interior_gaps, "合成网格太小，这条自检等于没跑"
+
+    # 实心块：三轴都找不到任何「被材料夹住」的空档 —— 这就是那一刀没切到的形状
+    assert solid.interior_gaps.max_mm == 0.0, solid.interior_gaps.to_dict()
+    # 挖了 16mm 空腔：沿 Y 必须量到（判据能揭穿「没切到」全靠这个数）
+    y_gap = voided.interior_gaps.per_axis[1]
+    assert 15.0 <= y_gap <= 16.2, voided.interior_gaps.to_dict()
+
+    suite_bad = reqtests.evaluate(metrics=solid, requirement="带夹口的手机夹", declared_gaps=declared)
+    gap_tests = [t for t in suite_bad.tests if t.kind == "feature-gap"]
+    assert gap_tests and all(t.status == reqtests.FAIL for t in gap_tests), [
+        (t.status, t.actual) for t in gap_tests
+    ]
+    assert jobs._hard_failures(suite_bad), "间隙实测失败不算硬伤 = 假绿复活"
+    # 回喂给 AI 的措辞：必须带上轴向与连续材料长度，光说「没空隙」它不知道往哪改
+    feed = jobs._gap_problems(solid)
+    assert len(feed) == 1 and "【问题 10】" in feed[0] and "clamp_gap" in feed[0], feed
+    assert "横跨这个区域" in feed[0] and "同一坐标系" in feed[0], "两条实测踩过的坑都得写进回喂"
+
+    verdict_bad = {"verdict": "pass", "score": 85, "issues": []}
+    why = jobs._downgrade_printability(verdict_bad, suite_bad, "", [])
+    assert why, "实测硬失败却不降级"
+    assert verdict_bad["verdict"] == "fail" and verdict_bad["score"] <= 49, verdict_bad
+    assert verdict_bad["issues"][0]["severity"] == "error", verdict_bad["issues"][0]
+
+    # 反例：空隙真存在时一句都不许报（假失败比漏报更糟）
+    suite_ok = reqtests.evaluate(metrics=voided, requirement="带夹口的手机夹", declared_gaps=declared)
+    ok_tests = [t for t in suite_ok.tests if t.kind == "feature-gap"]
+    assert ok_tests and all(t.status == reqtests.PASS for t in ok_tests), [
+        (t.status, t.actual) for t in ok_tests
+    ]
+    assert not jobs._gap_problems(voided), jobs._gap_problems(voided)
+    verdict_ok = {"verdict": "pass", "score": 85, "issues": []}
+    assert jobs._downgrade_printability(verdict_ok, suite_ok, "", []) is None, verdict_ok
+    assert verdict_ok == {"verdict": "pass", "score": 85, "issues": []}, verdict_ok
+
+    # 源码 → 声明间隙：只认顶层纯数值赋值，且不能被 clamp_w 这类**实体宽度**骗到
+    found = jobs._declared_gaps_from_source("clamp_gap = 14;\nclamp_w = 60;\nwall = 3;\n")
+    assert [n for _l, _v, n in found] == ["clamp_gap"], found
+    assert jobs._declared_gaps_from_source("span = 20;\n") == [], "普通长度不该被当成间隙"
+
+    # 给 AI 的客观数据里必须带上这条矛盾：不给它，打印性复核会闭着眼说「可以打印」
+    ai_summary = mesh.summarize_for_ai(solid, "model.stl")
+    assert "间隙实测" in ai_summary and "夹口张开=14mm" in ai_summary, ai_summary[-400:]
+    assert "根本没切到实体" in ai_summary, ai_summary[-400:]
+    assert "间隙实测" not in mesh.summarize_for_ai(
+        mesh.MeshMetrics(triangles=12, bbox=(40.0, 40.0, 40.0)), "model.stl"
+    ), "没声明间隙时不该占提示词篇幅"
+
+    return (
+        f"实心块最大被夹空档 {solid.interior_gaps.max_mm:g}mm → feature-gap FAIL/硬伤/降级为 "
+        f"{verdict_bad['verdict']}·{verdict_bad['score']}；挖 16mm 空腔的块沿 Y 量到 {y_gap:.1f}mm → 不降级"
+    )
+
+
+def t_announce_spec_values() -> str:
+    """需求复述必须把「我替你定的具体数值」念出来，用户才有可纠正的对象。
+
+    实测用户抱怨「对话大模型无法领会意思」，很大一块是没露面就生效的假设：
+    旧版只说「有几点你没说清楚，我按常见做法先定了」，一个数字都不给 ——
+    用户既不知道夹口开度取了多少，也没法说「改成 12」。所以这里钉住：
+    假设值逐个出现、非用户指定的项不得混进来、全是指定值时不多嘴。
+    """
+    from aiforge import design, jobs
+
+    job = jobs.create_job(project_id="announce-test", revision=1, mode="create")
+    spec = design.DesignSpec(
+        kind="手机夹",
+        summary="带夹口的手机支架",
+        specs=[
+            design.SpecItem(name="height", label="总高", value=120.0, user_specified=True),
+            design.SpecItem(name="clamp_gap", label="夹口开度", value=14.0),
+            design.SpecItem(name="wall", label="壁厚", value=2.4),
+            design.SpecItem(name="lanyard_hole", label="挂绳孔"),  # 规格里没数值，AI 自己在代码里定
+        ],
+        open_questions=["夹口朝向哪边？"],
+    )
+    # _announce_spec 不碰 self，直接拿未绑定方法跑（不依赖网络与完整执行器）
+    jobs.GenerationRunner._announce_spec(None, job, spec)  # type: ignore[arg-type]
+    text = "\n".join(m.text for m in job.messages)
+    assert "夹口开度 14mm" in text and "2.4mm" in text, text
+    assert "挂绳孔" in text, text
+    assert "夹口朝向哪边" in text, text
+    assert "哪一项不对" in text, text
+    # 用户自己说过的数字不能当成「我替你定的」（那会让用户怀疑自己的需求被改过）
+    assert "我按常见做法取了值：" not in text or "总高 120mm" not in text, text
+
+    plain = jobs.create_job(project_id="announce-test-plain", revision=1, mode="create")
+    plain_spec = design.DesignSpec(
+        kind="转接环",
+        specs=[design.SpecItem(name="outer", label="外径", value=72.0, user_specified=True)],
+    )
+    jobs.GenerationRunner._announce_spec(None, plain, plain_spec)  # type: ignore[arg-type]
+    assert all("我按常见做法取了值" not in m.text for m in plain.messages), [
+        m.text for m in plain.messages
+    ]
+    return "假设值逐个念出来（14mm / 2.4mm / 未定项 / 不确定处），用户可直接纠正；无假设时不多嘴"
 
 
 def t_helper_job_scope() -> str:
@@ -1121,10 +1514,11 @@ def t_child_process_guard() -> str:
 
     本项目的退出路径还是 `runtime_state.force_exit()` → `os._exit()`，
     **故意跳过** atexit/finally，所以"退出时清理"的写法根本靠不住。
-    这里验证的是三层兜底各自真的成立：
+    这里验证的是四层兜底各自真的成立：
       1. Windows 作业对象带 `KILL_ON_JOB_CLOSE`（内核保证：进程一死子进程全灭）；
       2. 登记表 + `terminate_all()` 能真的杀掉子进程；
-      3. 超时路径不留孤儿；启动清扫**只**杀我们自己装的 OpenSCAD。
+      3. 超时路径不留孤儿；启动清扫**只**杀我们自己装的 OpenSCAD；
+      4. `process_alive()` 这个“只问不动”的原语真的只问不动 —— 探一下不会把对方打死（见用例 5 注释）。
     """
     import subprocess as sp
     import sys
@@ -1204,8 +1598,840 @@ def t_child_process_guard() -> str:
         if innocent.poll() is None:
             innocent.kill()
 
+    # 5) “探测存活”不得弄死被探测的进程，也不得把死的报成活的。
+    #    Windows 上最“自然”的写法 `os.kill(pid, 0)` 两边都错：signal 0 在那里就是
+    #    CTRL_C_EVENT（实测 `signal.CTRL_C_EVENT == 0`），是往目标所在控制台的整组进程投信号 ——
+    #    本机拿它做投毒时，跑它的那条流水线自己被打死了（退出码 0xC000013A）；
+    #    而对一个已退出的 pid 它根本不报错（实测返回正常），等于报“还活着”。
+    #    所以两条各验一侧：活的 -> 报活且当场没死；死的 -> 必须报死。
+    #    另一格判据：“OpenProcess 开得开”不等于活 —— 实测一个已退出（码 7）但还没收尸的
+    #    pid 照样开得开句柄，所以必须比对 STILL_ACTIVE。
+    probe = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    time_mod.sleep(0.3)
+    assert procguard.process_alive(probe.pid) is True, "活着的进程被 `process_alive` 报成不在"
+    assert probe.poll() is None, "「探测存活」把被探测的进程弄死了（用户那边就是探一下旧实例，旧实例退出）"
+    probe.kill()
+    gone_deadline = time_mod.time() + 10
+    # 先问“没收尸”的形状（实测：这种 pid 的 OpenProcess 照样开得开），再收尸后再问一次
+    while time_mod.time() < gone_deadline and procguard.process_alive(probe.pid):
+        time_mod.sleep(0.2)
+    assert procguard.process_alive(probe.pid) is False, "已退出的进程仍被报成活着（只看了句柄开不开）"
+    probe.wait(timeout=10)  # 收尸：进入“已退出且句柄已释放”的形状
+    assert procguard.process_alive(probe.pid) is False, "收尸后仍被报成活着"
+
     procguard.terminate_all()
-    return "退出时不留孤儿：作业对象带 KillOnJobClose、登记表可回收、超时不留孤儿、清扫不误杀"
+    return (
+        "退出时不留孤儿：作业对象带 KillOnJobClose、登记表可回收、超时不留孤儿、清扫不误杀、"
+        "存活探测只问不动（活的报活且不死、死的报死）"
+    )
+
+
+def t_child_guard_survival() -> str:
+    """真把父进程打死，验“该跟着死的死了、不该死的没死”两边各自成立。
+
+    为什么非得做到这一步（起真子进程、真 `os._exit`、真去外面查进程表）：
+    `CREATE_BREAKAWAY_FROM_JOB` 那次翻车就是这个形态 —— 代码里"我们设了创建标志"
+    句句成立，接口报的 `detached: true` 也是真的，可用户那边：本软件一关，
+    刚送过去的 Bambu Studio 跟着没了（本机实测：带标志的子进程仍然在作业里）。
+    所以"能不能独立于本软件存活"这类断言，只有把父进程真打死才算验过。
+    """
+    import json
+    import subprocess as sp
+    import sys
+    import time as time_mod
+
+    from aiforge import procguard
+
+    procguard.install()
+    child_src = """
+import json, os, sys, time
+sys.path.insert(0, {src!r})
+from aiforge import procguard
+
+procguard.install()
+sleep_cmd = [sys.executable, "-c", "import time; time.sleep(120)"]
+worker = procguard.Popen(sleep_cmd)  # 工人：该跟着一起死
+free, detached = procguard.spawn_detached(sleep_cmd)  # 用户的程序：不该被带走
+print(json.dumps({{"worker": worker.pid, "free": free.pid, "detached": detached}}), flush=True)
+time.sleep(1.0)
+os._exit(0)  # 与 runtime_state.force_exit() 同一条路：跳过 atexit / finally
+"""
+    work_dir = ROOT / "build" / "work" / "guard-test"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    script = work_dir / "spawn-two-children.py"
+    script.write_text(child_src.format(src=str(ROOT / "src")), encoding="utf-8")
+
+    out = sp.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        # 必须写死编码并允许替代符：子进程是我们自己的脚本（`aiforge.stdio` 把它的输出
+        # 统一成 UTF-8），而 `text=True` 单独用时按**本机 locale** 解码。在中文 Windows 上
+        # 就是 cp936，遇到 UTF-8 字节会在线程里抛 UnicodeDecodeError —— 更糟的是 Python
+        # 不会把异常抛给调用方，只是把 `out.stdout` 置成 None，于是下面那句
+        # “没报出 pid” 报的是解码问题以外的原因，谁都看不出真凶。
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert out.stdout is not None, "子进程 stdout 读不出来（解码失败？这条断言就是防它静默失明）"
+    lines = [line for line in out.stdout.splitlines() if line.strip().startswith("{")]
+    assert lines, f"子进程没报出 pid（rc={out.returncode}）：{(out.stderr or '')[:300]}"
+    pids = json.loads(lines[-1])
+    worker_pid, free_pid = int(pids["worker"]), int(pids["free"])
+    assert pids["detached"] is True, "送出去的程序必须报 detached=True（现在是问内核问出来的）"
+
+    # 父进程已经硬退出了，现在轮到看两个子进程的真实下场（去外面问进程表，
+    # 不信任何一方的说法：这里是父进程外的另一个进程，谁也别想蒙我）
+    deadline = time_mod.time() + 15
+    worker_gone = free_alive = False
+    while time_mod.time() < deadline:
+        worker_gone = not _pid_alive(worker_pid)
+        free_alive = _pid_alive(free_pid)
+        if worker_gone and free_alive:
+            break
+        time_mod.sleep(0.3)
+    try:
+        assert free_alive, f"用户的程序 pid={free_pid} 被本软件带走了一起杀了"
+        if os.name != "nt":
+            # 非 Windows 没有作业对象，工人靠优雅退出时回收（另有一条检查验它）
+            procguard._terminate_pid(worker_pid)  # noqa: SLF001 - 实验产物必须收尾
+            return f"非 Windows：父进程硬退出后用户的程序 pid={free_pid} 存活（无作业对象可依赖）"
+        assert worker_gone, f"工人进程 pid={worker_pid} 没随父进程死掉（作业对象没管住它）"
+        return f"父进程硬退出后：工人 pid={worker_pid} 被内核带走，用户的程序 pid={free_pid} 存活"
+    finally:
+        procguard._terminate_pid(free_pid)  # noqa: SLF001 - 实验产物，收尾不能留
+
+
+def t_single_instance() -> str:
+    """单实例锁：真两进程验收「第二个被拒 / 提示里的 pid 拿得到 / 崩溃后不残留」。
+
+    这条是打包冒烟翻车后补的：控制台打出「AI 3D Forge 已经在运行中（进程号 None）」。
+    查下去是同一个函数里的两个结构缺陷（都用真两进程实测复现）：
+
+    1. pid 写在被强制锁住的那一个字节上 —— `msvcrt.locking` 是**强制**锁，别的进程读锁区
+       直接 `PermissionError`，于是 `running_pid()` 永远返回 None：一个结构上不可能生效的提示。
+       修法是锁只占第 0 字节、pid 从第 1 字节起写（这两格是投毒实测钉住的）。
+       读方那两个看起来像必须的写法（`buffering=0`、给 `read` 明确长度）**实测拆掉
+       守卫仍绿** —— 因为 `acquire()` 总把文件裁到 `1+len(pid)`；它们是防御，
+       不得写成修复（子进程探了 14 种读法：唯一会被弹回的是「有尾巴 + 不带长度」）。
+       —— 这条否定结论同时拦住了一个很易犯的错：拿「加了才跑得通」当理由而不真验。
+    2. `open(p, "a+b")` 的当前位置是 **EOF 而不是 0**，而 `locking` 从当前位置开始锁 ——
+       锁哪一字节取决于锁文件当时多长。实测：残留 30 字节旧 pid 时第二个实例 acquire 成功，
+       即两个服务同时起、抢端口、弹两个窗口 —— 这个模块存在的唯一理由没做到。
+    3. 上一条的修法留下一个新风险：**pid 挪了位置，旧版写的记录就会被读成「少掉首位数字」
+       的数**（本机真残留过 6 字节的 `336456` → 读成 `36456`）。这数可能正好是一个活着的
+       外来进程 —— 实测过把这种形状喂进产品代码：`running_pid()` 报出外来 pid，
+       `focus_running_window()` 真把那个程序最小化的窗口还原到了前台（用例 3）。
+       修法是：认不出是“我们自己”的 pid 就不说、也不用（用例 1 是同一条的正向对照）。
+
+    所以除了三段正向断言，还留一条**空跑对照**：确认从第 0 字节整读真的会失败 ——
+    读得动就说明没人持锁，那整条用例只是在自我表扬。它只认 `PermissionError`；
+    而「子进程报 ACQUIRED」也不等于前提成立（产品里那条 `except Exception: return True`
+    会把「锁文件根本没建出来」吞成成功），所以还要先钉一句锁文件真的存在。
+    两处都是本机撞见过一次「pid 读到 None」的红之后补的（那一红未能复现，但
+    它暴露的形状是真的：前提没成立时后面的断言只会报一个让人猜不到的原因）。
+    顺着那条红查到的是**并发互踩**：沙箱名字先前不带 pid，两条自检同时跑就会互相删
+    对方的锁（实测 1 过 2 红），现在沙箱按 pid 分名 —— 验证工具自己不可靠，报出来的红只会误导人。
+    """
+    import stat
+    import subprocess as sp
+    import time as time_mod
+
+    from aiforge import paths as paths_mod
+    from aiforge import procguard
+    from aiforge import single_instance as si
+
+    child_src = (
+        "import os, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from aiforge import single_instance as si\n"
+        "print('ACQUIRED' if si.acquire() else 'REFUSED', os.getpid(), flush=True)\n"
+        "sys.stdin.readline()\n"
+        "si.release()\n"
+    )
+    # 一个只会“把指定字节写进去并锁住第 0 字节”的持有者：用它伪造旧版布局，
+    # 而不是在本进程里摆弄锁（本进程要当“被拒的那个第二实例”，拿着锁就没法验）。
+    holder_src = (
+        "import msvcrt, sys\n"
+        "fh = open(sys.argv[1], 'w+b')\n"
+        "fh.seek(0)\n"
+        "fh.write(sys.argv[2].encode('ascii'))\n"
+        "fh.flush()\n"
+        "fh.seek(0)\n"
+        "msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)\n"
+        "print('HELD', flush=True)\n"
+        "sys.stdin.readline()\n"
+    )
+    # 沙箱目录带 pid：同一个固定名字下开两条自检会互踩 —— 开头那一句 `rmtree(work)`
+    # 会把另一条**正持着锁**的沙箱删掉。实测（三条 t_single_instance 并发）：1 过 2 红，
+    # 红成什么形状看运气（子进程拿不到锁 / 锁文件不见了 → pid 读到 None）。
+    # 不修这一条，下次误红还会被当成产品缺陷查一遍。
+    work = ROOT / "build" / "work" / f"single-instance-test-{os.getpid()}"
+    if work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    child_script = work / "si_child.py"
+    child_script.write_text(child_src, encoding="utf-8")
+    holder_script = work / "si_holder.py"
+    holder_script.write_text(holder_src, encoding="utf-8")
+
+    old_data_dir = os.environ.get("AIFORGE_DATA_DIR")
+
+    def use_case(name: str) -> Path:
+        """把一个用例的数据目录指到独立沙箱（产品代码里路径是缓存的，必须刷）。"""
+        case = work / name
+        case.mkdir(parents=True, exist_ok=True)
+        os.environ["AIFORGE_DATA_DIR"] = str(case)
+        paths_mod.paths(refresh=True)
+        si._handle = None  # noqa: SLF001 - 用例之间不得残留上一个的句柄
+        si._lock_path = None  # noqa: SLF001
+        return case
+
+    def spawn_child():
+        proc = sp.Popen(
+            [sys.executable, str(child_script), str(SRC)],
+            stdin=sp.PIPE,
+            stdout=sp.PIPE,
+            stderr=sp.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        line = proc.stdout.readline().strip()
+        return proc, line
+
+    def wait_gone(proc) -> None:
+        proc.kill()
+        try:
+            proc.wait(timeout=15)
+        except sp.TimeoutExpired:  # pragma: no cover
+            pass
+
+    try:
+        # ---- 用例 1：别人正持着锁 ----
+        case1 = use_case("holder")
+        proc, line = spawn_child()
+        assert line.startswith("ACQUIRED"), f"子进程没拿到锁，用例无法开始：{line}"
+        child_pid = int(line.split()[-1])
+        lock1 = case1 / "app.lock"
+        # 子进程说「拿到了」不等于锁真的建起来了：`acquire()` 有一条
+        # `except Exception: return True`（宁可放行也不能卡住启动），它连「文件没建出来」
+        # 一起吞掉。本用例唯一的凭据是「另一个进程真持着锁」，所以先钉住前提再读 pid。
+        assert lock1.is_file(), (
+            f"子进程报了 ACQUIRED 却没留下锁文件（{case1}）—— 那是 acquire() 的兜底分支"
+            "把失败吞成了成功，不能拿它当前提"
+        )
+        got = si.running_pid()
+        assert got == child_pid, (
+            f"「已在运行中」提示里的 pid 是 {got}（子进程真 pid={child_pid}，"
+            f"锁文件 {lock1.stat().st_size} 字节）"
+        )
+        assert si.acquire() is False, "已有实例在跑时第二个实例拿到了锁（会抢端口、弹两个窗口）"
+        if os.name == "nt":
+            # 空跑对照：只有 `PermissionError` 才算「锁真的被别人拿着」。缺文件 / 别的
+            # OSError 都是用例前提坏了 —— 把它们记成通过就是自欺（原先这里捕的是
+            # `OSError`，等于把「根本没锁文件」也当成「有人持锁」）。
+            try:
+                lock1.read_bytes()  # 带缓冲、从第 0 字节读
+            except PermissionError:
+                pass
+            except OSError as exc:
+                raise AssertionError(f"读锁文件出了预期外的错（不是被锁住）：{exc!r}") from exc
+            else:
+                raise AssertionError("从第 0 字节整读竟然成功 → 没人持锁，这条用例是空跑（假安全感）")
+        # 被拒那一刻用户看到的那句话（走真路径：report_refusal 而不是拼好的字符串）
+        import contextlib
+        import io
+
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            said = si.report_refusal(headless=True)
+        assert str(child_pid) in said, f"提示里没报出对方 pid：{said}"
+        assert "None" not in said, f"提示里出现了 None：{said}"
+        assert said.strip() in printed.getvalue(), "这句话根本没被写出去（打包版里它就是用户唯一的反馈）"
+        # 弹窗条件真值表：错一格要么是验收脚本被模态框卡死，要么是用户依旧看不见
+        dialog = si._should_dialog  # noqa: SLF001 - 守卫要验的就是这个决策本身
+        assert dialog(frozen=True, has_console=False, headless=False, focused=False) is True
+        assert not dialog(frozen=True, has_console=False, headless=True, focused=False), "--server 跑验收时不许弹模态框"
+        assert not dialog(frozen=False, has_console=False, headless=False, focused=False), "源码环境不许弹"
+        assert not dialog(frozen=True, has_console=True, headless=False, focused=False), "有控制台就别多一个要点的框"
+        assert not dialog(frozen=True, has_console=False, headless=False, focused=True), "窗口已经带回前台了，别再弹框"
+        assert "None" not in si.refusal_message(None), "拿不到 pid 时不许写「进程号 None」"
+        # 唤回窗口这条：没有窗口可找时必须回答 False（答 True 就是「以为做了其实什么都没做」）
+        assert si.focus_running_window(0) is False, "对方 pid=0（肯定没有窗口）却报「已带回前台」"
+        assert si.focus_running_window(2 ** 30) is False, "一个不存在的 pid 不该被认成已唤回"
+        wait_gone(proc)
+        # 崩溃/被强杀后锁必须跟着没掉，否则用户从此打不开软件（内核收句柄要时间，轮询 10s）
+        recovered = False
+        deadline = time_mod.time() + 10
+        while time_mod.time() < deadline:
+            if si.acquire() is True:
+                recovered = True
+                break
+            si._handle = None  # noqa: SLF001
+            time_mod.sleep(0.3)
+        assert recovered, "持锁进程被硬杀后锁残留，用户崩溃后再也打不开软件"
+        si.release()
+
+        # ---- 用例 2：锁文件里有旧的长残留（锁位飘移的复现形状）----
+        case2 = use_case("stale-seed")
+        (case2 / "app.lock").write_bytes(b"9" * 30)
+        assert si.acquire() is True, "锁文件有旧残留时本实例反而拿不到锁"
+        proc2, line2 = spawn_child()
+        assert line2.startswith("REFUSED"), (
+            f"锁文件有残留时第二个实例照样起来了（两个服务同时跑）：{line2}"
+        )
+        wait_gone(proc2)
+        si.release()
+
+        # ---- 用例 4：打不开锁文件 ≠ 已有实例在跑 ----
+        # 排在用例 3 之前：那条在 Windows 分支末尾直接 `return`，放它后面永远跑不到。
+        # 旧写法把 open / truncate / write 的 OSError 也 `return False`，于是两种很日常
+        # 的形态都会让用户双击后听到「已经在运行中，请切换到已打开的窗口」而
+        # 根本没有窗口（退出码还是 0）—— 软件从此打不开，只能手动删掉那个锁。
+        # 用例 1 是同一条的反向对照：真有人持锁时必须照样拒，否则就是把互斥关掉了。
+        for shape, case_name in (("readonly", "locked-readonly"), ("isdir", "locked-isdir")):
+            case4 = use_case(case_name)
+            blocker = case4 / "app.lock"
+            if shape == "isdir":
+                blocker.mkdir()
+                note = "app.lock 变成一个目录（同步盘占位/上次异常留下的壳）"
+            else:
+                blocker.write_bytes(b"\x00" + str(os.getpid()).encode("ascii"))
+                os.chmod(blocker, stat.S_IREAD)
+                note = "锁文件被置成只读（备份/同步盘/误操作）"
+            try:
+                assert si.acquire() is True, (
+                    f"{note}：被当成「已有实例在跑」，用户再也起不了软件"
+                )
+            finally:
+                if blocker.is_file():
+                    os.chmod(blocker, stat.S_IWRITE | stat.S_IREAD)
+                si._handle = None  # noqa: SLF001 - 不许把沙箱句柄留给后面的用例
+
+        # ---- 用例 3：旧版布局的残留记录会被错读成「别人的 pid」----
+        # 1.0.2 把 pid 写在第 0 字节，本版从第 1 字节读：跨版本时读回来的是
+        # 「少掉首位数字」的数（本机真残留过 6 字节的 `336456`）。危险不在数错了，
+        # 而在于它可能正好是一个活着的外来进程：本机拿 `charmap.exe` 实测过一次 ——
+        # 未修前 `focus_running_window()` 把那个程序最小化的窗口还原到了前台（一个被拒的
+        # 第二实例动了用户另一个程序），修后回答 None / False。
+        # 用例 1 是同一条的正向对照：真是我们的进程时 pid 必须照样读得到
+        # —— 只验“拒外人”不验“认兄弟”，就会把唤窗整个关死也照样绿。
+        if os.name == "nt":
+            lock3 = use_case("old-layout") / "app.lock"
+            # 一个肯定不是我们的活进程（镜像名 `ping.exe`），只为本机回环，不碰外网
+            foreign = sp.Popen(
+                ["ping", "-n", "30", "127.0.0.1"],
+                stdout=sp.DEVNULL,
+                stderr=sp.STDOUT,
+            )
+            holder3 = None
+            try:
+                record = f"1{foreign.pid}"  # 旧布局：整个数从第 0 字节写起，首位是喂给错读的诱饵
+                holder3 = sp.Popen(
+                    [sys.executable, str(holder_script), str(lock3), record],
+                    stdin=sp.PIPE,
+                    stdout=sp.PIPE,
+                    stderr=sp.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                held = (holder3.stdout.readline() or "").strip()
+                assert held == "HELD", f"持有者没真的锁住第 0 字节，用例无法开始：{held!r}"
+                assert si.acquire() is False, "别人正持着锁，本实例却拿到了（前提坏了）"
+                # 先证明「错读」真的发生了：不这一步，`running_pid()` 回答 None
+                # 可能只是因为根本没读出数 —— 那就是假通过。
+                raw = si._recorded_pid(lock3)  # noqa: SLF001 - 要看的就是未经身份过滤的原始读法
+                assert raw == foreign.pid, (
+                    f"没造出「错读成外来 pid」的形状（读到 {raw}，外来 pid={foreign.pid}，"
+                    f"记录 {record}）—— 用例前提坏了"
+                )
+                assert procguard.process_alive(foreign.pid), "那个外来进程已退了，本用例是空跑"
+                assert si.running_pid() is None, f"把别人的 pid 认成了自己的：{si.running_pid()}"
+                said3 = si.refusal_message(si.running_pid())
+                assert str(foreign.pid) not in said3, f"给用户的那句话里出现了外来 pid：{said3}"
+                assert si.focus_running_window() is False, "拿外来 pid 唤了一次窗还报「已带回前台」"
+            finally:
+                if holder3 is not None:
+                    wait_gone(holder3)
+                if foreign.poll() is None:
+                    foreign.kill()
+                try:
+                    foreign.wait(timeout=10)
+                except sp.TimeoutExpired:  # pragma: no cover
+                    pass
+            return (
+                "真两进程：第二个实例被拒且能报出对方 pid（含被拒那句话真的写出去了、无「None」，"
+                "以及唤窗/弹框的决策真值表）；锁文件有旧残留时仍被拒（锁位钉死）；"
+                "持锁进程被硬杀后锁可再拿（含「第 0 字节真读不到」的空跑对照）；"
+                "锁文件只读/变成目录时放行而不是谎报已在运行；"
+                "旧版布局错读出来的外来 pid 不被认成自己（也不拿它唤窗）"
+            )
+        return (
+            "真两进程：第二个实例被拒且能报出对方 pid（含被拒那句话真的写出去了、无「None」，"
+            "以及唤窗/弹框的决策真值表）；锁文件有旧残留时仍被拒（锁位钉死）；"
+            "持锁进程被硬杀后锁可再拿（含「第 0 字节真读不到」的空跑对照）；"
+            "锁文件只读/变成目录时放行而不是谎报已在运行"
+        )
+    finally:
+        if old_data_dir is None:
+            os.environ.pop("AIFORGE_DATA_DIR", None)
+        else:
+            os.environ["AIFORGE_DATA_DIR"] = old_data_dir
+        paths_mod.paths(refresh=True)
+        si.release()
+        si._handle = None  # noqa: SLF001 - 不许把沙箱句柄留给后面的用例
+        si._lock_path = None  # noqa: SLF001
+        # 自己的沙箱自己收干净（ignore_errors：上面那个被硬杀的子进程可能还挂着句柄）
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    """问操作系统这个 pid 还在不在（不信任何缓存）。"""
+    import subprocess as sp
+    import sys
+
+    if sys.platform == "win32":
+        # **不解码**，直接在字节里找。原因（实测）：`text=True` 的解码编码跟着本机 locale /
+        # `-X utf8` 变，而 tasklist 按 OEM 代码页写（中文版还会把会话名列写成「控制台」），
+        # 一但对不上就抛 UnicodeDecodeError，`out.stdout` 变成 None —— 那时这个函数
+        # 对任何 pid 都回答「不在」。用在轮询循环里，等于把「工人进程没被杀掉」这种
+        # 安全断言变成**假通过**：静默失明最要命的一种方向。
+        # CSV 格式给出确定的字段边界，`","<pid>","` 只会命中 PID 列，不会撞上别的数字。
+        out = sp.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+            capture_output=True,
+        )
+        return f'","{pid}","'.encode("ascii") in out.stdout
+    try:
+        os.kill(pid, 0)  # noqa: S606 - 探测存活的标准写法（signal 0）
+        return True
+    except OSError:
+        return False
+
+
+def t_no_unguarded_subprocess() -> str:
+    """除 `procguard.py` 自己，业务代码不得直接 `subprocess.run/Popen` 派生进程。
+
+    为什么钉这一条：子进程能不能随本软件一起死，完全取决于它有没有被登记并纳入作业。
+    只要还有一个地方裸 `subprocess.run`，那份保证就漏了一个洞 —— 而洞只有在
+    "用户关了软件后后台还在算"这种现场才会被发现，测试根本追不到。
+
+    只认字面上的 `subprocess.xxx(...)` 不够：改个名 `import subprocess as sp` 就绕过了，
+    所以先把本文件里 subprocess 的所有别名收集起来再判。
+    """
+    import ast
+
+    allowed = {ROOT / "src" / "aiforge" / "procguard.py"}
+    bare_spawn_names = {"run", "Popen", "call", "check_call", "check_output"}
+    offenders: list[str] = []
+    checked = 0
+    for path in sorted((ROOT / "src" / "aiforge").rglob("*.py")):
+        if path in allowed:
+            continue
+        checked += 1
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        aliases = {"subprocess"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "subprocess":
+                        aliases.add(alias.asname or "subprocess")
+            elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+                for alias in node.names:
+                    if alias.name in bare_spawn_names:
+                        offenders.append(
+                            f"{path.relative_to(ROOT).as_posix()}:{node.lineno} "
+                            f"from subprocess import {alias.name}"
+                        )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr in bare_spawn_names
+                and isinstance(func.value, ast.Name)
+                and func.value.id in aliases
+            ):
+                offenders.append(
+                    f"{path.relative_to(ROOT).as_posix()}:{node.lineno} {func.value.id}.{func.attr}"
+                )
+    assert not offenders, "这些派生进程没走 procguard（会被本软件遗漏回收）：" + "、".join(offenders)
+    # 一什么都没扫到的守卫比没有守卫更糟（假安全感），所以卡住扇区规模
+    assert checked >= 20, f"只扫到 {checked} 个模块，明显不对（目录结改了吗？）"
+    return (
+        f"扫过 {checked} 个模块（含别名）：派生进程全部走 procguard"
+        "（工人纳入作业，用户的程序走 spawn_detached）"
+    )
+
+
+def _ast_scopes(tree):
+    """把一棵树切成作用域：模块顶层 + 每个函数体（各自，不往上叠加）。"""
+    import ast
+
+    yield "<module>", tree
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield node.name, node
+
+
+def _walk_scope(scope):
+    """一个作用域内的节点；进到嵌套函数/lambda 就停（那里的变量是另一回事）。"""
+    import ast
+
+    stack = [scope]
+    while stack:
+        node = stack.pop()
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            stack.append(child)
+
+
+def _dict_keys_of(node) -> set[str]:
+    """从字面量里能静态看出来的 dict 键（`{{...}}` / `dict(a=1)` / `x["a"]`）。"""
+    import ast
+
+    keys: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Dict):
+            keys.update(
+                k.value for k in sub.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)
+            )
+        elif (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Name)
+            and sub.func.id == "dict"
+        ):
+            keys.update(kw.arg for kw in sub.keywords or [] if kw.arg)
+        elif (
+            isinstance(sub, ast.Subscript)
+            and isinstance(sub.slice, ast.Constant)
+            and isinstance(sub.slice.value, str)
+        ):
+            keys.add(sub.slice.value)
+    return keys
+
+
+def _keys_from_value(value, helper_keys: dict[str, set[str]]) -> set[str]:
+    """`_popen_kwargs()` / `dict(_popen_kwargs())` 这种表达式会展开出哪些键。"""
+    import ast
+
+    if not isinstance(value, ast.Call):
+        return set()
+    func = value.func
+    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+    keys = set(helper_keys.get(name, set()))
+    if name == "dict" and value.args:
+        keys |= _keys_from_value(value.args[0], helper_keys)
+    return keys
+
+
+def t_no_kwargs_collision() -> str:
+    """同一个调用里，具名参数不得与 `**` 展开出来的键重名。
+
+    实测中过的枪（就在产品代码里，已修）：OpenSCAD 静默安装那一行写成了
+    `subprocess.run(..., creationflags=CREATE_NO_WINDOW, **_popen_kwargs())`，
+    而 `_popen_kwargs()` 里已经有一份 creationflags —— Python 在参数绑定阶段就
+    报 TypeError，安装程序一行都跑不到。它藏在"只有真去装 OpenSCAD 才走得到"
+    的分支里，接口测试与 E2E 都碰不到，只能静态钉住。
+
+    中转变量也要认：`kwargs = dict(_popen_kwargs()); ...; run(cmd, timeout=..., **kwargs)`
+    是编译那条路径的写法，只看 `**函数()` 会漏掉它。
+    """
+    import ast
+
+    helper_names = {"_popen_kwargs"}
+    sources = {
+        path: ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for path in sorted((ROOT / "src" / "aiforge").rglob("*.py"))
+    }
+
+    # 1) helper 到底给出哪些键：不靠跑一次（跑一次只能拿到当前平台的键集），直接读字面量
+    helper_keys: dict[str, set[str]] = {name: set() for name in helper_names}
+    for tree in sources.values():
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in helper_names
+            ):
+                helper_keys[node.name] |= _dict_keys_of(node)
+    assert helper_keys["_popen_kwargs"], "没从 `_popen_kwargs()` 里读到任何键 —— 这条守卫什么都没查"
+    assert "creationflags" in helper_keys["_popen_kwargs"], (
+        f"`_popen_kwargs()` 的键集里没有 creationflags（读到 {sorted(helper_keys['_popen_kwargs'])}）"
+        " —— 这条守卫就是冲着重名参数写的，实现改了要同步改这里"
+    )
+
+    failures: list[str] = []
+    sites = 0
+    for path, tree in sources.items():
+        rel = path.relative_to(ROOT).as_posix()
+        for scope_name, scope in _ast_scopes(tree):
+            # 2) 本作用域里的中转变量：`x = dict(helper())` / `x = {{...}}` / `x["k"] = v`
+            var_keys: dict[str, set[str]] = {}
+            for node in _walk_scope(scope):
+                if not isinstance(node, ast.Assign):
+                    continue
+                keys = _keys_from_value(node.value, helper_keys)
+                if isinstance(node.value, (ast.Dict, ast.Call)):
+                    keys |= _dict_keys_of(node.value)
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and keys:
+                        var_keys.setdefault(target.id, set()).update(keys)
+                    elif (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and isinstance(target.slice, ast.Constant)
+                        and isinstance(target.slice.value, str)
+                    ):
+                        var_keys.setdefault(target.value.id, set()).add(target.slice.value)
+            # 3) 每个调用：把 `**` 展开出的键集拼起来，与具名参数求交
+            for node in _walk_scope(scope):
+                if not isinstance(node, ast.Call):
+                    continue
+                expanded: set[str] = set()
+                for keyword in node.keywords or []:
+                    if keyword.arg is not None:
+                        continue
+                    expanded |= _keys_from_value(keyword.value, helper_keys)
+                    if isinstance(keyword.value, ast.Name):
+                        expanded |= var_keys.get(keyword.value.id, set())
+                if not expanded:
+                    continue
+                sites += 1
+                given = {keyword.arg for keyword in node.keywords or [] if keyword.arg}
+                clash = given & expanded
+                if clash:
+                    failures.append(f"{rel}:{node.lineno}（{scope_name}）重复传 {sorted(clash)}")
+    assert not failures, "具名参数与 **kwargs 重名（参数绑定就会 TypeError）：" + "；".join(failures)
+    assert sites >= 4, f"只查到 {sites} 处 `**` 展开，明显不对（守卫没生效？）"
+    return f"{sites} 处 `**kwargs` 展开与具名参数零冲突（键集 {sorted(helper_keys['_popen_kwargs'])}）"
+
+
+def t_subprocess_decoding() -> str:
+    """读子进程的文本输出，不得让一次解码失败把结果“说没”了。
+
+    为什么要钉（实测踩过）：`subprocess.run(..., text=True)` 不写 `encoding=` 时，解码
+    编码跟着**本机 locale** 走（UTF-8 模式 / `-X utf8` / 区域设置都能改它），而子进程的输出
+    编码是另一个参数（`PYTHONIOENCODING`，由 `aiforge.stdio` 统一成 UTF-8）。两个不一致时，
+    Python **不会**把 UnicodeDecodeError 抛给调用方，而是报在工作线程里、然后把
+    `CompletedProcess.stdout` 置为 None。接下来 `(proc.stdout or "")` 就把它当成“输出为空”。
+
+    最坑的是它不一定报错，会**假通过**：`_pid_alive()` 以前就是 `str(pid) in (out.stdout or "")`，
+    一旦 stdout 变 None，它对任何 pid 都回答“进程已死”——“工人进程真的被内核带走了”
+    这条安全断言就再也不会红。所以这里除了静态规则，还把“严格解码 → None / errors=
+    "replace" → 拿得到文本”真跑一遍当证据（同一个字节流，两种读法，结论摆在一起）。
+
+    规则（只两条，不引入新依赖）：
+      1) `text=True` / `universal_newlines=True` 的调用必须同时写 `encoding=` 与 `errors=`
+         —— 两个都不许跟着环境变；
+      2) 派生的是我们自己的 Python（`[sys.executable, ...]`）时，`encoding` 必须是 `"utf-8"`
+         （输出由 `aiforge.stdio` 统一）。
+    外部工具（tasklist / git / 切片器）的输出不是 UTF-8：那就**不要转成文本**，直接拿字节
+    （见 `_pid_alive`：它扫的是 `out.stdout` 字节，根本不猜编码）。
+    """
+    import ast
+    import subprocess
+
+    spawn_names = {"run", "Popen", "call", "check_call", "check_output"}
+
+    def _call_name(node: ast.Call) -> str:
+        func = node.func
+        return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+
+    def _is_python_child(node: ast.Call) -> bool:
+        """argv[0] 是不是 `sys.executable`（包括 `import sys as _sys` 这种改名）。"""
+        if not node.args:
+            return False
+        first = node.args[0]
+        if isinstance(first, (ast.List, ast.Tuple)):
+            if not first.elts:
+                return False
+            first = first.elts[0]
+        return (
+            isinstance(first, ast.Attribute)
+            and first.attr == "executable"
+            and getattr(first.value, "id", "").rstrip("_").endswith("sys")
+        )
+
+    def _scan_decoding(src: str, where: str) -> list[str]:
+        """返回命中的问题（带行号）；只看字面关键字，不执行被测代码。"""
+        bad: list[str] = []
+        # filename 必须给：`ast.parse` 也会像 compile 一样把 SyntaxWarning 直接发到
+        # stderr，不给文件名的话报的是 `<unknown>:6`，谁也不知道去哪找（本轮实测）。
+        tree = ast.parse(src, filename=where)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or _call_name(node) not in spawn_names:
+                continue
+            given = {keyword.arg: keyword.value for keyword in node.keywords if keyword.arg}
+            if not {"text", "universal_newlines"} & set(given):
+                continue
+            missing = sorted({"encoding", "errors"} - set(given))
+            if missing:
+                bad.append(
+                    f"第 {node.lineno} 行：text 模式缺 {missing} —— 解码编码/容错策略不得跟着环境变，"
+                    "解码失败只会把 stdout 变成 None"
+                )
+                continue
+            if _is_python_child(node):
+                value = given["encoding"].value if isinstance(given["encoding"], ast.Constant) else None
+                if value != "utf-8":
+                    bad.append(
+                        f"第 {node.lineno} 行：子进程是我们自己的 Python，encoding 必须是 \"utf-8\""
+                        f"（实测为 {value!r}）"
+                    )
+        return bad
+
+    # 1) 阳性对照：三类违规都要报得出（不拿真实代码当试验品，隔离在字串里）
+    planted = "\n".join(
+        [
+            "import subprocess, sys",
+            "subprocess.run([sys.executable, 'x.py'], capture_output=True, text=True)",
+            "subprocess.run(['tasklist'], capture_output=True, text=True, encoding='utf-8')",
+            "subprocess.run([sys.executable, 'x.py'], capture_output=True, text=True,"
+            " encoding='gbk', errors='replace')",
+        ]
+    )
+    hits = _scan_decoding(planted, "<planted>")
+    assert len(hits) == 3, f"投毒没报全（{hits}）—— 守卫自己坏了，不报就是全仓都没人看"
+    # 2) 阴性对照：写全了的不得报（否则下一步就是被人用 noqa 绕过去）；
+    #    字节模式（不转文本）也不得报 —— tasklist 这类工具就该这么读。
+    clean = "\n".join(
+        [
+            "import subprocess, sys",
+            "subprocess.run([sys.executable, 'x.py'], capture_output=True, text=True,"
+            " encoding='utf-8', errors='replace')",
+            "subprocess.run(['tasklist'], capture_output=True)",
+            "subprocess.run(['tasklist'], capture_output=True, universal_newlines=True,"
+            " encoding='utf-8', errors='replace')",
+        ]
+    )
+    assert not _scan_decoding(clean, "<clean>"), f"写全了却被误报：{_scan_decoding(clean, '<clean>')}"
+
+    # 3) 真扫仓：产品代码 + 工具脚本 + main.py
+    offenders: list[str] = []
+    text_calls = 0
+    corpus = (
+        sorted((ROOT / "scripts").rglob("*.py"))
+        + sorted((ROOT / "src").rglob("*.py"))
+        + [ROOT / "main.py"]
+    )
+    for path in corpus:
+        src = path.read_text(encoding="utf-8", errors="replace")
+        rel = path.relative_to(ROOT).as_posix()
+        for hit in _scan_decoding(src, rel):
+            offenders.append(f"{rel}:{hit}")
+        tree = ast.parse(src, filename=str(path))
+        text_calls += sum(
+            1
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and _call_name(node) in spawn_names
+            and {keyword.arg for keyword in node.keywords} & {"text", "universal_newlines"}
+        )
+    assert text_calls >= 8, f"全仓只数到 {text_calls} 处 text 模式子进程，与实测不符（扫描失效？）"
+    assert not offenders, "子进程输出读取不安全：" + "；".join(offenders)
+
+    # 4) 真跑一遍：同一串字节，严格解码得到 None、errors="replace" 拿得到文本。
+    #    这一段自己必须合本文件的规则，所以**不能在自检进程里**直接写一个不带 errors=
+    #    的调用（那会被上面那条扫到，也刚好说明规则容易违反）：拿一个孙进程去跑两种读法，
+    #    结果以 ASCII 行传回来。孙进程里还要把 threading.excepthook 静掉 —— 读者线程的
+    #    异常默认直接打到本进程 stderr，那就是上一轮全量自检里“Exception in thread”噪音的来源。
+    work_dir = ROOT / "build" / "work" / "guard-test"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    writer = work_dir / "not-utf8-output.py"
+    # GBK 的“有效”四个字节：对 UTF-8 严格解码就是非法序列。
+    # 写成 bytes([...]) 而不是直接嵌字节：上一版把裸 GBK 字节写进 .py，Python 先按
+    # UTF-8 读源码就拒载了（“误报”的方向反了，验证不到任何东西）。
+    writer.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'HEAD' + bytes([0xD3, 0xD0, 0xD0, 0xA8]) + b'TAIL')\n",
+        encoding="ascii",
+    )
+    demo_src = (
+        "import subprocess, sys, threading\n"
+        "threading.excepthook = lambda args: None\n"
+        f"W = {str(writer)!r}\n"
+        "PY = sys.executable\n"
+        "a = subprocess.run([PY, W], capture_output=True, text=True, encoding='utf-8', timeout=60)\n"
+        "b = subprocess.run([PY, W], capture_output=True, text=True, encoding='utf-8',"
+        " errors='replace', timeout=60)\n"
+        "print('STRICT_IS_NONE', a.stdout is None)\n"
+        "print('TOLERANT_HEAD', (b.stdout or '').startswith('HEAD'))\n"
+        "print('TOLERANT_HAS_REPLACEMENT', '\\ufffd' in (b.stdout or ''))\n"
+    )
+    demo = subprocess.run(
+        [sys.executable, "-c", demo_src],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+    evidence = (demo.stdout or "") + (demo.stderr or "")
+    assert "STRICT_IS_NONE True" in evidence, (
+        f"严格解码居然没把 stdout 变成 None（{evidence!r}）"
+        " —— 用例前提变了，这条守卫在看一个不存在的问题"
+    )
+    assert "TOLERANT_HEAD True" in evidence and "TOLERANT_HAS_REPLACEMENT True" in evidence, (
+        f"errors='replace' 没能保住文本：{evidence!r}"
+    )
+    return (
+        f"{text_calls} 处 text 模式子进程全部写明了 encoding+errors；"
+        "实测对照：同一字节流严格解码得到 None（静默失明），errors='replace' 得到完整文本"
+    )
+
+
+def t_no_syntax_warnings() -> str:
+    """每个会提交的 .py 编译时不得发出任何警告（尤其是 SyntaxWarning）。
+
+    为什么单独钉（本轮实测撞出来的）：一个探针的文档串里写了 Windows 路径
+    （`build` 反斜杠 `work`），“反斜杠 + w”不是合法转义 → Python 往 stderr 打
+    SyntaxWarning。看上去只是“难看”，实际上三件事都真的碰过：
+
+      * PowerShell 把子进程的 stderr 当错误看待（`NativeCommandError`），验收脚本
+        会被一条警告带红；本轮就是靠“stderr 不为空”发现问题的。
+      * 自检里多处 `(proc.stderr or "")` 会被拿去拼进断言消息/解析输出，警告混在
+        里面就会误判（见 `t_subprocess_decoding`）。
+      * “反斜杠 + 字母”少写一个 `r` 本身就是真 bug：写进文档串的这个字面量（反斜杠 d）
+        实际得到的是字面 `d`，正则静默改义；Python 3.12 起这是警告，将来会变成 SyntaxError。
+
+    实现只用标准库：`warnings.catch_warnings(record=True)` + `compile()`，不拉 ruff。
+    """
+    import warnings
+
+    def compile_warnings(src: str, where: str) -> list[str]:
+        """编译一份源码，返回它发出的警告文本（不执行它）。"""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                compile(src, where, "exec")
+            except SyntaxError as exc:  # 语法错自有「产品代码可编译」那条管，这里不抢话
+                return [f"SyntaxError: {exc}"]
+        return [f"{item.category.__name__}: {item.message}" for item in caught]
+
+    # 阳性对照：不写 r 前缀的正则字面量必须报（隔离在字串里，不动真代码）
+    planted = compile_warnings('pattern = "\\d+\\.\\d+"\n', "<planted>")
+    assert planted, "投毒一个非法转义序列居然没报 —— 这条守卫什么都没查"
+    # 阴性对照：raw 字符串不得报（否则下一步就是到处加 noqa）
+    assert not compile_warnings('pattern = r"\\d+\\.\\d+"\n', "<clean>"), "raw 字符串被误报"
+
+    offenders: list[str] = []
+    scanned = 0
+    for path in _shipped_text_files():
+        if path.suffix != ".py":
+            continue
+        scanned += 1
+        rel = path.relative_to(ROOT).as_posix()
+        for warning in compile_warnings(path.read_text(encoding="utf-8", errors="replace"), rel):
+            offenders.append(f"{rel}: {warning}")
+    assert scanned >= 50, f"只编译了 {scanned} 个 .py，与仓库规模不符（扫描失效？）"
+    assert not offenders, "这些文件编译时会报警告：\n" + "\n".join(sorted(offenders))
+    return f"{scanned} 个 .py 全部静默编译通过（含双向对照：少个 r 前缀报、raw 字符串不报）"
 
 
 def t_progress_accuracy() -> str:
@@ -1637,6 +2863,446 @@ def t_parts_library() -> str:
     return checked or f"{len(parts_lib.PARTS)} 个零件全部通过实测"
 
 
+def t_deterministic_part() -> str:
+    """标准零件确定性直出：需求明确时程序直接生成已验证几何，不靠 AI 填参。
+
+    为什么必须有：用户反馈「67 转 77 滤镜环始终做不对」——AI 填参/手写几何
+    都可能错（口径填反、手写螺纹不封闭）。直出把口径映射与几何都交给程序，
+    这里钉住三件事：映射正确、语序含糊时回退 AI、直出源码真编译且几何正确。
+    """
+    import math as _math
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    from aiforge import compiler as _compiler, mesh as _mesh, scad as _scad
+    from aiforge.parts import catalog as parts_lib
+
+    # 1) 明确转换 → 命中 filter_adapter 且口径映射正确（male=67, female=77）
+    call = parts_lib.extract_call("建模一个67mm转77mm的滤镜转接环")
+    assert call is not None, "明确的 67 转 77 应当能直出"
+    part, values = call
+    assert part.id == "filter_adapter", part.id
+    assert values["male_d"] == 67 and values["female_d"] == 77, values
+
+    # 2) 语序含糊（两个口径之间夹别的词）→ 必须回退 AI，不能猜
+    assert parts_lib.extract_call("77mm滤镜用在67mm镜头上") is None, "语序含糊必须回退 AI"
+    # 3) 无关需求 → 不直出
+    assert parts_lib.extract_call("设计一个桌面手机支架，高度 100mm") is None
+    # 3b) 用户显式给的总高必须被尊重（否则直出会 silently 用默认高）
+    with_h = parts_lib.extract_call("建模一个67mm转77mm的滤镜转接环，高10mm")
+    assert with_h is not None and with_h[1]["height"] == 10, with_h
+    # 3c) 非标准螺距 → 回退 AI；标准螺距 → 仍可直出
+    assert parts_lib.extract_call("67转77 螺距1.0") is None, "非标准螺距必须回退 AI"
+    assert parts_lib.extract_call("M67×0.75转M77×0.75 转接环") is not None, "标准螺距应可直出"
+
+    # 4) 直出源码：过安全校验 + 真编译 + 几何正确（水密/单件/尺寸/镂空）
+    source = parts_lib.render_source(part, values, name="67转77滤镜转接环", summary=part.summary)
+    validation = _scad.validate(source)
+    assert validation.ok, validation.issues
+    with _tempfile.TemporaryDirectory(prefix="det_") as tmp:
+        res = _compiler.compile_to_stl(source, _Path(tmp), basename="model")
+        assert res.ok and res.stl_path, res.message or res.fatal
+        m = _mesh.analyze(_Path(res.stl_path))
+        assert m.watertight and m.solid_parts == 1, (m.watertight, m.solid_parts)
+        assert abs(m.bbox[0] - 81.7) <= 0.7 and abs(m.bbox[2] - 8.4) <= 0.7, m.bbox
+        verts, _ = _mesh.read_triangles(_Path(res.stl_path))
+        radii = [_math.hypot(p[0], p[1]) for p in verts]
+        assert min(radii) / max(radii) > 0.3, "中心必须镂空"
+        # 螺纹度量必须朝向鲁棒：翻转后的升口径环也应量出真实牙深(~0.46)，
+        # 而非固定单带跨到挡肩过渡区量出的假值(~2.46)。
+        depth = _mesh.measure_thread_depth(verts)
+        assert depth is not None and 0.3 <= depth <= 1.0, f"牙深应≈0.46，实测 {depth}"
+    return "明确转换直出已验证几何；语序含糊/无关需求正确回退 AI"
+
+
+def t_glm_provider() -> str:
+    """提供商感知：GLM/智谱 与 DeepSeek 的视觉模型、输出预算、错误码翻译各自正确。
+
+    为什么必须有：图片复核固定用一个视觉模型，而智谱 GLM-4V-Flash 的 max_tokens
+    硬上限 1024（超出报 1210）、模型名也不同；把 DeepSeek 那套 8192 直接发过去必然报错。
+    实测 glm-4.7-flash 高峰期返 429/1305（瞬态过载），错误码必须翻译成人话。
+    """
+    from aiforge import llm as llm_mod
+
+    assert llm_mod.detect_provider("https://api.deepseek.com") == "deepseek"
+    assert llm_mod.detect_provider("https://open.bigmodel.cn/api/paas/v4") == "glm"
+    assert llm_mod.detect_provider("https://example.com/v1") == "openai"
+    # 视觉模型随提供商切换
+    assert llm_mod.vision_model_for("https://open.bigmodel.cn/api/paas/v4") == "glm-4v-flash"
+    assert llm_mod.vision_model_for("https://api.deepseek.com") == "deepseek-flash"
+    # 输出预算：智谱视觉硬上限 1024；DeepSeek 保持 8192/16384
+    assert llm_mod.vision_max_tokens_for("https://open.bigmodel.cn/x") == (1024, 1024)
+    assert llm_mod.vision_max_tokens_for("https://api.deepseek.com") == (8192, 16384)
+    glm_url = "https://open.bigmodel.cn/api/paas/v4"
+    e = llm_mod._friendly_http_error(429, '{"error":{"code":"1305"}}', glm_url)
+    assert "访问量过大" in e.message and e.code == "API_UNREACHABLE", e.message
+    e = llm_mod._friendly_http_error(400, '{"error":{"code":"1113"}}', glm_url)
+    assert "余额不足" in e.message, e.message
+    e = llm_mod._friendly_http_error(401, '{"error":{"code":"1001"}}', glm_url)
+    assert e.code == "API_KEY_INVALID", e.code
+    # 429 限流文案随提供商切换（不能对 GLM 用户说「被 DeepSeek 限流」）
+    e = llm_mod._friendly_http_error(429, '{"error":{"code":"1130"}}', glm_url)
+    assert "智谱 GLM" in e.message and "限流" in e.message, e.message
+    e = llm_mod._friendly_http_error(429, "", "https://api.deepseek.com")
+    assert "DeepSeek" in e.message, e.message
+    # 5xx / 404 文案也随提供商切换
+    e = llm_mod._friendly_http_error(500, "", glm_url)
+    assert "智谱 GLM" in e.message, e.message
+    e = llm_mod._friendly_http_error(404, "", glm_url)
+    assert "open.bigmodel.cn" in (e.hint or ""), e.hint
+    e = llm_mod._friendly_http_error(500, "", "https://api.deepseek.com")
+    assert "DeepSeek" in e.message, e.message
+    # 思考模型思维链开关：glm 关闭（烧预算/拖慢），DeepSeek 不动
+    g = llm_mod.DeepSeekClient("k", glm_url, "glm-4.7-flash")
+    d = llm_mod.DeepSeekClient("k", "https://api.deepseek.com", "deepseek-chat")
+    assert g._thinking_control() == {"thinking": {"type": "disabled"}}
+    assert d._thinking_control() == {}
+    # glm 读超时放大（思考模型首字慢），DeepSeek 保持原值
+    assert g.timeout.read > d.timeout.read
+    # 视觉复核二级判据：不守首行契约但描述了强问题 → 算报告；纯复述指标 → 无结论
+    assert llm_mod.parse_snapshot_verdict("模型整体不错\n但有一根筋悬空在腔体里") is True
+    assert llm_mod.parse_snapshot_verdict(
+        "好的，包围盒 81.7 x 81.7 x 9.0 mm，水密单一实体，可用于 3D 打印。"
+    ) is False
+    assert llm_mod.parse_snapshot_verdict("结论：无明显问题") is False
+    assert llm_mod.parse_snapshot_verdict("结论：有问题\n底座悬空") is True
+    # 同提供商降级：仅 429/5xx 且未降级过时切换，并改写 payload；其余不切
+    fb = llm_mod.DeepSeekClient("k", glm_url, "glm-4.7-flash", fallback_model="glm-4-flash")
+    payload = {"model": fb.model}
+    assert fb._try_fallback(429, payload) is True, "429 应触发降级"  # noqa: SLF001
+    assert fb.model == "glm-4-flash" and payload["model"] == "glm-4-flash"
+    assert fb._try_fallback(429, payload) is False, "已降级过不应再切"  # noqa: SLF001
+    nb = llm_mod.DeepSeekClient("k", glm_url, "glm-4.7-flash")
+    assert nb._try_fallback(429, {"model": nb.model}) is False, "没配备用模型不降级"  # noqa: SLF001
+    assert nb._try_fallback(404, {"model": nb.model}) is False, "404 不降级"  # noqa: SLF001
+    # DeepSeek 分支不受影响
+    e = llm_mod._friendly_http_error(402, "", "https://api.deepseek.com")
+    assert "余额不足" in e.message and e.code == "API_KEY_INVALID"
+    return "提供商识别/视觉模型/输出预算/错误码翻译 均按提供商正确分流"
+
+
+def t_hole_measure() -> str:
+    """孔径射线实测：有孔量出直径、实心返回 None、**偏心孔也要量对**（HANDOVER P0）。
+
+    阴性对照：实心块必须返回 None —— 否则无法区分「真的量到孔」和「判据放松了」。
+
+    偏心孔这一条是本轮补的：旧实现直接从 `(0,0)` 出发走射线，只对**同心**的
+    竖直孔成立。实测两个都是 Ø10 的孔（`cube(center=true)` 减 `cylinder(d=10)`），
+    唯一的差别是孔偏心 12mm：
+        孔在中心   → 9.8  ✅
+        孔偏心 12mm → None ❌  （(0,0) 落在实体里，直接判「这个高度没有孔」）
+    后果很重：判据据此报「孔径没改到」，而 AI 其实改对了 —— 用户的正确修改被判失败。
+    偏心孔在真实模型里很常见（面板安装孔、阵列孔、`translate([x,y,0]) cylinder`）。
+
+    --- 但光修偏心孔不够：旧守卫自己也是**照不到问题的守卫** ---
+    上面那三个用例全部用 `cube(center=true)` + `$fn=64`，面数只有 **272**，
+    而当时代码里有个 `_HOLE_AXIS_MAX_FACES = 1200` 的代价上限 —— **上限永远咬不到**，
+    所以这条守卫一直是绿的，而用户机器上 14 份真实项目 STL 的面数是 3,041~122,771，
+    **14/14 全部超线**：每一份真实模型的孔都被那个过期常数直接判成「量不到」。
+    那个 1200 是探测步长还是 0.1mm 那一版量出来的，步长优化到 0.6mm 后没人重取。
+    所以本轮加的用例**必须把面数顶到 1500 以上**，否则又是绿着不工作。
+
+    另一半盲区：**模型不以原点为中心**时，`(0,0)` 是个顶角，走不出材料对 ——
+    就算孔完全同心也返回 None（AI 生成件经常不写 `center=true`）。
+
+    --- 同一个函数里还验了「实心底」那条新判据 ---
+    贴底/贴顶扫线（`measure_end_coverage`）的读数直接决定产品对用户说“底封住了”，
+    所以它必须在**真编译的网格**上有参考值：笔筒 95.8/8.5、开口管 8.5/8.5、
+    倒杯 8.5/100（本机实测）。这三组数字分得开，才能说“分档”不是空话；
+    预算与耗时也用值验，因为这条在作业前台跑（119s 那一版卡死过界面）。
+    """
+    import tempfile as _tempfile
+    import time as _time
+    from pathlib import Path as _Path
+
+    from aiforge import compiler as _compiler, mesh as _mesh
+
+    hole_scad = "difference(){ cube([40,40,10], center=true); cylinder(d=10, h=12, center=true, $fn=64); }\n"
+    solid_scad = "cube([40,40,10], center=true);\n"
+    # 同一个 Ø10 的孔，但偏心 12mm —— 旧实现在这里返回 None
+    offcenter_scad = (
+        "difference(){ cube([40,40,10], center=true);"
+        " translate([12,0,0]) cylinder(d=10, h=12, center=true, $fn=64); }\n"
+    )
+    # **非居中模型 + 同心孔**，而且面数要超过旧的 1200 上限（实测 3,616 面）：
+    # `$fn=900` 把孔壁敲密；模型不写 center=true，所以 (0,0) 是顶角。
+    noncenter_scad = (
+        "$fn = 900;\n"
+        "difference(){ cube([60,40,8]); translate([30,20,-1]) cylinder(d=10, h=10); }\n"
+    )
+    noncenter_solid_scad = "$fn = 900;\n cube([60,40,8]);\n"
+    with _tempfile.TemporaryDirectory(prefix="hole_") as tmp:
+        d = _Path(tmp)
+        r1 = _compiler.compile_to_stl(hole_scad, d, "hole")
+        assert r1.ok and r1.stl_path, r1.message or r1.fatal
+        m1 = _mesh.analyze(_Path(r1.stl_path))
+        assert m1.hole_diameter_mm is not None and abs(m1.hole_diameter_mm - 10.0) <= 0.3, (
+            f"Ø10 的孔应量出≈10，实测 {m1.hole_diameter_mm}"
+        )
+        r2 = _compiler.compile_to_stl(solid_scad, d, "solid")
+        assert r2.ok and r2.stl_path, r2.message or r2.fatal
+        m2 = _mesh.analyze(_Path(r2.stl_path))
+        assert m2.hole_diameter_mm is None, f"实心块不应量出孔，实测 {m2.hole_diameter_mm}"
+
+        r3 = _compiler.compile_to_stl(offcenter_scad, d, "offc")
+        assert r3.ok and r3.stl_path, r3.message or r3.fatal
+        m3 = _mesh.analyze(_Path(r3.stl_path))
+        assert m3.hole_diameter_mm is not None, (
+            "偏心孔量不到：孔轴不能假设在 (0,0)（这会让正确的孔径改动被判成「没改到」）"
+        )
+        assert abs(m3.hole_diameter_mm - 10.0) <= 0.3, (
+            f"偏心 Ø10 的孔应量出≈10，实测 {m3.hole_diameter_mm}"
+        )
+        # 剖面（6 个高度）也必须能测到偏心孔，否则改动判据拿到的全是 None
+        assert any(v is not None for v in m3.hole_profile), (
+            f"偏心孔的 hole_profile 全是 None：{m3.hole_profile}"
+        )
+
+        # --- 本轮补的覆盖：非居中模型 + 同心孔 + 面数超旧的 1200 上限 ---
+        r4 = _compiler.compile_to_stl(noncenter_scad, d, "nonc")
+        assert r4.ok and r4.stl_path, r4.message or r4.fatal
+        _t0 = _time.perf_counter()
+        m4 = _mesh.analyze(_Path(r4.stl_path))
+        _analyze_cost = _time.perf_counter() - _t0
+        # 这条断言是整项检查的**存在理由**：面数一旦掉回 1200 以下，
+        # 这个用例就退化成「守卫绿着但不工作」（旧守卫就是这么漏掉 14/14 真实模型的）。
+        assert m4.triangles > 1500, (
+            f"用例只有 {m4.triangles} 面，落在旧的面数上限内 —— "
+            "守不住「代价上限过期」这一类退化，请把 $fn 调大"
+        )
+        assert m4.hole_diameter_mm is not None, (
+            "同心孔 + 非居中模型量不到：孔轴锚点不能只给 (0,0)（(0,0) 在这里是个顶角）"
+        )
+        # 读数必须≈真值：逐步走（step=0.1）时返回的是「最后一个还空的采样点」
+        # 而不是墙面，直径被系统性低估 2×step —— 实测 Ø10 报 9.8。
+        # 公差 0.1 能咬住那 0.2 的偏差，又容纳 OpenSCAD 多边形化（Ø10/64 段 ≈ 9.99）。
+        assert abs(m4.hole_diameter_mm - 10.0) <= 0.1, (
+            f"Ø10 量成 {m4.hole_diameter_mm}：系统性低估就是「改对了却报不达标」"
+        )
+        _hits = sum(1 for v in m4.hole_profile if v is not None)
+        assert _hits == 6, (
+            f"6 个高度只量到 {_hits} 个：预算把**本来量得到**的剖面砍掉了，"
+            "等于换一个门槛继续误判"
+        )
+        # 时间必须有余量：这个扫描是在作业前台跑的（119s 那一版直接把界面卡死）
+        assert _analyze_cost <= 15.0, f"{m4.triangles} 面 analyze 花了 {_analyze_cost:.1f}s"
+
+        # 阴性对照：非居中的实心块也必须 None（加了锚点以后判据没被放松）
+        r5 = _compiler.compile_to_stl(noncenter_solid_scad, d, "nonc_solid")
+        assert r5.ok and r5.stl_path, r5.message or r5.fatal
+        m5 = _mesh.analyze(_Path(r5.stl_path))
+        assert m5.hole_diameter_mm is None, (
+            f"非居中实心块不应量出孔，实测 {m5.hole_diameter_mm}"
+        )
+
+        # --- 假孔：多边形内腔顶上那条「月牙」不能当成孔 ---
+        # 本机实测的翻车形状：Ø80 外壳、内腔 Ø74 从 z=5 起、底座 5mm、
+        # 底座正中一个 Ø10 排水孔。这个模型**总高 100、孔只在 0~5**：
+        #   * 剖面只按比例取（最低 15%）时，六个高度全量不到那个真孔；
+        #   * 而搜索会把贴着腔壁的那条月牙当成孔，在 z=15 这种**根本没有孔**
+        #     的高度报出 **11.36**。
+        # 后果：【问题 8】对一个做对了的 Ø10 孔说「要求 10mm，实测 11.36」——
+        # 正确的修改被判失败，还会驱动修复循环去改一个本来没坏的东西。
+        penholder_scad = (
+            "difference(){ cylinder(h=100, r=40, $fn=64);"
+            " translate([0,0,5]) cylinder(h=96, r=37, $fn=64);"
+            " cylinder(h=5.001, r=5, $fn=48); }\n"
+        )
+        r6 = _compiler.compile_to_stl(penholder_scad, d, "penholder")
+        assert r6.ok and r6.stl_path, r6.message or r6.fatal
+        m6 = _mesh.analyze(_Path(r6.stl_path))
+        assert m6.hole_diameter_mm is None, (
+            f"笔筒中部只有腔体，没有孔，却量出 {m6.hole_diameter_mm}："
+            "腔壁顶上那条月牙形空档被当成孔了（旧的假读数就是 11.36）"
+        )
+        _ph = sorted({round(v, 2) for v in m6.hole_profile if v is not None})
+        assert _ph, (
+            f"底座上的 Ø10 排水孔一个高度都没量到（剖面 {m6.hole_profile}）："
+            "探针必须包含贴底的绝对高度，否则薄底座里的孔对判据永久隐形"
+        )
+        assert all(abs(v - 10.0) <= 0.3 for v in _ph), (
+            f"笔筒剖面量到 {_ph}，而这个模型里唯一的孔是底座正中 Ø10："
+            "多出来的读数就是腔体/月牙被当成孔（11.36 那一类假孔）"
+        )
+
+        # --- 实心底 / 开口方向：必须钉在**真实网格**上 -------------------------
+        # 合成 metrics 那份守卫（「实心底与开口方向判定」）只能验判定分支，验不了
+        # 「贴底 0.3mm 这根探针到底落在底板上还是落进腔里」——而那才是这条判据
+        # 真正的风险所在：`_END_PROBE_MM` 从 0.3 改成 3.0，合成用例一点感觉都没有，
+        # 用户那边却会把 2mm 的底当成开口。
+        _bc, _tc = m6.bottom_coverage, m6.top_coverage
+        assert _bc is not None and _tc is not None, (
+            f"笔筒的贴底/贴顶占比没量出来（{_bc}/{_tc}）：reqtests 整条退化成 invalid，"
+            "用户明令过的「实心底」变成「没测出来」"
+        )
+        assert _bc >= 0.9, (
+            f"5mm 底板 + 底座正中 Ø10 排水孔被量成 {round(_bc * 100, 1)}%（本机实测 95.8）："
+            "探针高度或奇偶口径漂了，做对了的设计会被判成「底被挖穿」"
+        )
+        assert _tc <= 0.15, (
+            f"顶部敞开的笔筒被量出贴顶 {round(_tc * 100, 1)}%（本机实测 8.5）："
+            "贴顶探针没落在开口里，「方向反了」那一档就永远判不出来"
+        )
+        # 前端与落盘都按这两个键名取数（改名要同步 API-CONTRACT），先钉住
+        _pd = m6.to_dict()
+        assert _pd.get("bottom_coverage_pct") is not None and _pd.get("top_coverage_pct") is not None, (
+            f"to_dict 没给出 bottom/top_coverage_pct：{sorted(_pd)}"
+        )
+
+        # 另外两个真模型形状：开口管（内腔从 z=0 挖穿）与倒过来建的杯。
+        # 31 份历史版本里底开口的 18 份就是这两类（14 两端开 / 4 上下反），
+        # 拿它们做夹具是因为**分档靠这两个数就能分开**，不需要再读需求文字。
+        tube_scad = (
+            "difference(){ cylinder(h=100, r=40, $fn=64);"
+            " cylinder(h=100.001, r=37, $fn=64); }\n"
+        )
+        inverted_scad = (
+            "difference(){ cylinder(h=100, r=40, $fn=64);"
+            " translate([0,0,-0.005]) cylinder(h=95, r=37, $fn=64); }\n"
+        )
+        r7 = _compiler.compile_to_stl(tube_scad, d, "tube")
+        assert r7.ok and r7.stl_path, r7.message or r7.fatal
+        m7 = _mesh.analyze(_Path(r7.stl_path))
+        assert m7.bottom_coverage is not None and m7.top_coverage is not None, (
+            f"开口管两端没量出来（{m7.bottom_coverage}/{m7.top_coverage}）"
+        )
+        assert m7.bottom_coverage <= 0.15 and m7.top_coverage <= 0.15, (
+            f"两端挖穿的开口管量到 底{round(m7.bottom_coverage * 100, 1)}% / "
+            f"顶{round(m7.top_coverage * 100, 1)}%（本机实测都是 8.5）："
+            "这种件会被判成「有底」，然后装着笔漏一桌面"
+        )
+        r8 = _compiler.compile_to_stl(inverted_scad, d, "inverted")
+        assert r8.ok and r8.stl_path, r8.message or r8.fatal
+        m8 = _mesh.analyze(_Path(r8.stl_path))
+        assert m8.bottom_coverage is not None and m8.top_coverage is not None, (
+            f"倒杯两端没量出来（{m8.bottom_coverage}/{m8.top_coverage}）"
+        )
+        assert m8.bottom_coverage <= 0.15 and m8.top_coverage >= 0.9, (
+            f"腔体从底面开挖、顶上封死的杯量成 底{round(m8.bottom_coverage * 100, 1)}% / "
+            f"顶{round(m8.top_coverage * 100, 1)}%（本机实测 8.5 / 100）："
+            "上下反了这一档就分不出来 —— 27cc8c 那种件会直接交付出去"
+        )
+
+        # 薄底容器（2mm 底板）：这一例专门看**探针高度**本身。上面三个夹具的壁都够厚，
+        # `_END_PROBE_MM` 从 0.3 改成 3.0 它们全都量不出来（本机实测：笔筒仍 95.8）；
+        # 而 2mm 的底在 3.0mm 探针下就读成 8.5%（本机实测），做对了的薄底件会被判成开口。
+        # 用户真实需求里“壁厚 2mm”很常见，所以这一例不是凑数，是把上一个夹具留的盲区补上。
+        thin_bottom_scad = (
+            "difference(){ cylinder(h=100, r=40, $fn=64);"
+            " translate([0,0,2]) cylinder(h=99, r=37, $fn=64); }\n"
+        )
+        r9 = _compiler.compile_to_stl(thin_bottom_scad, d, "thin_bottom")
+        assert r9.ok and r9.stl_path, r9.message or r9.fatal
+        m9 = _mesh.analyze(_Path(r9.stl_path))
+        assert m9.bottom_coverage is not None and m9.bottom_coverage >= 0.9, (
+            f"2mm 实心底被量成 {m9.bottom_coverage}：贴边探针比底还厚，"
+            "探到腔里去了（本机实测 0.3mm 探针下是 100%）"
+        )
+        assert m9.top_coverage is not None and m9.top_coverage <= 0.15, (
+            f"2mm 底、顶部敲开的筒量出贴顶 {m9.top_coverage}：顶部探针没在腔里"
+        )
+
+        # 预算是否**真的生效**：用值验，不用时钟验（这一段必须在临时目录里跑完，
+        # 跳出去文件就被删了）。
+        # 同一个模型、同一次整段搜索（不传 center，(0,0) 又不在模型里 → 只能走搜索）：
+        #   给一个已经过期的 deadline → 必须 None；预算宽裕 → 必须量到 ≈10。
+        # 哪天 deadline 检查被删掉，前一条会返回 9.99 而不是 None —— 当场变红，
+        # 而且不受机器快慢影响（拿计时断言验预算会在慢机器上假失败）。
+        _pts4, _ = _mesh.read_triangles(_Path(r4.stl_path))
+        _fc4 = len(_pts4) // 3
+        _mid4 = (m4.bbox_min[2] + m4.bbox_max[2]) / 2.0
+        _grid4 = _mesh._FaceGrid(_pts4, _fc4, 1.0)  # noqa: SLF001
+        expired = _mesh.measure_hole_diameter(
+            _pts4, _fc4, _mid4, grid=_grid4,
+            deadline=_time.monotonic(),
+        )
+        assert expired is None, (
+            f"deadline 已经过期却仍量出 {expired}：预算检查没生效（会把作业卡住）"
+        )
+        roomy = _mesh.measure_hole_diameter(
+            _pts4, _fc4, _mid4, grid=_grid4,
+            deadline=_time.monotonic() + 60.0,
+        )
+        assert roomy is not None and abs(roomy - 10.0) <= 0.1, (
+            f"整段搜索在预算内量不到孔（实测 {roomy}）：偏心孔搜索这条路断了"
+        )
+
+        # 贴边扫线的**时间预算用值验**（和上面同一个做法，不用时钟）：
+        # 那 0.35s/端 是实测定的，一旦哪天有人把它改成 35s，作业前台就会像
+        # 119s 那一版一样把界面卡死 —— 这里要当场变红，而不是靠用户反馈。
+        _expired_end = _mesh.measure_end_coverage(
+            _pts4, _fc4, m4, grid=_grid4, deadline=_time.monotonic(),
+        )
+        assert _expired_end is None, (
+            f"deadline 过期仍量出 {_expired_end}：每端 0.35s 的预算根本没生效"
+        )
+        # 两端各走一遍的**真实耗时**（这条在作业前台跑，是用户等得到的时间）：
+        # 本机实测 3,616 面约 0.01s，给 1s 上限是百倍余量 —— 足够拖住「改成
+        # 逐层扫描」这类把 3 条线写成 300 条的退化，又不会在慢机器上假失败。
+        _t_end = _time.perf_counter()
+        _mesh.measure_end_coverage(_pts4, _fc4, m4, grid=_grid4)
+        _mesh.measure_end_coverage(_pts4, _fc4, m4, at_top=True, grid=_grid4)
+        _cost_end = _time.perf_counter() - _t_end
+        assert _cost_end <= 1.0, (
+            f"{m4.triangles} 面两端量了 {_cost_end:.2f}s：贴边扫线变成逐层扫了"
+        )
+        assert 0 < _mesh._END_BUDGET_S <= 1.0, (  # noqa: SLF001
+            f"每端预算 {_mesh._END_BUDGET_S}s 不合理：要能跑完 3 条扫线，又不能卡住界面"
+        )
+
+    # --- 代价必须封顶，但封顶要用**时间**而不是面数 ---
+    assert not hasattr(_mesh, "_HOLE_AXIS_MAX_FACES"), (
+        "面数上限又回来了：按面数封顶会把「本来 0.2 秒能量出来的模型」判成没量到"
+        "（旧值 1200 就是这样让用户 14/14 份真实模型全盲的）"
+    )
+    assert 0 < _mesh._HOLE_SEARCH_BUDGET_S <= 2.0, (  # noqa: SLF001
+        f"单次找孔轴预算 {_mesh._HOLE_SEARCH_BUDGET_S} 不合理（要能跑完一次搜索，又要不卡界面）"  # noqa: E501
+    )
+    assert _mesh._HOLE_SEARCH_BUDGET_S <= _mesh._HOLE_PHASE_BUDGET_S <= 20.0, (  # noqa: SLF001
+        f"总预算 {_mesh._HOLE_PHASE_BUDGET_S} 必须容得下一次完整搜索"
+        f"（{_mesh._HOLE_SEARCH_BUDGET_S}）又要小到不把界面卡住"
+    )
+
+    return (
+        f"同心/偏心/非居中同心（{m4.triangles} 面，超旧上限）均 ≈10；"
+        "实心 None（阴性对照）；剖面 6/6 不被预算砍掉；deadline 用值验证生效；"
+        "笔筒（Ø74 腔 + 底座 Ø10 孔）中部不再报假孔 11.36、贴底探针量到真孔；"
+        f"贴底/贴顶实测 笔筒 {round(m6.bottom_coverage * 100, 1)}/{round(m6.top_coverage * 100, 1)}%、"
+        f"开口管 {round(m7.bottom_coverage * 100, 1)}/{round(m7.top_coverage * 100, 1)}%、"
+        f"倒杯 {round(m8.bottom_coverage * 100, 1)}/{round(m8.top_coverage * 100, 1)}%、"
+        f"2mm 薄底 {round(m9.bottom_coverage * 100, 1)}/{round(m9.top_coverage * 100, 1)}%"
+        f"（两端共 {_cost_end * 1000:.0f}ms）"
+    )
+
+
+
+def t_hole_criterion() -> str:
+    """孔径改动判据：声明 vs 实测剖面的四种情形（匹配/不匹配/量不到/未点名）。"""
+    from aiforge import jobs as jobs_mod
+    from aiforge.design import DesignSpec, SpecItem
+    from aiforge.mesh import MeshMetrics
+
+    def spec_with_hole(value, user_specified=True):
+        s = DesignSpec()
+        s.specs = [SpecItem(name="hole_diameter", label="孔径", value=value, user_specified=user_specified)]
+        return s
+
+    # 1) 剖面任一高度匹配声明值 → 不报
+    m = MeshMetrics(); m.hole_profile = [None, 10.05, None, 9.9, None, None]
+    assert jobs_mod._hole_problems(spec_with_hole(10.0), m) == []
+    # 2) 剖面与声明不符 → 报「问题 8」
+    m = MeshMetrics(); m.hole_profile = [8.0, 8.0, 8.0, 8.0, 8.0, 8.0]
+    probs = jobs_mod._hole_problems(spec_with_hole(10.0), m)
+    assert len(probs) == 1 and "问题 8" in probs[0], probs
+    # 3) 剖面全 None（没有居中孔）→ 不下结论
+    m = MeshMetrics(); m.hole_profile = [None] * 6
+    assert jobs_mod._hole_problems(spec_with_hole(10.0), m) == []
+    # 4) 非用户点名 → 不报
+    m = MeshMetrics(); m.hole_profile = [8.0] * 6
+    assert jobs_mod._hole_problems(spec_with_hole(10.0, user_specified=False), m) == []
+    return "匹配不报/不符报问题8/量不到不报/未点名不报 四种情形均正确"
+
+
 def t_thread_detection() -> str:
     """螺纹识别：真螺旋 vs 同心环（后者看着有纹路，实际拧不上）。
 
@@ -1647,6 +3313,7 @@ def t_thread_detection() -> str:
     只有专门量才能发现拧不上。
     """
     import math as _math
+    import time as _time
 
     from aiforge import mesh
 
@@ -1686,6 +3353,24 @@ def t_thread_detection() -> str:
     assert mesh.detect_helix_thread(rings) is not True, "同心环绝不能被判成螺旋"
     assert mesh.measure_thread_depth(helix) is not None, "真螺旋应当量出牙深"
 
+    # 代价守卫：这个函数在每个生成作业里都**无条件**跑一遍（手机支架、
+    # 水杯架这些根本没有螺纹的件也要付钱），所以它必须是线性的。
+    # 实测踩到的形状：把 `max(radii)/min(radii)` 写在列表推导的条件里，
+    # 条件对每个元素重算一遍全表 —— 24,016 面的模型上单这个函数就吃
+    # **41.4s**，占整段 analyze 47.8s 的 86%（cProfile：`max` 32.4 万次 + `min` 34.8 万次）。
+    # 用合成点云测，不需要 OpenSCAD，所以离线也能跑住这条。
+    big = helix_points(turns=120, per_turn=250)  # 30,000 点 / 跨 90mm 高度
+    assert len(big) >= 20_000, len(big)
+    _t0 = _time.perf_counter()
+    big_depth = mesh.measure_thread_depth(big)
+    _cost = _time.perf_counter() - _t0
+    assert big_depth is not None, "大点云也必须量出牙深（不能拿「算不动」当结论）"
+    assert _cost <= 0.5, (
+        f"measure_thread_depth 在 {len(big):,} 点上花了 {_cost:.2f}s："
+        "这个扫描是无条件跑的，代价必须随点数线性增长 —— "
+        "查有没有在循环/推导式里重算全表的 max/min/sorted/sum"
+    )
+
     # 需求里要螺纹、模型却没有真螺旋时，必须产出可执行的修复证据
     from aiforge import jobs as jobs_mod
 
@@ -1706,6 +3391,2276 @@ def t_thread_detection() -> str:
     return "真螺旋/同心环可区分（合成点云），无螺纹时给出「改用零件库」的修复证据"
 
 
+def t_repair_wiring() -> str:
+    """几何修复链路的**接线**测试（不需要 OpenSCAD、不需要 AI）。
+
+    为什么单列：加「需求里要螺纹但模型没有真螺旋」这条判定时，调用点写了
+    `self._requirement_text()`，而方法本身没加进类里 —— 运行到这条分支直接
+    AttributeError，作业变成「生成过程中出现了意外问题」。
+    自检当时全绿，因为这条分支离线不跑。所以这里用桩对象把链路走一遍：
+    断言需求文本确实传到了判定函数里，且判定结果被拼进给 AI 的修复证据。
+    """
+    from aiforge import jobs as jobs_mod
+    from aiforge import mesh as mesh_mod
+
+    runner = jobs_mod.GenerationRunner.__new__(jobs_mod.GenerationRunner)
+    assert hasattr(runner, "_requirement_text"), "GenerationRunner 必须有 _requirement_text()"
+    assert runner._requirement_text() == ""  # noqa: SLF001 - 未开始作业时应为空串
+
+    runner._requirement = "设计一个 72mm 转 67mm 的滤镜转接环，带螺纹"  # noqa: SLF001
+    assert "滤镜" in runner._requirement_text()  # noqa: SLF001
+
+    metrics = mesh_mod.MeshMetrics(triangles=12, bbox=(72.0, 72.0, 8.4), watertight=True, solid_parts=1)
+    problems = jobs_mod._geometry_integrity_problems(  # noqa: SLF001
+        metrics, None, "", None, runner._requirement_text()  # noqa: SLF001
+    )
+    assert problems, "需求要螺纹、模型没有螺纹时应当给出修复证据"
+    assert "aiforge_parts.scad" in problems[0], problems[0][:200]
+
+    # 反向：同一份 metrics，但需求没提螺纹 → 不该报螺纹问题
+    assert not jobs_mod._geometry_integrity_problems(  # noqa: SLF001
+        metrics, None, "", None, "设计一个桌面手机支架"
+    ), "无关需求不该报螺纹问题"
+
+    # 修复调用点必须把需求文本传进去（防止以后重构时又漏）
+    import inspect
+
+    source = inspect.getsource(jobs_mod.GenerationRunner._repair_geometry_integrity)  # noqa: SLF001
+    assert source.count("_requirement_text()") >= 3, (
+        f"几何修复里应当有 3 处传递需求文本，实际 {source.count('_requirement_text()')} 处"
+    )
+    # 散件两轮修不好时的换路径兜底必须接上；早退比较的元数必须和 rank 一致
+    # （写少一位会导致永不早退，写多一位会永远早退）
+    assert "_INTEGRITY_REGEN_EXTRA" in source, "散件兜底换路径重生成未接线"
+    assert "(0, 0, 0, 0, 0, 0, 0)" in source, "完整性早退比较应为 7 元组（与 _integrity_rank 同数）"
+    # AI 复核里用过 job.say 就必须先绑定 job（实测漏绑导致 modify 作业 NameError 崩溃）
+    second = inspect.getsource(jobs_mod.GenerationRunner._ai_second_opinion)  # noqa: SLF001
+    assert "job = self.job" in second, "_ai_second_opinion 必须先绑定 job"
+    return "需求文本贯通几何修复链路，螺纹缺失/散件兜底均有可执行证据与换路径重生成"
+
+
+def t_axis_dimension_fix() -> str:
+    """点名尺寸实测偏差的确定性逐轴缩放兜底（离线、不调 AI）。
+
+    阴性对照：偏差 ≤2% 必须返回 None（不修），否则会把测量噪声当问题乱缩。
+    """
+    from aiforge import jobs as jobs_mod
+    from aiforge.design import DesignSpec, SpecItem
+    from aiforge.mesh import MeshMetrics
+
+    runner = jobs_mod.GenerationRunner.__new__(jobs_mod.GenerationRunner)
+    spec = DesignSpec()
+    spec.specs = [SpecItem(name="height", label="总高", value=100.0, user_specified=True)]
+    source = "height = 100;\ncube([80, 80, height]);\n"
+
+    # 实测 z=110（偏 10%）→ 只缩 z，倍率 100/110
+    m = MeshMetrics(triangles=12, bbox=(80.0, 80.0, 110.0), watertight=True, solid_parts=1)
+    fixed = runner._axis_dimension_fix(source, m, spec)  # noqa: SLF001
+    assert fixed and "scale([1.000000, 1.000000, 0.909091])" in fixed, fixed
+    # 声明留在块外、几何被缩进包进 scale 块
+    assert "height = 100;\nscale(" in fixed and "\n  cube([80, 80, height]);" in fixed, fixed
+
+    # 实测 z=100（偏差 0）→ 不修
+    m_ok = MeshMetrics(triangles=12, bbox=(80.0, 80.0, 100.0), watertight=True, solid_parts=1)
+    assert runner._axis_dimension_fix(source, m_ok, spec) is None  # noqa: SLF001
+
+    # 偏差离谱（z=30，倍率 3.3 超出放大上界 2.0）→ 不修，宁可报问题
+    m_bad = MeshMetrics(triangles=12, bbox=(80.0, 80.0, 30.0), watertight=True, solid_parts=1)
+    assert runner._axis_dimension_fix(source, m_bad, spec) is None  # noqa: SLF001
+    return "逐轴缩放兜底：偏 10% 只缩 z、偏差≤2% 不修、倍率离谱不修"
+
+
+def t_sliver_detection() -> str:
+    """≈0 厚薄膜（挖空刀具没伸出表面）必须报为完整性问题；正常壁厚不报。
+
+    实测 glm 的笔筒底留下一层 0.01mm 膜：水密/单件/尺寸全对，只有射线壁厚能量出。
+    """
+    from aiforge import jobs as jobs_mod
+    from aiforge.mesh import MeshMetrics, WallThickness
+
+    thin = WallThickness(min_mm=0.01, p05_mm=0.01, median_mm=2.5, samples=400,
+                         thinnest=[((0.0, 0.0, 0.0), 0.01)])
+    m = MeshMetrics(triangles=12, bbox=(80.0, 80.0, 100.0), watertight=True, solid_parts=1, wall=thin)
+    probs = jobs_mod._geometry_integrity_problems(m, None, "", None, "设计一个笔筒")  # noqa: SLF001
+    assert any("问题 9" in p for p in probs), probs
+    ok_wall = WallThickness(min_mm=2.0, p05_mm=2.5, median_mm=2.5, samples=400, thinnest=[])
+    m_ok = MeshMetrics(triangles=12, bbox=(80.0, 80.0, 100.0), watertight=True, solid_parts=1, wall=ok_wall)
+    assert not jobs_mod._sliver_problems(m_ok), "正常壁厚不该报薄膜"  # noqa: SLF001
+    return "0.01mm 薄膜报问题9（含位置与改法）、正常壁厚不报"
+
+
+def t_modify_prompt_clarifications() -> str:
+    """修改提示词必须带上用户此前的补充说明（长对话口头约束不丢，HANDOVER P2）。
+
+    阴性对照：没有 clarifications 时不该凭空多出这一段。
+    """
+    from aiforge import changes as changes_mod
+    from aiforge.design import DesignSpec, SpecItem
+
+    spec = DesignSpec(
+        kind="笔筒",
+        specs=[SpecItem(name="height", label="总高", value=100.0, user_specified=True)],
+    )
+    spec.clarifications = ["底部要留排水孔", "不要镂空侧壁"]
+    contract = changes_mod.build_change_contract("把高度改成 120mm", spec, {"height": 100.0})
+    prompt = changes_mod.modify_prompt("height = 100;\ncube([80, 80, height]);\n", contract, spec)
+    assert "底部要留排水孔" in prompt and "不要镂空侧壁" in prompt, prompt[:400]
+    assert "用户此前补充说明过的要求" in prompt
+
+    plain = DesignSpec(kind="笔筒", specs=[SpecItem(name="height", label="总高", value=100.0, user_specified=True)])
+    contract2 = changes_mod.build_change_contract("把高度改成 120mm", plain, {"height": 100.0})
+    prompt2 = changes_mod.modify_prompt("height = 100;\ncube([80, 80, height]);\n", contract2, plain)
+    assert "用户此前补充说明过的要求" not in prompt2, "没有补充说明时不该凭空多出这一段"
+    return "修改提示词携带 clarifications（口头约束不丢），无补充时不凭空多段"
+
+
+def t_provider_keys_and_economy() -> str:
+    """两把 Key 按提供商分槽共存 + 混合模式经济档接线（离线、不碰真实凭据）。
+
+    混合模式需要 DeepSeek 付费生成 + 智谱免费复核同时可用，
+    所以 Key 必须分槽存、按 base_url 取；清一把不能带走另一把。
+    """
+    import inspect
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    from aiforge import config as config_mod
+    from aiforge import jobs as jobs_mod
+
+    assert config_mod.provider_of_base("https://api.deepseek.com") == "deepseek"
+    assert config_mod.provider_of_base("https://open.bigmodel.cn/api/paas/v4") == "glm"
+    assert config_mod.ApiSettings().economy_model == ""
+    assert config_mod.ApiSettings().economy_base_url == ""
+
+    with _tempfile.TemporaryDirectory(prefix="keys_") as tmp:
+        store = config_mod.SecretStore(_Path(tmp) / "credentials.json")
+        # 强制文件后端：真实机器凭据管理器里可能已有用户真 Key，不能拿它做断言
+        store._keyring = lambda: None  # noqa: SLF001
+        store.set("sk-deepseek-1", "deepseek")
+        store.set("glm-key-1", "glm")
+        assert store.get("deepseek") == "sk-deepseek-1"
+        assert store.get("glm") == "glm-key-1"
+        store.set("", "glm")  # 清智谱不应带走 DeepSeek
+        assert store.get("glm") is None
+        assert store.get("deepseek") == "sk-deepseek-1"
+
+        # --- 后端归属必须按提供商分开报 ---
+        # 设置页（settings_routes）与诊断页（envcheck.check_api）都拿 `backend_for(prov)`
+        # 告诉用户「Key 存在哪儿」。两把 Key 允许存在不同后端（混合模式的设计前提），
+        # 所以共用一个字段时「上一次读写的是哪把」会决定「这一把存在哪儿」的回答。
+        # 本机实测过的形状：deepseek 进凭据管理器、glm 落文件之后，deepseek 那把
+        # 被报成 config_file —— 用户按这个说法去删/换 Key 根本找不到它。
+        class _FakeVault:
+            """只实现产品用到的三个方法，不碰真机凭据管理器。"""
+
+            def __init__(self) -> None:
+                self.data: dict[tuple[str, str], str] = {}
+
+            def get_password(self, service, user):
+                return self.data.get((service, user))
+
+            def set_password(self, service, user, value):
+                self.data[(service, user)] = value
+
+            def delete_password(self, service, user):
+                self.data.pop((service, user), None)
+
+        vault = _FakeVault()
+        mixed = config_mod.SecretStore(_Path(tmp) / "mixed-credentials.json")
+        mixed._keyring = lambda: vault  # noqa: SLF001
+        assert mixed.set("sk-deepseek-2") == "credential_manager"
+        mixed._keyring = lambda: None  # noqa: SLF001 - 凭据管理器随后不可用
+        assert mixed.set("glm-key-2", "glm") == "config_file"
+        assert mixed.backend_for() == "credential_manager", (
+            f"DeepSeek 那把明明在凭据管理器里，却被报成 {mixed.backend_for()}"
+        )
+        assert mixed.backend_for("glm") == "config_file", mixed.backend_for("glm")
+        # get() 必须照旧返回 **Key 本身**（改这一段时最容易把返回值写成后端名）
+        mixed._keyring = lambda: vault  # noqa: SLF001
+        assert mixed.get() == "sk-deepseek-2", f"get() 返回的不是 Key：{mixed.get()!r}"
+        assert mixed.get("glm") == "glm-key-2", f"get('glm') 返回的不是 Key：{mixed.get('glm')!r}"
+        assert mixed.backend_for() == "credential_manager", "读完之后后端归属又被另一把洗掉了"
+        assert mixed.backend_for("glm") == "config_file"
+
+        # --- 真 HTTP 驱动：设置页里那句「Key 存在哪儿」必须是对的 ---
+        # 上面那两条只是库层断言，而这个缺陷的用户后果在接口上：
+        # `settings_routes._serialize()` 把 `backend_for(prov)` 当作 `api_key_store` 直接回给界面。
+        # 本进程的 AIFORGE_DATA_DIR 已在开头指向 build/work 沙箱（见文件顶部），
+        # 不会碰到真机凭据管理器与真实密钥文件；进出仍按字节快照/还原。
+        import json as _json
+
+        from fastapi.testclient import TestClient
+
+        from aiforge.app import create_app
+
+        cfg_store = config_mod.store(refresh=True)
+        secret_file = cfg_store.secrets._file  # noqa: SLF001
+        saved_bytes = secret_file.read_bytes() if secret_file.is_file() else None
+        saved_kr = cfg_store.secrets._keyring  # noqa: SLF001
+        saved_backends = dict(cfg_store.secrets._backend_by_provider)  # noqa: SLF001
+        saved_backend = cfg_store.secrets._backend  # noqa: SLF001
+        saved_base = cfg_store.config.api.base_url
+        try:
+            vault_ep = _FakeVault()
+            cfg_store.secrets._backend_by_provider.clear()  # noqa: SLF001
+            cfg_store.secrets._backend = None  # noqa: SLF001
+            cfg_store.secrets._keyring = lambda: vault_ep  # noqa: SLF001
+            cfg_store.secrets.set("sk-endpoint-probe")  # deepseek → 凭据管理器
+            cfg_store.secrets._keyring = lambda: None  # noqa: SLF001
+            cfg_store.secrets.set("glm-endpoint-probe", "glm")  # 智谱 → 本地文件
+            # 请求期间把凭据管理器接回去：这才是真机最常见的形态 ——
+            # 两把 Key 一在 vault 一在文件，两者都取得到，只是**存放位置不同**。
+            # （上一版没接回去，于是第一次请求 `api_key_set` 就是 False，
+            # 验成了「拿不到 Key」而不是「报错了存放位置」。）
+            cfg_store.secrets._keyring = lambda: vault_ep  # noqa: SLF001
+            client_ep = TestClient(
+                create_app(), base_url="http://127.0.0.1:8760", raise_server_exceptions=False
+            )
+            body = client_ep.get("/api/settings")
+            assert body.status_code == 200, body.text
+            ds = body.json()
+            assert ds["api_key_set"] is True, ds
+            assert ds["api_key_store"] == "credential_manager", (
+                f"DeepSeek 那把在凭据管理器里，设置页却说存成「{ds['api_key_store']}」"
+            )
+            assert "sk-endpoint-probe" not in _json.dumps(ds), "接口把完整 Key 吐给了界面"
+            cfg_store.config.api.base_url = "https://open.bigmodel.cn/api/paas/v4"
+            glm = client_ep.get("/api/settings").json()
+            assert glm["api_key_set"] is True, glm
+            assert glm["api_key_store"] == "config_file", (
+                f"智谱那把落在本地文件，设置页却说存成「{glm['api_key_store']}」"
+            )
+            assert glm["api_key_store"] != ds["api_key_store"], (
+                "两把 Key 存在不同后端，接口却回同一个答案 —— 分桶没生效"
+            )
+        finally:
+            cfg_store.secrets._keyring = saved_kr  # noqa: SLF001
+            cfg_store.secrets._backend_by_provider.clear()  # noqa: SLF001
+            cfg_store.secrets._backend_by_provider.update(saved_backends)  # noqa: SLF001
+            cfg_store.secrets._backend = saved_backend  # noqa: SLF001
+            cfg_store.config.api.base_url = saved_base
+            if saved_bytes is not None:
+                secret_file.write_bytes(saved_bytes)
+
+    # 经济档接线：解析/评审/复核三处必须走 _client_economy
+    src_pipeline = inspect.getsource(jobs_mod.GenerationRunner._pipeline_generate)  # noqa: SLF001
+    src_second = inspect.getsource(jobs_mod.GenerationRunner._ai_second_opinion)  # noqa: SLF001
+    assert "_client_economy()" in src_pipeline, "规格解析应走经济档"
+    assert "_client_economy()" in src_second, "AI 复核应走经济档"
+    src_review = inspect.getsource(jobs_mod.GenerationRunner._finish)  # noqa: SLF001
+    assert "_client_economy()" in src_review, "打印性评审应走经济档"
+    return "两把 Key 分槽共存/互不带走；后端归属按提供商分开报（库层 + 真 HTTP）；解析/评审/复核接经济档"
+
+
+def t_3mf_export() -> str:
+    """3MF 导出（对标 Meshy/SolidWorks 的可打印交付格式）。离线，不跑 OpenSCAD。
+
+    为什么必须验这三件事：
+      * **单位**：STL 不带单位，用户实测踩过“导入切片软件差 10/100 倍”；
+        3MF 的核心价值就是 unit="millimeter"，写错就等于白做。
+      * **面数一致**：3MF 是从已交付的 STL 转的，不一致就是用户拿到两个不同的模型。
+      * **顶点去重**：STL 每个角重复存坐标，不去重文件白胖一半。
+    """
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    from aiforge import threemf
+
+    # 10×20×30 的长方体：8 个角、12 个三角面（STL 里是 36 个重复顶点）
+    c = {
+        (0, 0, 0): (0.0, 0.0, 0.0), (1, 0, 0): (10.0, 0.0, 0.0),
+        (0, 1, 0): (0.0, 20.0, 0.0), (1, 1, 0): (10.0, 20.0, 0.0),
+        (0, 0, 1): (0.0, 0.0, 30.0), (1, 0, 1): (10.0, 0.0, 30.0),
+        (0, 1, 1): (0.0, 20.0, 30.0), (1, 1, 1): (10.0, 20.0, 30.0),
+    }
+    faces = [
+        ((0, 0, 0), (1, 0, 0), (1, 1, 0)), ((0, 0, 0), (1, 1, 0), (0, 1, 0)),
+        ((0, 0, 1), (1, 1, 1), (1, 0, 1)), ((0, 0, 1), (0, 1, 1), (1, 1, 1)),
+        ((0, 0, 0), (0, 1, 0), (0, 1, 1)), ((0, 0, 0), (0, 1, 1), (0, 0, 1)),
+        ((1, 0, 0), (1, 1, 1), (1, 1, 0)), ((1, 0, 0), (1, 0, 1), (1, 1, 1)),
+        ((0, 0, 0), (0, 0, 1), (1, 0, 1)), ((0, 0, 0), (1, 0, 1), (1, 0, 0)),
+        ((0, 1, 0), (1, 1, 0), (1, 1, 1)), ((0, 1, 0), (1, 1, 1), (0, 1, 1)),
+    ]
+    ascii_stl = "solid box\n" + "".join(
+        "  facet normal 0 0 0\n    outer loop\n"
+        + "".join(f"      vertex {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n" for v in (c[a], c[b], c[d]))
+        + "    endloop\n  endfacet\n"
+        for a, b, d in faces
+    ) + "endsolid box\n"
+
+    with _tempfile.TemporaryDirectory(prefix="3mf_") as tmp:
+        stl = _Path(tmp) / "model.stl"
+        out = _Path(tmp) / "model.3mf"
+        stl.write_text(ascii_stl, encoding="ascii")
+        stats = threemf.write_3mf_from_stl(
+            stl,
+            out,
+            title="长方体测试件",
+            metadata={"Title": "长方体测试件", "Material": "PLA", "Printer": "X1E", "DesignSizeMM": "10.0x20.0x30.0"},
+        )
+        assert stats["triangles"] == 12, stats
+        assert stats["vertices"] == 8, f"36 个重复顶点应去重成 8 个，实际 {stats['vertices']}"
+
+        summary = threemf.read_3mf_summary(out)
+        assert summary["unit"] == "millimeter", summary  # 写错单位比不带单位更坑
+        assert summary["triangles"] == 12 and summary["vertices"] == 8, summary
+        assert summary["has_build"], "缺 <build> 切片软件不知道把哪个 object 放进去"
+        assert summary["metadata"]["Material"] == "PLA", summary
+        assert summary["metadata"]["Printer"] == "X1E", summary
+        assert summary["object_name"] == "长方体测试件", summary
+
+    # 输入不是 3 的倍数时必须拒绝，不能静默多出半个面
+    try:
+        threemf.build_3mf_bytes([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)])
+        raise AssertionError("顶点数不是 3 的倍数时必须报错")
+    except ValueError:
+        pass
+
+    # --- <model> 子元素顺序与 metadata 形状必须合规范 ---
+    # 本模块踩过两次，都只发生在「用户能打开吗」验不到的地方：
+    #   1. 顺序写成 resources → metadata → build；
+    #   2. 把所有 <metadata name=…> 包进一层**没有 name 的 <metadata>**（规范里根本没
+    #      这个包裹层，name 是必需属性，metadata 也不允许再套元素）。
+    # 判据必须走 XML 解析：旧的 `findall(r"<(metadata|resources|build)>")` 只认不带属性的
+    # 标签，于是它恰好把那个多余的包裹层当成了合法顺序的证据 —— 尺子跟着被测代码一起错。
+    import io as _io
+    import xml.etree.ElementTree as _ET
+    import zipfile as _zipfile
+
+    ns = "{http://schemas.microsoft.com/3dmanufacturing/core/2015/02}"
+
+    def _model_shape(text: str) -> list[str]:
+        """返回 <model> 的直接子元素名序列，不合规就抛 AssertionError。"""
+        root = _ET.fromstring(text)
+        assert root.tag == f"{ns}model", f"根元素不是 3MF 核心命名空间下的 model：{root.tag}"
+        tags = [child.tag.removeprefix(ns) for child in root]
+        assert set(tags) <= {"metadata", "resources", "build"}, f"<model> 下有规范外的子元素：{tags}"
+        assert tags.count("resources") == 1 and tags.count("build") == 1, f"resources/build 必须各一份：{tags}"
+        assert tags == ["metadata"] * tags.count("metadata") + ["resources", "build"], (
+            f"<model> 子元素顺序违反 3MF 核心规范：{tags}（应为 metadata* → resources → build）"
+        )
+        for meta in root.findall(f"{ns}metadata"):
+            assert (meta.get("name") or "").strip(), (
+                f"<metadata> 缺必需属性 name（规范外包裹层）：{_ET.tostring(meta)[:120]!r}"
+            )
+            assert len(meta) == 0, f"<metadata> 里不许再套元素：{_ET.tostring(meta)[:120]!r}"
+        return tags
+
+    data, _stats = threemf.build_3mf_bytes(
+        [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 0), (0, 1, 0), (0, 0, 1)],
+        title="顺序",
+        metadata={"Material": "PLA"},
+    )
+    xml = _zipfile.ZipFile(_io.BytesIO(data)).read("3D/3dmodel.model").decode("utf-8")
+    tags = _model_shape(xml)
+    assert tags.count("metadata") >= 2, f"Title 与 Material 应各占一条 metadata：{tags}"
+
+    # 阴性对照：两个真实踩过的形状都必须被判不合格（否则这条判据就是个常亮的摆设）。
+    for label, sample in (
+        ("顺序写反", f'<model xmlns="{threemf.CORE_NS}"><resources/><metadata name="X">1</metadata><build/></model>'),
+        ("多一层无 name 的包裹", f'<model xmlns="{threemf.CORE_NS}"><metadata><metadata name="Title">t</metadata></metadata><resources/><build/></model>'),
+    ):
+        try:
+            _model_shape(sample)
+        except AssertionError:
+            pass
+        except _ET.ParseError as exc:  # 解析不了也算不合格（但不能静默当成通过）
+            raise AssertionError(f"{label} 的样本根本不是合法 XML：{exc}") from exc
+        else:
+            raise AssertionError(f"{label} 的投毒样本没被识破：形状判据失效了")
+
+    # ZIP 条目必须用正斜杠：ZIP 规范要求 / ，反斜杠会让不少解包器直接拒绝。
+    with _zipfile.ZipFile(_io.BytesIO(data)) as _z:
+        names = _z.namelist()
+    assert all("\\" not in n for n in names), f"ZIP 条目用了反斜杠：{names}"
+    assert names[0] == "[Content_Types].xml", f"[Content_Types].xml 必须是第一个条目：{names}"
+
+    return (
+        "3MF：mm 单位/面数与 STL 一致/顶点 36→8 去重/元数据与 build 可读回/坏输入拒绝/"
+        "子元素顺序与 metadata 形状合规范（含两个阴性对照）/正斜杠条目"
+    )
+
+
+def t_slicer_detect() -> str:
+    """切片软件检测的判定逻辑：识别要宽、不猜、同一软件只能出现一次、送出的文件不能被自己删掉。
+
+    为什么全靠夹具而不跑真机：这台机器装了 Bambu Studio 与 OrcaSlicer，换一台
+    只装 Cura、或者把软件放在 `D:\\绿色软件\\` 下的机器，检测结果就全变了 ——
+    靠“在我机器上能看到”永远测不到那些形态。这里把解析与合并规则钉死（喂注册表
+    原文、造假安装目录、替掉候选来源）；真机那一半由 `launch/send` 的往返脚本另测。
+    """
+    import tempfile
+    from types import SimpleNamespace
+
+    from aiforge import slicers
+
+    # 1) exe 名 → 种类：NTFS 不区分大小写，所以比较前必须 casefold
+    kind = slicers.classify_exe(Path("D:/Bambu Studio/BAMBU-STUDIO.exe"))
+    assert kind is not None and kind.id == "bambu_studio", f"大写名没认出来：{kind}"
+    assert slicers.classify_exe(Path("C:/Windows/System32/notepad.exe")) is None, "不该随便认陌生程序"
+    # 表可以宽（多认几个是好事），但表序就是界面文案的顺序：前几个必须是最主流的
+    assert len(slicers.SLICER_KINDS) >= 8, f"只认 {len(slicers.SLICER_KINDS)} 种，少了"
+    head = [k.id for k in slicers.SLICER_KINDS[:4]]
+    assert head == ["bambu_studio", "orcaslicer", "prusa_slicer", "cura"], f"界面只报前 4 个名字，它们必须最主流：{head}"
+    flags = [k.verified for k in slicers.SLICER_KINDS]
+    assert flags == [True] * sum(flags) + [False] * (len(flags) - sum(flags)), (
+        "本机真发过一次的必须排在表最前面（没实测过的不能排在前面给用户当首选）"
+    )
+
+    # 2) 注册表原文解析：全是实测或官方安装包里的形态
+    got = slicers.parse_open_command('"D:\\Bambu Studio\\bambu-studio.exe" "%1"', require_exists=False)
+    assert got == Path("D:\\Bambu Studio\\bambu-studio.exe"), got
+    got = slicers.parse_open_command(
+        '"C:\\Program Files\\SoftFever\\orca-slicer.exe" --load "%1"', require_exists=False
+    )
+    assert got == Path("C:\\Program Files\\SoftFever\\orca-slicer.exe"), got
+    assert slicers.parse_open_command('"%1"', require_exists=False) is None, "只有占位符时不能返路径"
+    assert slicers.parse_open_command(
+        'rundll32.exe "C:\\x\\a.dll",Open "%1"', require_exists=False
+    ) is None, "rundll32 只是壳，拿着启动等于什么也没打开"
+    assert slicers.parse_open_command(
+        '"C:\\Users\\me\\AppData\\Local\\Packages\\App_8wekyb3d8bbwe\\WindowsApps\\bambu.exe" "%1"',
+        require_exists=False,
+    ) is None, "UWP 不能这样直接启动（本机 .3mf 的 UserChoice 正是这种）"
+    with tempfile.TemporaryDirectory() as td:
+        spaced = Path(td) / "Program Files" / "Bambu Studio"
+        spaced.mkdir(parents=True)
+        real_exe = spaced / "bambu-studio.exe"
+        real_exe.write_bytes(b"MZ")
+        # 路径含空格又没引号：靠磁盘一段段试出来（不能硬猜成 `D:\\Bambu`）
+        got = slicers.parse_open_command(f"{real_exe} \"%1\"", require_exists=True)
+        assert got == real_exe, f"没引号的含空格路径应当靠磁盘拼全：{got}"
+        assert slicers.parse_open_command(f"{real_exe} \"%1\"", require_exists=False) is None, (
+            "不查磁盘时不能猜路径在哪结束，宁可不报"
+        )
+    assert slicers.parse_display_icon('"C:\\x\\a.exe",0') == "C:\\x\\a.exe"
+    assert slicers.parse_display_icon("C:\\Program Files\\App, Inc\\a.exe,1") == "C:\\Program Files\\App, Inc\\a.exe", (
+        "只有逗号后面是纯数字才当图标序号，带逗号的目录名不能切错"
+    )
+
+    # 3) 常见安装目录：通配命中、大小写无关、不能乱深挖
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        nested = root / "UltiMaker Cura 5.9.0" / "UltiMaker Cura 5.9.0"  # Cura 会再套一层版本号
+        nested.mkdir(parents=True)
+        (nested / "cura.exe").write_bytes(b"MZ")
+        matched = slicers.match_known_dir(root, "ultimaker cura*")
+        assert matched is not None and matched.name.startswith("UltiMaker Cura"), matched
+        cura_kind = slicers.classify_exe(Path("x/cura.exe"))
+        assert cura_kind is not None
+        found = slicers.exe_in_dir(matched, cura_kind)
+        assert found is not None and found.name.casefold() == "cura.exe", found
+        assert slicers.match_known_dir(root, "prusaslicer") is None, "目录对不上就是不能命中"
+        deep = root / "deep" / "a" / "b"
+        deep.mkdir(parents=True)
+        (deep / "bambu-studio.exe").write_bytes(b"MZ")
+        bambu_kind = slicers.classify_exe(Path("x/bambu-studio.exe"))
+        assert bambu_kind is not None
+        assert slicers.exe_in_dir(root / "deep", bambu_kind) is None, (
+            "只往下看一层；愿意扫整盘就能把任何目录当成安装目录"
+        )
+
+    # 4) 合并与去重：替掉候选来源，只看规则
+    real_pairs = slicers._candidate_pairs  # noqa: SLF001 - 自检就为验这个合并规则
+    slicers.invalidate_cache()
+    slicers._candidate_pairs = lambda: [  # noqa: SLF001
+        ("known_dir", Path("D:/Bambu Studio/bambu-studio.exe"), None),
+        ("uninstall", Path("D:/Bambu Studio/bambu-studio.exe"), "02.08.02.61"),
+        ("association", Path("D:/orcaslicer/orca-slicer.exe"), None),
+        ("uninstall", Path("C:/Windows/System32/notepad.exe"), None),
+        ("custom", Path("D:/绿色软件/my-slicer.exe"), None),
+    ]
+    import aiforge.config as config_mod
+
+    real_store = config_mod.store
+    fake_cfg = SimpleNamespace(slicers=SimpleNamespace(default_id="ghost", custom_paths=[]))
+    config_mod.store = lambda: SimpleNamespace(config=fake_cfg)  # type: ignore[assignment]
+    try:
+        items = slicers.scan(force=True)
+        ids = [item.id for item in items]
+        assert ids == ["bambu_studio", "orcaslicer", "ext:my-slicer"], f"去重/丢弃/排序不对：{ids}"
+        assert items[0].version == "02.08.02.61", "同一软件：版本从有版本的来源补齐，但不能因此多出一条"
+        assert items[0].source == "known_dir", "先命中的来源保留说明（同一软件不抢名字）"
+        shape = slicers.describe()
+        assert shape["count"] == len(shape["slicers"]) == 3, shape
+        assert shape["default_id"] is None, "记过的软件被卸载了要回到「没有默认」，不能把无效 id 发给界面"
+        assert len(shape["recognized_names"]) >= 8, "没检测到时界面要能告诉用户装哪些就行"
+        assert set(shape["slicers"][0]) == {"id", "name", "exe", "version", "source_label", "running"}, (
+            f"字段就是界面用得上的那几个，别偷偷加：{sorted(shape['slicers'][0])}"
+        )
+        try:
+            slicers.resolve("ghost")
+            raise AssertionError("未知 id 必须 LookupError（接口据此回 409，绝不照着请求里的路径启动）")
+        except LookupError:
+            pass
+        assert slicers.resolve(None).id == "bambu_studio", "默认目标没了就回落到第一个"
+        fake_cfg.slicers.default_id = "orcaslicer"
+        assert slicers.resolve(None).id == "orcaslicer", "不点名时必须用默认目标"
+    finally:
+        config_mod.store = real_store  # type: ignore[assignment]
+
+    # 5) 送出去的快照：只留最近几份，而且**绝不能把刚送出去那份删掉**
+    with tempfile.TemporaryDirectory() as td:
+        proj_dir = Path(td)
+        source = proj_dir / "model.3mf"
+        source.write_bytes(b"fake-3mf")
+        (proj_dir / "model.stl").write_bytes(b"fake-stl")
+        project = SimpleNamespace(
+            dir=proj_dir,
+            three_mf_path=source,
+            stl_path=proj_dir / "model.stl",
+            name="滤镜转接环",
+            revision=7,
+        )
+        target = slicers.stage_file(project, "3mf")
+        assert target.name == "滤镜转接环-r07.3mf", target.name
+        assert target.parent.name == "slicer" and target != source, (
+            "交出的是快照，不是 model.3mf 本体（切片软件会长期占用它）"
+        )
+        staged_stl = slicers.stage_file(project, "stl")
+        for revision in range(1, 12):  # 反复送样：这些快照的 mtime 全都被复制成了源文件那个旧时间
+            project.revision = revision
+            newest = slicers.stage_file(project)
+        left = sorted(p.name for p in (proj_dir / "slicer").glob("*.3mf"))
+        assert newest.name == "滤镜转接环-r11.3mf" and newest.is_file(), (
+            f"刚送出去的那份被自己删掉了（切片软件马上就会报文件不存在）：{left}"
+        )
+        assert left == [f"滤镜转接环-r{r:02d}.3mf" for r in (7, 8, 9, 10, 11)], (
+            f"快照应该只留版本号最大的那几份（实际 {left}）"
+        )
+        assert len(left) == slicers.STAGE_KEEP, f"快照只该留 {slicers.STAGE_KEEP} 份，实际 {len(left)}：{left}"
+        assert staged_stl.is_file(), "清 3mf 快照不能顺手删掉 stl 的"
+    slicers._candidate_pairs = real_pairs  # noqa: SLF001
+    slicers.invalidate_cache()
+    return (
+        f"{len(slicers.SLICER_KINDS)} 种识别（实测过的排前面）/注册表原文解析/壳与 UWP 不认/"
+        f"同软件去重不重复/未知 id 拒绝/快照只留 {slicers.STAGE_KEEP} 份且不动刚送出那份"
+    )
+
+
+def t_social_footer_links() -> str:
+    """底部作者账号栅：前端链接必须真能在原生窗口里打开（离线）。
+
+    为什么需要这条：WebView2 拦截新窗口，前端唯一可靠的打开方式是后端
+    /api/app/open-external，而后端有 https 域名白名单。白名单漏加时，
+    用户看到的是「点了没反应」（catch 里的 window.open 同样被拦），
+    所以前端清单与后端白名单必须一起校验，不允许各改各的。
+    """
+    import re as _re
+    from urllib.parse import urlparse
+
+    from aiforge.api.settings_routes import ALLOWED_EXTERNAL_HOSTS
+
+    src = (ROOT / "webui" / "src" / "components" / "SocialFooter.tsx").read_text(encoding="utf-8")
+    urls = _re.findall(r"url:\s*'(https?://[^']+)'", src)
+    assert len(urls) >= 2, f"底部入口至少要有两个链接，实际 {urls}"
+    for url in urls:
+        parsed = urlparse(url)
+        assert parsed.scheme == "https", url
+        host = (parsed.hostname or "").lower()
+        assert host in ALLOWED_EXTERNAL_HOSTS, f"{host} 不在后端白名单，原生窗口点了会没反应"
+    # 文案：作者要求按「平台：@账号」展示，改丢了就是入口看不见
+    assert "@不会拍的锡" in src and "@xiiiiii422" in src, "底部账号名被改动"
+    # 全局可见：必须挂在外壳 App.tsx 里，而不是只做在某个页面上
+    app = (ROOT / "webui" / "src" / "App.tsx").read_text(encoding="utf-8")
+    assert "<SocialFooter />" in app, "底部栅没挂进外壳，只有某页能看到"
+    # 兜底链：open-external 失败要退到 window.open，否则纯浏览器模式下点不动
+    assert "window.open(" in src, "缺少 window.open 兜底"
+    return f"{len(urls)} 个链接全部 https 且在白名单；账号名/外壳挂载/兜底齐全"
+
+
+
+def t_requirement_tests() -> str:
+    """需求可执行测试（对标 CADTests：PR/RS/IR + 失败日志回喂）。离线，不跑 OpenSCAD。
+
+    为什么必须单独一条用例：这一层的全部价值就是「把需求变成能判定的东西」，
+    如果它自己没有被判定，就等于又回到「看起来对就行」。
+    这里锁四件事：
+      1. 指标口径（全过才 PR=1；invalid 算失败并计入 IR；manual 不参与打分）；
+      2. **契约目标优先**（用户授权改成 50 后，绝不能拿旧规格 100 判失败 ——
+         这是实测踩过的最恶劣回归：判失败 → AI 把模型改回 100 → 用户看到"改了没反应"）；
+      3. invalid 只摊给用户看，**不驱动修复**（给 AI 一句"量不到孔"它就去改没坏的东西）；
+      4. 与 jobs 的判据**单向一致**：jobs 报出来的尺寸问题，清单里必须也是 fail。
+    """
+    from aiforge import jobs as jobs_mod
+    from aiforge import mesh, reqtests
+    from aiforge.design import DesignSpec, SpecItem
+
+    wall_ok = mesh.WallThickness(min_mm=1.9, p05_mm=2.1, median_mm=2.4, samples=400)
+
+    def mk(**kw):
+        m = mesh.MeshMetrics(triangles=4000, vertices=2000)
+        for k, v in kw.items():
+            setattr(m, k, v)
+        return m
+
+    spec = DesignSpec(
+        kind="笔筒",
+        specs=[
+            SpecItem(name="height", label="总高", value=100.0, user_specified=True),
+            SpecItem(name="hole_d", label="线孔直径", value=8.0, user_specified=True),
+        ],
+        features=["背面有穿孔"],
+    )
+    dims = {2: ("总高", 100.0, "height")}
+    _planar_probe = jobs_mod.spec_planar_dimensions(
+        DesignSpec(
+            kind="长方体",
+            specs=[
+                SpecItem(name="length", label="长度", value=60.0, user_specified=True),
+                SpecItem(name="width", label="宽度", value=40.0, user_specified=True),
+                SpecItem(name="wall", label="壁厚", value=3.0, user_specified=True),
+                SpecItem(name="hole_w", label="孔宽", value=5.0, user_specified=True),
+            ],
+        )
+    )
+    base = dict(
+        spec=spec,
+        requirement="做一个笔筒，总高100mm",
+        limits=None,
+        declared_dimensions=dims,
+        declared_holes=[],
+        spec_items=list(spec.specs),
+    )
+
+    def dim_row(**kw):
+        suite = kw.pop("suite_obj")
+        return [t for t in suite.tests if t.group == "dim:height"][0]
+
+    limits = mesh.AnalysisLimits()  # 工艺类判据要有机型，否则那几条不会生成
+
+    # --- 1. 全部达成 -------------------------------------------------------
+    good = mk(
+        bbox=(60.0, 60.0, 100.0), watertight=True, boundary_edges=0,
+        solid_parts=1, stray_parts=0, wall=wall_ok, sits_on_plate=True,
+    )
+    suite = reqtests.evaluate(metrics=good, **base)
+    summary = suite.summary()
+    assert summary["pass_rate"] == 1.0, summary
+    assert summary["requirement_score"] == 1.0, summary
+    assert summary["invalid_ratio"] == 0.0, summary
+    assert suite.repair_lines() == [], suite.repair_lines()
+    # 语义需求标 manual，不参与打分 —— 否则「外观对不对」会把 PR 永远压成 0
+    assert any(t.status == reqtests.MANUAL for t in suite.tests), "语义需求没有标 manual"
+    assert all(t.status != reqtests.MANUAL or not t.scored for t in suite.tests)
+
+    # --- 1b. 螺纹三态：True=过 / False=不过 / None=没能判定（绝不粉饰成通过）---
+    # mesh.detect_helix_thread 的 docstring 自己写着「样本不足时返回 None（不猜）」，
+    # 而旧判据只拦 `is_helix is False` —— None 落进 else 被当成真螺旋，给用户的
+    # 判定表上多一个根本没人做过的结论（而且它永不驱动修复）。
+    for helix, want_status in (
+        (True, reqtests.PASS),
+        (False, reqtests.FAIL),
+        (None, reqtests.INVALID),
+    ):
+        m_thread = mk(
+            bbox=(60.0, 60.0, 100.0), watertight=True, boundary_edges=0,
+            solid_parts=1, stray_parts=0, wall=wall_ok, sits_on_plate=True,
+            thread_depth_mm=0.46, thread_is_helix=helix,
+        )
+        s_thread = reqtests.evaluate(
+            metrics=m_thread, **dict(base, requirement="做一个能拧得上的螺纹转接环")
+        )
+        rows = [t for t in s_thread.tests if t.group == "thread:real"]
+        assert rows, f"需求里点了螺纹却没出螺纹那一行（helix={helix}）"
+        row = rows[0]
+        assert row.status == want_status, f"helix={helix} 应该判 {want_status}，实际 {row.status}：{row.actual}"
+        if helix is None:
+            assert "真螺旋" not in row.actual, f"没能判定的项把结论写成了事实：{row.actual}"
+            assert row not in s_thread.blocking_failures, "没能判定的项不许驱动修复循环"
+            assert row in s_thread.failures, "invalid 必须算失败（论文口径：不许拿没测当通过）"
+            assert s_thread.summary()["invalid_ratio"] > 0.0, s_thread.summary()
+            assert s_thread.summary()["pass_rate"] == 0.0, "没能判定却整件 PR=1 = 假绿复活"
+
+    # --- 2. 尺寸偏小：判定 + 回喂日志带数字与公差 ---------------------------
+    short = mk(
+        bbox=(60.0, 60.0, 92.4), watertight=True, solid_parts=1,
+        wall=wall_ok, sits_on_plate=True,
+    )
+    suite2 = reqtests.evaluate(metrics=short, **base)
+    row = dim_row(suite_obj=suite2)
+    assert row.status == reqtests.FAIL, row.to_dict()
+    assert abs(row.deviation_pct + 7.6) < 0.2, row.to_dict()
+    assert row.tolerance_mm and row.tolerance_mm >= 2.0, row.to_dict()  # 2% 兜底公差
+    log_text = "\n".join(suite2.repair_lines())
+    assert "总高" in log_text and "92.4" in log_text and "±" in log_text, log_text
+    assert suite2.summary()["pass_rate"] == 0.0, suite2.summary()
+
+    # --- 2.5 水平尺寸整组择优配对（第一版质量基准抓到的假失败）-------------
+    # 「长 60、宽 40」做成 60(X)×40(Y) 与做成 40(X)×60(Y) 是同一件东西转了 90°，
+    # 按固定轴比对会把正确的模型判成两条未达成 —— 假失败的代价是用户不再信这张表。
+    block_dims = {0: ("宽度", 40.0, "width"), 1: ("长度", 60.0, "length")}
+    planar = [("宽度", 40.0, "width"), ("长度", 60.0, "length")]
+    for bbox_xy, note in (((60.0, 40.0), "长边放在 X"), ((40.0, 60.0), "长边放在 Y")):
+        rotated = mk(
+            bbox=(bbox_xy[0], bbox_xy[1], 20.0), watertight=True, solid_parts=1,
+            wall=wall_ok, sits_on_plate=True,
+        )
+        srows = reqtests.evaluate(
+            spec=spec, metrics=rotated, requirement="长60宽40高20", limits=None,
+            declared_dimensions=block_dims, planar_dimensions=planar,
+            spec_items=list(spec.specs),
+        )
+        dim_tests = [t for t in srows.tests if t.group.startswith("dim:")]
+        assert len(dim_tests) == 2, (note, [t.group for t in dim_tests])
+        assert all(t.status == reqtests.PASS for t in dim_tests), (
+            note, [t.to_dict() for t in dim_tests]
+        )
+    # 真的做错了必须判失败：宽 40 做成 50（两个方向都救不回来）
+    wrong = mk(
+        bbox=(60.0, 50.0, 20.0), watertight=True, solid_parts=1,
+        wall=wall_ok, sits_on_plate=True,
+    )
+    wrows = [
+        t for t in reqtests.evaluate(
+            spec=spec, metrics=wrong, requirement="长60宽40高20", limits=None,
+            declared_dimensions=block_dims, planar_dimensions=planar,
+            spec_items=list(spec.specs),
+        ).tests
+        if t.group.startswith("dim:")
+    ]
+    assert any(t.status == reqtests.FAIL for t in wrows), [t.to_dict() for t in wrows]
+    # 「长度」以前从来没被核对过（第一版质量基准抓到的覆盖洞）：
+    # 现在由 spec_planar_dimensions 兜住，但**不许**进按轴记账的那份判据 ——
+    # 那份要喂给逐轴缩放，方向猜错就会把模型放大一倍。
+    _planar_names = {name for _label, _v, name in _planar_probe}
+    assert {"length", "width"} <= _planar_names, _planar_probe
+    assert not (_planar_names & {"wall", "hole_w"}), f"局部尺寸混进了整体尺寸判据：{_planar_probe}"
+    _axis_dims = jobs_mod._spec_declared_dimensions(
+        DesignSpec(
+            kind="长方体",
+            specs=[SpecItem(name="length", label="长度", value=60.0, user_specified=True)],
+        )
+    )
+    assert 1 not in _axis_dims, f"长度不该进按轴缩放判据：{_axis_dims}"
+
+    # --- 2.4 工艺建议不参与打分；壁厚判据不被棱边切向采样骗到 --------------
+    # 实测第一轮基准：Ø50×5 的垫片射线 p05 只有 0.29mm（打到棱边上），中位 5mm。
+    # 只拿 p05 判"壁厚不达标"会把完全合格的件报成失败 —— 假失败的代价是用户不信这张表。
+    def _rim(p05: float, median: float):
+        return reqtests.evaluate(
+            metrics=mk(
+                bbox=(50.0, 50.0, 5.0), watertight=True, solid_parts=1, sits_on_plate=True,
+                wall=mesh.WallThickness(min_mm=0.2, p05_mm=p05, median_mm=median, samples=400),
+            ),
+            limits=limits, spec=spec, requirement="总高100mm",
+            declared_dimensions={}, declared_holes=[], spec_items=list(spec.specs),
+        )
+
+    rim = _rim(0.29, 5.0)
+    wall_row = [t for t in rim.tests if t.group == "print:min-wall"][0]
+    assert wall_row.status == reqtests.PASS, wall_row.to_dict()
+    assert "中位" in wall_row.actual, wall_row.to_dict()
+    # advisory 不参与 PR/RS：用户要的全做到时，不该因为一条工艺建议把整件判 0
+    assert all(not t.scored for t in rim.tests if t.advisory), "咨询项仍在参与打分"
+    assert rim.summary()["pass_rate"] == 1.0, rim.summary()
+    # 真做薄了必须判失败（中位也低）
+    assert [t for t in _rim(0.4, 0.6).tests if t.group == "print:min-wall"][0].status \
+        == reqtests.FAIL, "整体偏薄必须报"
+
+    # --- 2.5 水平尺寸整组择优配对（第一轮基准抓到的假失败 + 假绿）----------
+    # 「长 60、宽 40」做成 60(X)×40(Y) 与 40(X)×60(Y) 是同一件东西转了 90°：
+    # 按固定轴比对会把正确模型判成两条未达成；而只核对宽和高又会把
+    # 「做成了 40×40」放过去（第一轮实测真的发生了）。
+    block_dims = {0: ("宽度", 40.0, "width"), 1: ("长度", 60.0, "length")}
+    planar = [("宽度", 40.0, "width"), ("长度", 60.0, "length")]
+    for bx, by, note in ((60.0, 40.0, "长边在 X"), (40.0, 60.0, "长边在 Y")):
+        pair = reqtests.evaluate(
+            metrics=mk(
+                bbox=(bx, by, 20.0), watertight=True, solid_parts=1,
+                wall=wall_ok, sits_on_plate=True,
+            ),
+            spec=spec, requirement="长60宽40高20", limits=None,
+            declared_dimensions=block_dims, planar_dimensions=planar,
+            spec_items=list(spec.specs),
+        )
+        dims_rows = [t for t in pair.tests if t.group.startswith("dim:")]
+        assert len(dims_rows) == 2, (note, [t.group for t in dims_rows])
+        assert all(t.status == reqtests.PASS for t in dims_rows), (
+            note, [t.to_dict() for t in dims_rows]
+        )
+    # 配对后的方向要回传给逐轴校正：两层必须用同一套事实
+    pair_targets = reqtests.evaluate(
+        metrics=mk(
+            bbox=(60.0, 40.0, 20.0), watertight=True, solid_parts=1,
+            wall=wall_ok, sits_on_plate=True,
+        ),
+        spec=spec, requirement="长60宽40高20", limits=None,
+        declared_dimensions=block_dims, planar_dimensions=planar,
+        spec_items=list(spec.specs),
+    ).dimension_targets()
+    assert {a: (l, v) for a, (l, v, _n) in pair_targets.items()} == {
+        0: ("宽度", 40.0), 1: ("长度", 60.0)
+    } or {a: (l, v) for a, (l, v, _n) in pair_targets.items()} == {
+        0: ("长度", 60.0), 1: ("宽度", 40.0)
+    }, pair_targets
+    assert {name for _l, _v, name in jobs_mod.spec_planar_dimensions(
+        DesignSpec(
+            kind="长方体",
+            specs=[
+                SpecItem(name="length", label="长度", value=60.0, user_specified=True),
+                SpecItem(name="width", label="宽度", value=40.0, user_specified=True),
+                SpecItem(name="wall", label="壁厚", value=3.0, user_specified=True),
+                SpecItem(name="hole_w", label="孔宽", value=5.0, user_specified=True),
+            ],
+        )
+    )} == {"length", "width"}, "长度没进核对判据，或局部尺寸混进了整体判据"
+    # 真的做错仍要判失败：宽 40 做成 50，两个方向都救不回来
+    wrong = [
+        t for t in reqtests.evaluate(
+            metrics=mk(
+                bbox=(60.0, 50.0, 20.0), watertight=True, solid_parts=1,
+                wall=wall_ok, sits_on_plate=True,
+            ),
+            spec=spec, requirement="长60宽40高20", limits=None,
+            declared_dimensions=block_dims, planar_dimensions=planar,
+            spec_items=list(spec.specs),
+        ).tests
+        if t.group.startswith("dim:")
+    ]
+    assert any(t.status == reqtests.FAIL for t in wrong), [t.to_dict() for t in wrong]
+
+    # --- 3. 与 jobs 判据单向一致：jobs 报了，清单也必须判 fail --------------
+    way_short = mk(
+        bbox=(60.0, 60.0, 62.0), watertight=True, solid_parts=1,
+        wall=wall_ok, sits_on_plate=True,
+    )
+    problems = "\n".join(
+        jobs_mod._geometry_integrity_problems(way_short, spec, "", None, "总高100mm", None)
+    )
+    assert "总高" in problems, problems[:200]  # jobs 确实报了这条尺寸问题
+    row3 = dim_row(suite_obj=reqtests.evaluate(metrics=way_short, **base))
+    assert row3.status == reqtests.FAIL, row3.to_dict()
+
+    # --- 4. 偏大：附加结构可解释（≤10%）不判失败，超出才判 ------------------
+    ok_big = mk(
+        bbox=(60.0, 60.0, 104.0), watertight=True, solid_parts=1,
+        wall=wall_ok, sits_on_plate=True,
+    )
+    assert dim_row(suite_obj=reqtests.evaluate(metrics=ok_big, **base)).status == reqtests.PASS
+    too_big = mk(
+        bbox=(60.0, 60.0, 130.0), watertight=True, solid_parts=1,
+        wall=wall_ok, sits_on_plate=True,
+    )
+    assert dim_row(suite_obj=reqtests.evaluate(metrics=too_big, **base)).status == reqtests.FAIL
+
+    # --- 5. 契约目标优先（历史 Bug 的回归位）--------------------------------
+    class _Contract:
+        changed = ["height"]
+        unchanged = []
+        frozen = []
+        target_values = {"height": 50.0}
+
+    m50 = mk(
+        bbox=(60.0, 60.0, 50.0), watertight=True, solid_parts=1,
+        wall=wall_ok, sits_on_plate=True,
+    )
+    row50 = dim_row(suite_obj=reqtests.evaluate(metrics=m50, contract=_Contract(), **base))
+    assert row50.status == reqtests.PASS, f"契约目标没盖过旧规格：{row50.to_dict()}"
+    assert row50.expected == "50mm", row50.to_dict()
+
+    # --- 6. 量不到 = invalid：计入 IR，但不进回喂日志 ------------------------
+    holes = reqtests.evaluate(
+        metrics=mk(
+            bbox=(60.0, 60.0, 100.0), watertight=True, solid_parts=1,
+            wall=wall_ok, sits_on_plate=True, hole_profile=[None] * 6,
+        ),
+        spec=spec,
+        requirement="做一个笔筒，总高100mm",
+        limits=None,
+        declared_dimensions=dims,
+        declared_holes=[("线孔直径", 8.0, "hole_d")],
+        spec_items=list(spec.specs),
+    )
+    hole_rows = [t for t in holes.tests if t.group == "hole:hole_d"]
+    assert hole_rows and hole_rows[0].status == reqtests.INVALID, hole_rows[0].to_dict()
+    assert holes.summary()["invalid_ratio"] > 0, holes.summary()
+    assert "线孔直径" not in "\n".join(holes.repair_lines()), "没测出来的项不该去驱动修复"
+    assert holes.summary()["pass_rate"] == 0.0, "invalid 按论文口径算失败，不许当通过"
+
+    # 剖面命中 → pass
+    hole_hit = reqtests.evaluate(
+        metrics=mk(
+            bbox=(60.0, 60.0, 100.0), watertight=True, solid_parts=1,
+            wall=wall_ok, sits_on_plate=True, hole_profile=[None, 8.0, None],
+        ),
+        spec=spec,
+        requirement="总高100mm，线孔直径8mm",
+        limits=None,
+        declared_dimensions=dims,
+        declared_holes=[("线孔直径", 8.0, "hole_d")],
+        spec_items=list(spec.specs),
+    )
+    assert [t for t in hole_hit.tests if t.group == "hole:hole_d"][0].status == reqtests.PASS
+
+    # --- 7. 薄膜/散件/要螺纹 的判定（都是实测翻车过的类） --------------------
+    film = reqtests.evaluate(
+        metrics=mk(
+            bbox=(60.0, 60.0, 100.0), watertight=True, solid_parts=1,
+            wall=mesh.WallThickness(min_mm=0.01, p05_mm=0.01, median_mm=2.4, samples=400),
+            sits_on_plate=True,
+        ),
+        **base,
+    )
+    assert any(t.group == "integrity:no-film" and t.status == reqtests.FAIL for t in film.tests)
+
+    parts = reqtests.evaluate(
+        metrics=mk(
+            bbox=(60.0, 60.0, 100.0), watertight=True, solid_parts=3, stray_parts=2,
+            wall=wall_ok, sits_on_plate=True,
+        ),
+        **base,
+    )
+    assert any(t.group == "integrity:one-body" and t.status == reqtests.FAIL for t in parts.tests)
+
+    threadless = reqtests.evaluate(
+        metrics=mk(
+            bbox=(60.0, 60.0, 100.0), watertight=True, solid_parts=1,
+            wall=wall_ok, sits_on_plate=True,
+        ),
+        spec=spec,
+        requirement="做一个 67 转 77 滤镜转接环，带螺纹",
+        limits=None,
+        declared_dimensions={},
+        declared_holes=[],
+        spec_items=list(spec.specs),
+    )
+    assert any(t.group == "thread:real" and t.status == reqtests.FAIL for t in threadless.tests), \
+        "要螺纹却量不到时也必须进清单（jobs 那边已有问题 7）"
+    # 单向一致：jobs 报了螺纹问题，清单里同样是 fail
+    thread_problems = "\n".join(
+        jobs_mod._geometry_integrity_problems(
+            mk(bbox=(60.0, 60.0, 100.0), watertight=True, solid_parts=1, wall=wall_ok),
+            None, "", None, "做一个 67 转 77 滤镜转接环，带螺纹", None,
+        )
+    )
+    assert "螺纹" in thread_problems and thread_problems, thread_problems[:120]
+
+    # --- 8. 网格根本没有 → 全表 invalid -----------------------------------
+    empty = reqtests.evaluate(spec=spec, metrics=None, requirement="x")
+    assert empty.summary()["invalid_ratio"] == 1.0, empty.summary()
+    assert empty.summary()["pass_rate"] == 0.0, empty.summary()
+
+    # --- 9. 接线：修复回喂与落盘都带上清单 ---------------------------------
+    import inspect
+
+    src = inspect.getsource(jobs_mod.GenerationRunner._repair_geometry_integrity)
+    assert "_requirement_suite(" in src and "repair_lines()" in src, "修复循环没接需求核对表"
+    src_finish = inspect.getsource(jobs_mod.GenerationRunner._finish)
+    assert "requirement_suite" in src_finish, "结果里没有需求核对表"
+    src_persist = inspect.getsource(jobs_mod.GenerationRunner._persist)
+    assert "_metrics_payload(" in src_persist, "核对表没随项目指标落盘（重开项目就丢了）"
+    # 方向要统一供给：问题段落、逐轴校正、采纳比较三处都用配对后的方向
+    assert "dimension_targets()" in src, "逐轴校正仍按固定轴判，会把正确的模型越修越歪"
+    assert "dim_targets" in inspect.getsource(jobs_mod._geometry_integrity_problems), \
+        "尺寸问题段落没接配对方向"
+    # 偏 2%~10% 这种「不报错但也没做到」的尺寸，必须仍然能走到确定性逐轴校正：
+    # 第二轮基准实测到旧的 early-return 把它整段跳过（要 60×40 做出 56×36 照样交付）。
+    repair_src = src  # 上方已取：GenerationRunner._repair_geometry_integrity
+    assert "if not problems:\n            return source, compile_result, metrics" not in repair_src, \
+        "提前 return 会让逐轴校正永远轮不到"
+    assert "if problems:" in repair_src and "for attempt in (1, 2):" in repair_src, \
+        "AI 修复轮没有被 problems 门住（要么白烧调用，要么无条件重做）"
+
+    return (
+        "PR/RS/IR 口径正确（工艺建议不打分、invalid 不驱动修复）；契约目标优先；"
+        "水平尺寸整组择优配对并回传逐轴校正；与 jobs 判据单向一致；落盘已接线"
+    )
+
+
+def t_solid_bottom_verdict() -> str:
+    """实心底与开口方向的判定分档（离线，只喂合成 metrics）。
+
+    为什么不并进「需求可执行测试」那一项：那项已有 40 多个断言，而这里的
+    **每一档都对应一类真实翻车**（31 份历史版本里底是开口的 18 份：14 两端开、
+    4 上下反），单独立项能让失败信息直接说出「哪一档判错了」。
+
+    锁六件事：
+      1. 五档分得开：PASS / 两端开 FAIL / 方向反 FAIL / 盖子 MANUAL+advisory / INVALID；
+      2. 只有 FAIL 驱动修复（盖子不许被修复循环封底，量不到不许驱动修复）；
+      3. 需求里没有「底」字时这条**完全不出场**（套管/环形件天生两头通）；
+      4. 大孔件按实测孔径放宽（同样是 20% 材料：有 Ø45 通孔=过，没孔=不过）；
+      5. 门槛只有一把尺子：reqtests 不许自己另写一个占比常数，必须从 mesh 拿；
+      6. 接线：需求原文要含「项目最初那句诉求」，否则改一句「打个通到底的孔」
+         就把门控丢掉了（实测：那一步的指令里根本没得词表里的说法）。
+    """
+    import inspect
+    import re as _re
+    from types import SimpleNamespace
+
+    from aiforge import jobs as jobs_mod
+    from aiforge import mesh, reqtests
+
+    # 需求文案直接用用户真实那句（history.jsonl 第一条），而不是编造一句：
+    # 词表能不能命中全看原文，编的句子验不出真东西。
+    REQ_BOTTOM_TOP = (
+        "设计一个圆形的桌面笔筒：外径 80mm、总高 100mm、壁厚 2.5mm，"
+        "底部是封闭的实心底，顶部敞开。"
+    )
+    REQ_BOTTOM_ONLY = "做个圆形收纳筒：外径 80mm、总高 100mm，底部是封闭的实心底。"
+    REQ_NO_BOTTOM = "做个圆形套管：外径 80mm、内径 74mm、总高 100mm。"
+
+    def mk(**kw):
+        footprint = kw.pop("footprint", 80.0)
+        m = mesh.MeshMetrics(
+            triangles=4000, vertices=2000,
+            bbox=(footprint, footprint, 100.0),
+            bbox_min=(0.0, 0.0, 0.0), bbox_max=(footprint, footprint, 100.0),
+            watertight=True, boundary_edges=0, solid_parts=1, stray_parts=0,
+            sits_on_plate=True, volume_mm3=1000.0,
+        )
+        m.hole_profile = list(kw.pop("hole_profile", [None] * 6))
+        for k, v in kw.items():
+            setattr(m, k, v)
+        return m
+
+    def suite_of(metrics, requirement):
+        return reqtests.evaluate(
+            spec=None, metrics=metrics, requirement=requirement, limits=None,
+            declared_dimensions={}, declared_holes=[], spec_items=[],
+        )
+
+    def row_of(metrics, requirement):
+        rows = [t for t in suite_of(metrics, requirement).tests if t.group == "bottom:solid"]
+        return rows[0] if rows else None
+
+    # 三组读数就是 OpenSCAD 夹具的真实测值（见「孔径射线实测」）：0.958/0.085、
+    # 0.085/0.085、0.085/1.0。两边差一个数量级，所以这些数字**不是凑的**。
+    SOLID = mk(bottom_coverage=0.958, top_coverage=0.085)
+    TUBE = mk(bottom_coverage=0.085, top_coverage=0.085)
+    INVERTED = mk(bottom_coverage=0.085, top_coverage=1.0)
+
+    # --- 1. 做对了就必须 PASS，而且两种需求文案都要能门控 -------------------
+    for req in (REQ_BOTTOM_TOP, REQ_BOTTOM_ONLY):
+        r = row_of(SOLID, req)
+        assert r is not None and r.status == reqtests.PASS, (
+            f"封了底还带 Ø10 排水孔的件被判成 {r and r.status}（{r and r.actual}）："
+            "正确修改会被说成「没改到」"
+        )
+        assert not r.advisory and r.scored and "95.8" in r.actual and "8.5" in r.actual, r.to_dict()
+
+    # --- 2. 两端都开：必须拦住，而且要驱动修复 ------------------------------
+    r = row_of(TUBE, REQ_BOTTOM_TOP)
+    assert r.status == reqtests.FAIL, f"开口管被判成 {r.status}：笔放进去就漏"
+    assert "两端都开着" in r.actual and "z=0" in r.fix_hint, r.to_dict()
+    s = suite_of(TUBE, REQ_BOTTOM_TOP)
+    assert any(t.group == "bottom:solid" for t in s.blocking_failures), "底开了却没进拦住名单"
+    assert "实心底" in "\n".join(s.repair_lines()), "底开了却没回喂 AI（修循环不知道要补底）"
+
+    # --- 3. 上下反了：能拦，而且给的是翻转改法 ----------------------------
+    r = row_of(INVERTED, REQ_BOTTOM_TOP)
+    assert r.status == reqtests.FAIL, f"倒过来建的杯被判成 {r.status}（需求明写了顶部要开）"
+    assert "方向反了" in r.actual, r.to_dict()
+    assert "上下正好反了" in r.fix_hint, r.fix_hint
+
+    # --- 4. 盖子：同一个读数却不能拦住修 ------------------------------------
+    # 需求没说顶部要开 → 底开着顶封着就是「开口朝下」的盖子/罩壳。
+    # 拿「补底」去要它，修复循环会把一个本来正确的盖子改成塞子。
+    r = row_of(INVERTED, REQ_BOTTOM_ONLY)
+    assert r.status == reqtests.MANUAL and r.advisory, (
+        f"盖子被判成 {r.status}（advisory={r.advisory}）：要么误拦修复，要么默默放行"
+    )
+    assert not r.scored, "manual/advisory 还在参与 PR/RS 打分"
+    s = suite_of(INVERTED, REQ_BOTTOM_ONLY)
+    assert all(t.group != "bottom:solid" for t in s.blocking_failures), "盖子被修复循环拦去封底"
+    assert "实心底" not in "\n".join(s.repair_lines()), "盖子进了回喂日志（会被改成塞子）"
+    assert "bottom:solid" not in s.scored_groups, "manual 那一档不该占一个打分位"
+
+    # --- 5. 阴性对照：需求里没「底」字，这条必须完全不出场 ----------------
+    for name, metrics in (("封底", SOLID), ("开口管", TUBE), ("倒杯", INVERTED)):
+        assert row_of(metrics, REQ_NO_BOTTOM) is None, (
+            f"套管需求里没点过「底」，却给 {name} 强加了实心底判定"
+        )
+
+    # --- 6. 大孔放宽：拿产品自己的实测剖面放宽，不拿固定 50% 卡天下 ------
+    funnel = mk(footprint=50.0, bottom_coverage=0.2, top_coverage=0.2,
+                hole_profile=[45.0, None, None, None, None, 45.0])
+    assert row_of(funnel, REQ_BOTTOM_ONLY).status == reqtests.PASS, (
+        "Ø45 通孔只留下 20% 足迹的件被判「底被挖穿」："
+        "固定阈值会驱动修复去封一个用户明令要通的孔"
+    )
+    nohole = mk(footprint=50.0, bottom_coverage=0.2, top_coverage=0.2)
+    assert row_of(nohole, REQ_BOTTOM_ONLY).status == reqtests.FAIL, (
+        "同样 20% 却没量到任何孔却判过了：放宽只能放宽在**用户点名的缺口**上"
+    )
+
+    # --- 7. 量不到 = invalid：进 IR、但不驱动修复 -------------------------
+    unknown = mk(bottom_coverage=None, top_coverage=None)
+    r = row_of(unknown, REQ_BOTTOM_TOP)
+    assert r.status == reqtests.INVALID, f"没量出来却被判成 {r.status}"
+    s = suite_of(unknown, REQ_BOTTOM_TOP)
+    assert all(t.group != "bottom:solid" for t in s.blocking_failures), "没测出来的项去驱动修复了"
+    assert "实心底" not in "\n".join(s.repair_lines()), "没测出来的项进了回喂日志"
+    assert s.summary()["invalid_ratio"] > 0, "invalid 没进 IR（等于把「没测出来」当通过）"
+    assert "bottom:solid" in s.scored_groups, "invalid 不能不参与打分"
+
+    # --- 8. 只有一把尺子：门槛必须从测量层拿，不能在判定层重写 ----------
+    src_req = inspect.getsource(reqtests)
+    assert _re.search(r"from \.mesh import[^\n]*_END_MIN_COVERAGE", src_req), (
+        "reqtests 没从 mesh 拿占比门槛：同一个软件里就会有两把尺子量同一件事"
+    )
+    assert not _re.search(r"coverage[^\n]{0,20}>=\s*0?\.\d", src_req), (
+        "reqtests 里写死了占比字面常量（应该用 mesh._END_MIN_COVERAGE）"
+    )
+    expect_threshold = round((1.0 - mesh._END_MIN_COVERAGE) * 100)
+    assert f"≥{expect_threshold}%" in row_of(SOLID, REQ_BOTTOM_ONLY).expected, (
+        f"清单里给用户看的门槛与 mesh 常数对不上：{row_of(SOLID, REQ_BOTTOM_ONLY).expected}"
+    )
+
+    # --- 9. 接线：需求原文必须带上「项目最初那句诉求」 -------------------
+    project = SimpleNamespace(history=[
+        SimpleNamespace(prompt=REQ_BOTTOM_TOP, instruction=None),
+        SimpleNamespace(prompt=None, instruction="再打个通到底部的排水孔"),
+    ])
+    base = jobs_mod._project_baseline_requirement(project)
+    assert base == REQ_BOTTOM_TOP, f"最初诉求取错了：{base!r}"
+    # 第一条空原文要跳过（实测：真实 history.jsonl 里会有只写 instruction 的回退条目）
+    assert jobs_mod._project_baseline_requirement(SimpleNamespace(history=[
+        SimpleNamespace(prompt="   ", instruction=""),
+        SimpleNamespace(prompt=None, instruction="回退到第 2 版"),
+        SimpleNamespace(prompt="不该被取到", instruction=None),
+    ])) == "回退到第 2 版"
+    assert jobs_mod._project_baseline_requirement(SimpleNamespace(history=[])) == ""
+    assert jobs_mod._project_baseline_requirement(SimpleNamespace()) == ""
+    # 超长要截断（它会被发给 AI，不能把整个历史拼上去）
+    long_base = jobs_mod._project_baseline_requirement(SimpleNamespace(history=[
+        SimpleNamespace(prompt="长" * 2000, instruction=None),
+    ]))
+    assert len(long_base) <= jobs_mod._REQUIREMENT_MAX_CHARS, len(long_base)
+
+    runner = jobs_mod.GenerationRunner.__new__(jobs_mod.GenerationRunner)
+    runner._requirement = "再打个通到底部的排水孔"  # noqa: SLF001
+    runner._requirement_base = base  # noqa: SLF001
+    text = runner._requirement_text()
+    # 这一对断言就是本轮修复的**存在理由**：本次指令本身开不了门控，
+    # 拼上最初诉求才关得上——旧代码只看本次指令，所以那一步的实心底判定根本不生成。
+    assert reqtests._BOTTOM_TOKENS.search(runner._requirement) is None, (  # noqa: SLF001
+        "本次指令里居然有词表里的说法，这条阴性对照失去意义了（换个措辞）"
+    )
+    assert reqtests._BOTTOM_TOKENS.search(text), (  # noqa: SLF001
+        f"拼上最初诉求后门控仍未命中：{text!r}"
+    )
+    assert "排水孔" in text, text
+    # 去重两个方向（第一次生成时 base 就是 current；修改时 current 常被写成 base 的子串）
+    runner._requirement = base  # noqa: SLF001
+    assert runner._requirement_text() == base, "最初诉求与本次指令相同时被拼了两遍"
+    runner._requirement_base = ""  # noqa: SLF001
+    assert runner._requirement_text() == base, "没有 base 时把内容弄丢了"
+    runner._requirement_base = base  # noqa: SLF001
+    runner._requirement = "长" * 2000  # noqa: SLF001
+    assert len(runner._requirement_text()) <= jobs_mod._REQUIREMENT_MAX_CHARS, "拼接后没截断"
+
+    src_run = inspect.getsource(jobs_mod.GenerationRunner.run)
+    assert "_requirement_base = _project_baseline_requirement(" in src_run, (
+        "run() 里没接最初诉求（那上面那段门控断言就只是自吹自擂）"
+    )
+    src_init = inspect.getsource(jobs_mod.GenerationRunner.__init__)
+    assert 'self._requirement_base: str = ""' in src_init, (
+        "__init__ 没给空默认值（注释里写了有，而先于 run() 调到就会 AttributeError）"
+    )
+    src_suite = inspect.getsource(jobs_mod.GenerationRunner._requirement_suite)
+    assert "self._requirement_text()" in src_suite, "需求核对表没用累计诉求"
+    # 判据不许绕过 `_requirement_text()` 直接读本次指令（少一处就漏判一类）
+    assert src_run.count("self._requirement ") <= 1, "还有地方在直接拼本次指令"
+
+    return (
+        "五档分得开（封底 PASS / 两端开 FAIL / 方向反 FAIL / 盖子 MANUAL+advisory / 量不到 INVALID）；"
+        "只有 FAIL 驱动修复；无「底」字不出场；大孔按实测剖面放宽；"
+        "门槛只从 mesh 拿；需求原文已含最初诉求"
+    )
+
+
+
+
+
+_DESIGN_RUN: "tuple[int, str] | None" = None
+
+
+def _design_run() -> "tuple[int, str]":
+    """跑一次 `selfcheck_design.py`，结果缓存（它约 3 秒，有两个地方要用）。
+
+    返回 `(退出码, 全部输出)`。缓存而不是各跑一遍：项数守卫要的是**真跑出来的** `[OK]`
+    条数，不是文档里抄的数 —— 而设计机制守卫本来就要跑它。
+    """
+    global _DESIGN_RUN
+    if _DESIGN_RUN is None:
+        import subprocess
+        import sys as _sys
+
+        script = ROOT / "scripts" / "selfcheck_design.py"
+        assert script.is_file(), f"缺少专项自检脚本：{script}"
+        proc = subprocess.run(
+            [_sys.executable, "-u", str(script)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
+        _DESIGN_RUN = (proc.returncode, (proc.stdout or "") + (proc.stderr or ""))
+    return _DESIGN_RUN
+
+
+def t_selfcheck_count_documented() -> str:
+    """文档里的自检项数必须等于真源，`OFFLINE_SKIPS` 不许有死键（离线）。
+
+    为什么会漂：项数被抄在 5 篇文档里（README-开发者的发布门槛清单与基线表、
+    CONTRIBUTING、docs/DEVELOPMENT、docs/PUBLISH-TO-GITHUB、docs/HANDOVER），
+    每加一项检查就要同步 5 处。实测同时存在 **89 / 74 / 50 / 85 / 131** 五种写法，
+    **没有一个对**；而这些都是「发布前必跑」的门槛描述 —— 照着「50 项」核对的人会
+    以为自己少跑了 41 项，而根本没人核对过「全绿」前面那个数。
+
+    真源 = 本文件 `main()` 里 `check("名称", fn)` 的注册集合，用 **AST** 取。
+    （拿正则扫源码会把注释与 docstring 里举的 `check(...)` 例子也算成一项 —— 同一个坑踩过。）
+
+    设计机制那 142 项**不能**从静态调用点数出来（条件分支里两处 `check(...)` 只跑一处，
+    还有循环），所以拿 `selfcheck_design.py` 真跑一遍的 `[OK]` 条数当尺子。
+    """
+    import ast
+
+    src = Path(__file__).resolve().read_text(encoding="utf-8")
+    names: list[str] = []
+    for node in ast.walk(ast.parse(src)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "check"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            names.append(node.args[0].value)
+    total = len(names)
+    dup = sorted({n for n in names if names.count(n) > 1})
+    assert not dup, f"注册了重名的检查：{dup}（两条同名时根本看不出少跑了一条）"
+    # 取数方式坏了不会报「0 项」，它会报一个看起来也很合理的旧数字 —— 所以先钉住下限
+    assert total >= 80, f"AST 只数到 {total} 项注册，这条守卫自己先失效了（取数方式要查）"
+
+    orphans = sorted(set(OFFLINE_SKIPS) - set(names))
+    assert not orphans, (
+        f"OFFLINE_SKIPS 里有死键：{orphans} —— 对应的检查早就不存在了。"
+        "它在 --offline 下永远匹配不到东西，却会把「跳了几项」这个数骗过所有人"
+    )
+    offline_skip = len(OFFLINE_SKIPS)
+    offline_pass = total - offline_skip
+
+    design_rc, design_out = _design_run()
+    assert design_rc == 0, "selfcheck_design.py 没跑过（具体原因看「设计规格与改动机制」那一项）"
+    design_total = design_out.count("[OK]")
+    assert design_total >= 100, f"只数到 {design_total} 项设计机制子检查，多半是输出格式改了"
+
+    truth = {"total": total, "offline_pass": offline_pass, "offline_skip": offline_skip,
+             "design": design_total, "fail": 0}
+    # 历史实录：**具体哪几处**旧数字算历史，写成一份清单（各自说清是哪一轮），
+    # 而不是靠「这行里有个‘当时’就整行放行」—— 后者会放过「当时的项数，现在完整是 85 项」
+    # 这种把历史跟假现在时写在一句里的情况。不在清单里的旧数字一律算漂移：
+    # 要么改对，要么把它记进清单并写清楚它是哪一轮的取证。
+    historical_notes = (
+        ("docs/HANDOVER.md", "**63 通过 / 0 失败**", "§12 交接后增量（2026-09-17）基线"),
+        ("README-开发者.md", "**50/50 通过**", "§67 首次克隆冒烟那一次"),
+        ("README-开发者.md", "**50/50**（新增「进度可信度」", "§69 那一轮"),
+        ("README-开发者.md", "**50/50**（新增「开源文件完整性」", "§70 那一轮"),
+        ("README-开发者.md", "`selfcheck.py --offline` 32 通过 / 13 跳过", "§70 那一轮"),
+        ("README-开发者.md", "**50/50**（新增「固定零件库可编译」", "§71 那一轮"),
+        ("README-开发者.md", "`selfcheck --offline` 36 通过 / 14 跳过", "§71 那一轮"),
+        ("README-开发者.md", "**50/50**（当时的项数", "基线表里 1.0.0 的克隆冒烟"),
+        ("CHANGELOG.md", "**79 通过 / 0 失败**", "1.0.1 发布记录"),
+        ("CHANGELOG.md", "**40 通过 / 14 跳过 / 0 失败**", "1.0.0 发布记录"),
+        ("CHANGELOG.md", "`--offline` 64 通过 / 15 跳过", "1.0.1 发布记录"),
+    )
+
+    # 只扫随包文档：内部记录（TAKEOVER/COMPETITIVE-GAPS）是**带日期的快照**，
+    # 它们写的是「那一轮测到的数」，钉它们等于要求历史跟着代码改。
+    internal = _internal_doc_paths()
+    docs = [p for p in _doc_files() if p.relative_to(ROOT).as_posix() not in internal]
+    assert len(docs) >= 10, f"只扫到 {len(docs)} 篇随包文档，这条检查等于没跑"
+
+    # 文档里确实就是这么写这几类数的，按写法抽（顺序重要：先吃长写法，剩下的才是泛项数）。
+    # 最后一列 `own`：这种写法要不要本行自己带主题词。**加粗的 N/M 必须自己带**——
+    # 「**13/13**」「**6/6**」这种在文档里隔几行就是一个（打包冒烟、零件库、verify-flow），
+    # 让缩进续行继承主题会把它们当成自检项数报红（实测就这么红了）。而
+    # 「N 通过 / M 跳过 / K 失败」「N 项中跳 M 项」这种写法本身就只可能是项数，续行也能接。
+    idioms = (
+        (re.compile(r"(\d+)\s*项中跳\s*(\d+)\s*项"), ("total", "offline_skip"), False),
+        (re.compile(r"(\d+)\s*通过\s*/\s*(\d+)\s*跳过\s*/\s*(\d+)\s*失败"),
+         ("offline_pass", "offline_skip", "fail"), False),
+        (re.compile(r"(\d+)\s*通过\s*\+\s*(\d+)\s*跳过"), ("offline_pass", "offline_skip"), False),
+        (re.compile(r"(\d+)\s*通过\s*/\s*(\d+)\s*失败"), ("total", "fail"), False),
+        (re.compile(r"\*\*(\d+)\s*/\s*(\d+)\*\*"), ("total", "total"), True),
+        (re.compile(r"(\d+)\s*(?:项|个)\s*(?:子检查|细判据|确定性检查)"), ("design",), False),
+    )
+    # 泛项数只接「N 项」后面是分隔符的（「91 项」/「**91 项**」/「共 91 项）」），
+    # 不接「182 个文本文件」「扫 49 个点」「其中 5 项是…」这类同形不同义的数 ——
+    # 不收「个」是不想报「文档里提到多少个文件」为项数漂移（实测那样会一次报出十几条假阳）。
+    generic = re.compile(r"(\d+)\s*项(?=$|[\s，。、；：）)【】（(*—/|])")
+
+    findings: list[str] = []
+    claim_files: set[str] = set()
+    hist_used: set[int] = set()
+    bound = 0
+    for doc in docs:
+        rel = doc.relative_to(ROOT).as_posix()
+        prev_kind: str | None = None
+        for ln, line in enumerate(doc.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+            # 历史实录是一份**逐字清单**，认它不需要主题词推断，所以必须排在下面的
+            # 门控之前。实测教训：「用它自己的 `scripts/selfcheck.py` 跑 —— **50/50 通过**」
+            # 和「`selfcheck --offline` 36 通过 / 14 跳过」这两句既没缩进、本行又没主题词，
+            # 放在门控之后就被 `continue` 掉了 —— 清单里那两条永远命不中，守卫反过来
+            # 把它们报成「文档里已经找不到」，跟真正的死条目长得一模一样。
+            is_hist = False
+            for hi, (hf, needle, _w) in enumerate(historical_notes):
+                if hf == rel and needle in line:
+                    is_hist = True
+                    hist_used.add(hi)
+            design_subject = any(
+                k in line for k in ("selfcheck_design", "设计规格与改动机制")
+            )
+            # 命令清单里经常是「上一行注释写项数、下一行才是脚本路径」，
+            # 所以主题词不能只认文件名：「后端自检（91 项）」这种也得算数。
+            self_subject = (not design_subject) and any(
+                k in line for k in ("selfcheck.py", "后端自检", "完整自检")
+            )
+            kind = "design" if design_subject else ("total" if self_subject else None)
+            if not line.strip():
+                prev_kind = None  # 空行结束一段，续行不能隔着空行认爸爸
+            elif kind is not None:
+                prev_kind = kind
+            elif not (prev_kind and line.startswith("  ")):
+                continue
+            # markdown 软换行接上一行的主题（实测漏过 HANDOVER.md 基线表：
+            # 「**89 通过 / 0 失败**」就写在缩进的续行上，只认本行主题词永远抓不到它）。
+            own_subject = design_subject or self_subject
+            if kind is None:
+                kind = prev_kind
+            consumed: list[range] = []
+            claims: list[tuple[int, str]] = []
+            for rx, kinds, needs_own in idioms:
+                if needs_own and not own_subject:
+                    continue
+                for m in rx.finditer(line):
+                    claims.extend((int(g), k) for g, k in zip(m.groups(), kinds))
+                    consumed.append(range(m.start(), m.end()))
+            for m in generic.finditer(line):
+                if any(m.start() in c for c in consumed):
+                    continue
+                claims.append((int(m.group(1)), kind))
+            # 本行自己点名了哪个脚本（`selfcheck.py` / `selfcheck_design.py`），那它写的
+            # 任何「N 项」就是在说那个脚本的项数 —— 后面跟什么词都得算。只认严格分隔符时
+            # 实测漏过一句：`selfcheck_design.py`：**全部通过**（142 项设计机制判据）
+            # —— 「项」后面是「设计机制判据」，既不接分隔符也不在写法表里，142 就这么滑过了。
+            # 不带主题词的续行不走这一支，否则「182 个文本文件」「其中 5 项是」又会涌进来。
+            if own_subject:
+                for m in re.finditer(r"(\d+)\s*项(?![\d.])", line):
+                    if any(m.start() in c for c in consumed):
+                        continue
+                    claims.append((int(m.group(1)), kind))
+                    consumed.append(range(m.start(), m.end()))
+            if not claims:
+                continue
+            claim_files.add(rel)
+            for num, k in claims:
+                if num == truth[k]:
+                    bound += 1
+                    continue
+                if is_hist:
+                    continue
+                findings.append(
+                    f"{rel}:{ln} 写着「{num}」（按 {k} 解释），真源是 {truth[k]} —— "
+                    f"{line.strip()[:60]}"
+                )
+    # 同一个数字常被严格分隔符和 own_subject 两支各抓一次， findings 里就会连着
+    # 出现完全相同的两行（实测：21 行里只有 12 处真漂移）。逐条改文档时这种噪声
+    # 会把人带偏，所以先去重再报错。
+    findings = list(dict.fromkeys(findings))
+    assert not findings, (
+        "文档里的自检项数和真源不一致：\n" + "\n".join(findings[:30])
+        + (f"\n……共 {len(findings)} 处" if len(findings) > 30 else "")
+    )
+    # 历史清单自己也不能长死条目：躺着一条文档里已经找不到的“历史”，和
+    # OFFLINE_SKIPS 里的死键是同一类病（它们都不会报错，只会把下一个读者带偏）。
+    unused_hist = [
+        f"{hf} 「{needle}」（{why}）"
+        for i, (hf, needle, why) in enumerate(historical_notes) if i not in hist_used
+    ]
+    assert not unused_hist, (
+        "历史实录清单里有文档中已经找不到（或被改写掉）的条目：\n  " + "\n  ".join(unused_hist)
+        + "\n—— 要么把那句话改回去了，要么它本来就不存在：从清单里删掉，或者改成能命中的那句"
+    )
+    # 数到 0 处声明就是「什么都没查却绿了」；而发布门槛那几篇必须各自至少有一处
+    # （历史实录按**清单条目数**计，同一句里两个旧数字只算一处 —— 它证明的是
+    # 「这条记录还被文档带着」，不是「核了两个数」）。
+    historical = len(hist_used)
+    assert bound + historical >= 12, f"只核到 {bound} 处现行声明 + {historical} 条历史实录，扫描范围不对"
+    must_state = {"README-开发者.md", "CONTRIBUTING.md", "docs/DEVELOPMENT.md",
+                   "docs/PUBLISH-TO-GITHUB.md", "docs/HANDOVER.md"}
+    missing = sorted(must_state - claim_files)
+    assert not missing, (
+        f"这些发布相关文档里一处项数都没写：{missing} —— 把数字删掉不算把数字改对，"
+        "跑哪个脚本、该得几项得写在文档里"
+    )
+    return (
+        f"真源 {total} 项 / --offline {offline_pass} 通过 + {offline_skip} 跳过 / 设计机制 {design_total} 项；"
+        f"{len(docs)} 篇随包文档里 {bound} 处项数声明全部对上（另有 {historical} 条已登记的历史实录）；"
+        "检查名无重名、OFFLINE_SKIPS 无死键"
+    )
+
+
+def t_bench_prompts_script() -> str:
+    """质量基准脚本的结构守卫（离线，不调 AI）。
+
+    为什么要给"基准脚本"本身做自检：基准一旦题目退化，报出来的 PR/RS 就成了噪声，
+    而噪声基线比没有基线更危险（会让人以为回归通过了）。这里锁三件事：
+      1. 题量与分档（20 题 / 4 档，对齐 CADTestBench 的公开口径）；
+      2. 每题都必须带**可实测的点名尺寸**（没有数字就没法判 RS，等于白跑一次生成）；
+      3. 判据只认实测：脚本必须从 requirement_tests 取数，不许读 AI 的自我陈述。
+    """
+    import importlib.util
+    import os
+    import re
+    from pathlib import Path as _Path
+
+    script = _Path(ROOT) / "scripts" / "bench_prompts.py"
+    assert script.is_file(), "基准脚本丢了"
+    spec = importlib.util.spec_from_file_location("aiforge_bench_probe", script)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    # 脚本在 import 时就设 AIFORGE_DATA_DIR/PROJECTS_DIR（它靠这个隔离跑题数据）：
+    # 自检进程里必须原样还回去，否则后面的用例会写到别人的目录里去。
+    saved = {k: os.environ.get(k) for k in ("AIFORGE_DATA_DIR", "AIFORGE_PROJECTS_DIR")}
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    prompts = mod.PROMPTS
+    assert len(prompts) == 20, f"题量必须固定才能横向比较，实际 {len(prompts)}"
+    tiers = {q["tier"] for q in prompts}
+    assert tiers == {1, 2, 3, 4}, tiers
+    for q in prompts:
+        assert re.search(r"\d+(?:\.\d+)?\s*mm", q["prompt"]), f"{q['name']} 没有可实测的尺寸"
+    # 一致性指标要真的比对重复次数
+    src = script.read_text(encoding="utf-8")
+    assert "requirement_tests" in src, "基准没有取实测核对表，分数就是假的"
+    assert "pass_rate" in src and "invalid_ratio" in src, "缺 PR/IR 口径"
+    assert "AIFORGE_BENCH_REPEAT" in src, "没有一致性子模式"
+    return f"{len(prompts)} 题 / 4 档，全部带可实测尺寸；判据取自 requirement_tests"
+
+
+def t_name_bridge() -> str:
+    """规格名 ↔ 源码参数名的「改名桥」必须接上（离线、不调 AI）。
+
+    实测到的翻车（用户报的正是这个）：一句话生成时 AI 把参数写成 `total_h`，
+    提炼规格时又写成 `height`。用户说「把高度改成50mm」，AI 也**真的**把
+    `total_h` 从 100 改成了 50 —— 但程序：
+      * 找不到 `height` → 判「你要的改动没生效」；
+      * 又按名字比对，把 `total_h` 的改动判成「未授权改动」；
+      两项加起来代价 8.0，高于「完全没改」的 4.0，于是取舍逻辑选中了
+      **原封不动的那一版**，界面还报成功。用户看到的就是「改了没反应」。
+
+    这里把整条桥固化成断言：标签解析 → 名字解析 → 契约 → 判定 → 兜底，
+    并带一个**阴性对照**（把名字换成毫无线索的 `body_extent`），
+    确保绿灯是桥带来的，不是判据被放松换来的。
+    """
+    from aiforge import jobs as jobs_mod
+    from aiforge import scad as scad_src
+    from aiforge.changes import (
+        build_change_contract,
+        follow_values,
+        resolve_param_name,
+        verify_change,
+    )
+    from aiforge.design import DesignSpec
+
+    source = (
+        "// @name 笔筒\n"
+        "// @param total_h 100 总高 60 200\n"
+        "// @param outer_d 80 外径 60 120\n"
+        "// @param rib_z0 12 加强筋起始高度 0 60\n"
+        "// @param rib_z1 88 加强筋结束高度 20 100\n"
+        "// @param rib_h 1.2 加强筋凸出高度 0.6 4\n"
+        "total_h = 100;\n"
+        "outer_d = 80;\n"
+        "rib_z0 = 12;\n"
+        "rib_z1 = 88;\n"
+        "rib_h = 1.2;\n"
+        "cylinder(h = total_h, d = outer_d);\n"
+    )
+    spec = DesignSpec.from_dict(
+        {
+            "kind": "笔筒",
+            "specs": [
+                {"name": "height", "label": "总高", "value": 100.0, "unit": "mm",
+                 "user_specified": True},
+                {"name": "outer_diameter", "label": "外径", "value": 80.0, "unit": "mm",
+                 "user_specified": True},
+            ],
+        }
+    )
+    params = scad_src.extract_top_level_numbers(source)
+    labels = scad_src.extract_param_labels(source)
+    assert labels.get("total_h") == "总高", labels
+    assert resolve_param_name("height", params, labels) == "total_h", "标签桥没接上"
+    # 第二道网：没有注释标签时，结尾的单字母缩写也要能认出来
+    assert resolve_param_name("height", {"total_h": 100.0, "wall_t": 2.0}) == "total_h"
+    # 阴性对照：既无标签也无缩写线索时不许硬猜
+    assert resolve_param_name("height", {"body_extent": 100.0}) is None
+
+    contract = build_change_contract("把高度改成50mm。", spec, params, labels)
+    assert "total_h" in contract.changed, contract.changed
+    assert contract.target_values.get("total_h") == 50.0, contract.target_values
+    assert "total_h" not in contract.unchanged, contract.unchanged
+    # 同维度家族、沿轴的位置项必须进入跟随名单，并从「必须不变」里拿掉
+    assert "rib_z1" in contract.follow, contract.follow
+    assert not (set(contract.follow) & set(contract.unchanged)), contract.unchanged
+    assert "outer_d" in contract.unchanged, contract.unchanged
+
+    candidate = source.replace("total_h = 100;", "total_h = 50;")
+    verdict = verify_change(source, candidate, contract, spec)
+    assert verdict.ok, verdict.describe()
+    assert not verdict.unauthorized, verdict.unauthorized
+    assert verdict.penalty() == 0.0, verdict.penalty()
+
+    # 阴性对照：把参数换成毫无线索的名字，同一形状的候选必须被判失败
+    renamed = source.replace("total_h", "body_extent")
+    narrow = build_change_contract(
+        "把高度改成50mm。", spec, scad_src.extract_top_level_numbers(renamed)
+    )
+    narrow_verdict = verify_change(
+        renamed, renamed.replace("body_extent = 100;", "body_extent = 50;"), narrow, spec
+    )
+    assert not narrow_verdict.ok and narrow_verdict.unauthorized, narrow_verdict.describe()
+
+    # 跟随项按比例缩放；但「特征自身尺寸」（凸出高度）不许跟着缩 ——
+    # 把 1.2mm 的筋缩成 0.6mm 是改坏模型，不是改小模型。
+    followed = follow_values(contract, params, labels)
+    assert followed.get("rib_z1") == 44.0 and followed.get("rib_z0") == 6.0, followed
+    assert "rib_h" not in followed, followed
+
+    surgical = jobs_mod._apply_targets(source, contract)  # noqa: SLF001
+    assert surgical is not None
+    rewritten = scad_src.extract_top_level_numbers(surgical)
+    assert rewritten["total_h"] == 50.0 and rewritten["rib_z1"] == 44.0, rewritten
+    assert rewritten["outer_d"] == 80.0 and rewritten["rib_h"] == 1.2, rewritten
+    assert verify_change(source, surgical, contract, spec).ok
+
+    # 底线：目标在源码里是表达式赋值时，绝不能改别的参数充数
+    expr = "design_h = 100;\nheight = design_h * 1.5;\ncube([10, 10, height]);\n"
+    expr_contract = build_change_contract(
+        "把高度改成150mm。", spec, scad_src.extract_top_level_numbers(expr)
+    )
+    assert jobs_mod._apply_targets(expr, expr_contract) is None, (  # noqa: SLF001
+        "height 是表达式赋值时不能改写 design_h 充数"
+    )
+
+    # 方位词必须**自成词元**才算方位（旧写法是子串，误伤过真参数名）。
+    # 为什么这一条值得钉在改名桥里：`_modifier_conflict` 一报“方位相反”就把那个
+    # 参数从候选里整个删掉，删错了就不是“保守”，而是**解析不到 → 确定性兜底失效
+    # → 用户明明改对了却被判“没改到”**。实测拿全仓 760 个真实参数名/标签对账：
+    #   * `backlash`（齿轮侧间隙，零件库里的真参数）旧判定读出 `back`；
+    #   * `laptop_bottom_h` 里 `top` 只是 `laptop` 的中间一段，旧判定读出 top+bottom，
+    #     于是它与「底部厚度」被判成方位相反（实测：旧=冲突、新=不冲突）。
+    # 也不能反过来只按 `[_-\s]` 切词：零件库里有 `NemaBackAxleLength` / `CenterCandleWidth`
+    # 这种驼峰名，切不开就把**真**方位词一起丢了（实测这两个名字新旧判定一致，
+    # 靠的就是驼峰边界而不是子串）。
+    from aiforge.changes import _direction_words  # noqa: SLF001
+
+    assert _direction_words("laptop_bottom_h") == {"bottom"}, _direction_words("laptop_bottom_h")
+    assert _direction_words("backlash") == set(), _direction_words("backlash")
+    assert _direction_words("NemaBackAxleLength") == {"back"}, "驼峰里的真方位词丢了"
+    assert _direction_words("CenterCandleWidth") == {"center"}, "驼峰里的真方位词丢了"
+    # 中文没有词边界，单字方位词仍按子串认（这条不能误伤到英文那一套里）
+    assert _direction_words("把这个孔的内径改成8mm") == {"inner"}, "中文方位词丢了"
+    # …并且真的能接到参数上（实测：旧判定下唯一候选被删 → 返回 None；新判定接得上）
+    assert resolve_param_name("底部高度", {"laptop_height": 80.0}) == "laptop_height", (
+        "laptop 里的 top 被当成方位词，把用户说的那个参数从候选里删了"
+    )
+    return (
+        "改名桥：标签与缩写都能把 height 接到 total_h，跟随项按轴缩放、特征尺寸不动；"
+        "方位词只认自成词元的（backlash/laptop 不误伤，驼峰 Back/Center 不丢）"
+    )
+
+
+def t_contract_intent() -> str:
+    """改动契约的**语义**正确性：用户说什么，就只能授权改什么（离线）。
+
+    这一组全部来自真机实测翻车（跑真实端到端矩阵时抓到的）：
+      * 「在顶部增加一个直径10mm的圆孔」→ 契约里出现
+        `target_values={'outer_d': 90}`：裸别名「直径」命中了规格里的**外径**，
+        「增加」又被当成相对改动 → 程序**主动下令**把外径从 80 改成 90。
+        用户只是要加个孔，外径却变了 10mm。
+      * 「把这个孔的内径改成8mm」→ 解析到 `outer_d`（外径）：`inner_diameter`
+        与 `外径` 是相反的两个尺寸，但一个写英文一个写中文，逐字比对看不出来。
+      * 「高度不变，把外径改成70mm」→ `total_h` 仍被写进 changed：
+        冻结的是规格名 `total_height`，而授权名单里补的是源码名 `total_h`。
+      * 「把高度增加20mm」→ 目标值成了 20（而不是 70）：`total_height` 这种
+        复合规格名解析不到源码里的 `total_h`。
+    这些错误都比"AI 改错"更严重 —— 契约错了，AI 改得再听话也是错的。
+    """
+    from aiforge import scad as scad_src
+    from aiforge.changes import build_change_contract
+    from aiforge.design import DesignSpec
+
+    source = (
+        "// @param outer_d 80 外径 40 200\n"
+        "// @param total_h 100 总高 30 300\n"
+        "// @param wall_t 2.5 筒壁厚度 1 10\n"
+        "// @param bottom_t 6 底部实心厚度 1 20\n"
+        "// @param rib_z1 88 加强筋终止高度 10 300\n"
+        "outer_d = 80;\n"
+        "total_h = 100;\n"
+        "wall_t = 2.5;\n"
+        "bottom_t = 6;\n"
+        "rib_z1 = 88;\n"
+        "cylinder(h = total_h, d = outer_d);\n"
+    )
+    spec = DesignSpec.from_dict(
+        {
+            "kind": "圆形笔筒",
+            "specs": [
+                {"name": "outer_diameter", "label": "外径", "value": 80.0, "unit": "mm",
+                 "user_specified": True},
+                {"name": "total_height", "label": "总高", "value": 100.0, "unit": "mm",
+                 "user_specified": True},
+                {"name": "wall_thickness", "label": "壁厚", "value": 2.5, "unit": "mm",
+                 "user_specified": True},
+                # 底部厚度这类项常常是后加的（用户改动时才被提炼出来），
+                # 句子里没有"厚度"两个字、只有动词「加厚」时也要能落到它上面
+                {"name": "bottom_thickness", "label": "底部实心厚度", "value": None,
+                 "unit": "mm", "user_specified": False},
+                {"name": "inner_diameter", "label": "内径", "value": None, "unit": "mm",
+                 "user_specified": False},
+            ],
+        }
+    )
+    params = scad_src.extract_top_level_numbers(source)
+    labels = scad_src.extract_param_labels(source)
+
+    def contract(text: str):
+        return build_change_contract(text, spec, params, labels)
+
+    def touches_outer(built) -> bool:
+        return any(
+            "outer" in name for name in (*built.changed, *built.target_values, *built.follow)
+        )
+
+    # ① 加孔：只能当成结构改动，绝不能授权改外径
+    hole = contract("在顶部正中间增加一个直径10mm的圆孔，要完全贯通到底部。")
+    assert not hole.target_values, hole.target_values
+    assert not touches_outer(hole), (hole.changed, hole.target_values, hole.follow)
+    # ② 内径：不许落到外径上
+    inner = contract("把这个孔的内径改成8mm。")
+    assert not touches_outer(inner), (inner.changed, inner.target_values, inner.follow)
+    # ③ 明确冻结的项，解析出来的源码参数名也要一起冻结
+    frozen = contract("高度不变，把外径改成70mm。")
+    assert frozen.target_values.get("outer_d") == 70.0, frozen.target_values
+    assert "total_h" not in frozen.changed, frozen.changed
+    assert "total_h" in frozen.frozen, frozen.frozen
+    # ④ 相对改动：以源码里的当前值为基准（100 + 20 = 120）
+    grow = contract("把高度增加20mm。")
+    assert grow.target_values.get("total_h") == 120.0, grow.target_values
+    # ⑤ 整体缩放：比例被识别、且不存在"必须逐字不变"的项
+    scale = contract("整体缩小到原来的80%。")
+    assert abs(float(scale.scale_factor or 0) - 0.8) < 1e-9, scale.scale_factor
+    assert scale.unchanged == [] and scale.follow == [], (scale.unchanged, scale.follow)
+    # 缩放的授权名单必须落到**源码参数名**上：只写规格名时，参数核对会把
+    # 缩放后的 outer_d / total_h 全判成"越权改动"，缩放永远不达标 → 被回退成
+    # "什么都没改"（实测：整体缩小到 80% 时模型一毫米没动，作业却报成功）。
+    for name in ("outer_d", "total_h", "wall_t", "bottom_t"):
+        assert name in scale.changed, (name, scale.changed)
+    # ⑥ 正对照：直接说外径，必须真的授权外径（别为了防误报把正事也挡了）
+    outer = contract("把外径改成90mm。")
+    assert outer.target_values.get("outer_d") == 90.0, outer.target_values
+    # ⑦ 壁厚：复合规格名要能落到 wall_t
+    wall = contract("把壁厚改成3mm。")
+    assert wall.target_values.get("wall_t") == 3.0, wall.target_values
+    # ⑧ 「底座加厚到6mm」：句子里没有"厚度"两个字，只有动词"加厚"。
+    #    以前契约完全空转（changed/target_values 都空）→ AI 什么都不改 → 报成功。
+    base = contract("把底座加厚到6mm。")
+    assert base.target_values.get("bottom_t") == 6.0, base.target_values
+    assert "wall_t" not in base.target_values, base.target_values
+
+    # ⑨ 多个子句各自一个数字时，每个数字必须落在**自己那一句**的参数上。
+    #   钉住的是「按句长推算子句区间」那套记账：分隔符不都是 1 个字符
+    #   （然后/并且/同时/另外 是 2 个），而且「，然后」会被当成**两个**分隔符、
+    #   中间空片段又被丢弃 —— 推算出的区间比真实区间短，句尾的个位数就滑到下一句。
+    #   旧实现下这一句实测会算成 `outer_d=8、total_h=3、壁厚没目标值`：
+    #   程序**主动下令**把总高改成 3mm（用户说的是 50）。这不是保守，是错。
+    many = contract("把外径改成8，然后把壁厚改成3，同时把总高改成50")
+    assert many.target_values == {"outer_d": 8.0, "wall_t": 3.0, "total_h": 50.0}, (
+        many.target_values
+    )
+    return "契约语义正确：加孔不授权外径、内径不落到外径、冻结含源码名、缩放授权到参数名、加厚认得厚度、多子句数字各归各句"
+
+
+def t_user_scale() -> str:
+    """用户要求的整体缩放必须**真的缩小**，且不改变结构（离线，不调 AI）。
+
+    实测两个坑：
+      * 缩放没有"目标参数值"，所以「把目标值写回源码」那条确定性兜底对它是空转，
+        AI 两次没做到时整条链只能保留原版 —— 用户看到"缩小到80%"却一毫米没变，
+        作业还报成功；
+      * 无差别按倍率改写会把 `rib_count` 从 16 缩成 12.8（渲染成 13 条筋），
+        那是**改了结构**，不是等比缩小。
+    """
+    from aiforge import jobs as jobs_mod
+    from aiforge import scad as scad_src
+    from aiforge.changes import build_change_contract, verify_change
+    from aiforge.design import DesignSpec
+
+    source = (
+        "// @param outer_d 80 外径 40 200\n"
+        "// @param total_h 100 总高 30 300\n"
+        "// @param wall_t 2.5 筒壁厚度 1 10\n"
+        "// @param rib_count 16 竖向加强筋数量 0 36\n"
+        "// @param rib_z1 88 加强筋终止高度 10 300\n"
+        "outer_d = 80;\n"
+        "total_h = 100;\n"
+        "wall_t = 2.5;\n"
+        "rib_count = 16;\n"
+        "rib_z1 = 88;\n"
+        "cylinder(h = total_h, d = outer_d);\n"
+    )
+    spec = DesignSpec.from_dict(
+        {
+            "kind": "笔筒",
+            "specs": [
+                {"name": "outer_diameter", "label": "外径", "value": 80.0, "unit": "mm",
+                 "user_specified": True},
+                {"name": "height", "label": "总高", "value": 100.0, "unit": "mm",
+                 "user_specified": True},
+            ],
+        }
+    )
+    params = scad_src.extract_top_level_numbers(source)
+    labels = scad_src.extract_param_labels(source)
+    contract = build_change_contract("整体缩小到原来的80%。", spec, params, labels)
+    assert abs(float(contract.scale_factor or 0) - 0.8) < 1e-9, contract.scale_factor
+    assert not contract.unchanged, contract.unchanged
+
+    scaled = jobs_mod.build_user_scaled_source(source, 0.8, "测试机")  # noqa: SLF001
+    assert scaled and scaled != source, "必须能构造出缩放版"
+    after = scad_src.extract_top_level_numbers(scaled)
+    assert abs(after["outer_d"] - 64.0) < 1e-6, after
+    assert abs(after["total_h"] - 80.0) < 1e-6, after
+    assert abs(after["rib_z1"] - 70.4) < 1e-6, after
+    assert abs(after["rib_count"] - 16.0) < 1e-6, f"筋数量不该跟着缩：{after}"
+    verdict = verify_change(source, scaled, contract, spec)
+    assert verdict.ok, verdict.describe()
+    assert not verdict.unauthorized, verdict.unauthorized
+    return "整体缩放：契约授权到参数名、确定性缩放真的缩小、数量类参数不变、核对达标"
+
+
+def t_compile_advice() -> str:
+    """编译失败要给出**针对该错误的可执行改法**（离线，不调 AI）。
+
+    实测：模型生成时 OpenSCAD 报 `CGAL error in CGALUtils::applyUnion3D:
+    assertion violation`，程序把这段原文直接丢给 AI 去修 —— 连修两轮还是同一个错，
+    用户看到的是「自动修复后仍然失败」。原文对 AI 基本是噪音，
+    必须翻成「共面重合 / 零厚度 / 非流形」这类具体成因与改法。
+    """
+    from aiforge import compiler
+    from aiforge import jobs as jobs_mod
+    import inspect
+
+    cgal = (
+        "CGAL error in CGALUtils::applyUnion3D: CGAL ERROR: assertion violation!\n"
+        "Expr: e_bp == CGAL::EQUAL"
+    )
+    advice = compiler.explain_failure(cgal)
+    assert advice and "0.01mm" in advice and "共面" in advice, advice
+    manifold = compiler.explain_failure("Object may not be a valid 2-manifold and may need repair!")
+    assert manifold and "2-流形" in manifold, manifold
+    flat = compiler.explain_failure("Current top level object is not a 3D object.")
+    assert flat and "extrude" in flat, flat
+    # 不认识的报错原样交给 AI，不要编造改法
+    assert compiler.explain_failure("something totally unknown") is None
+    assert compiler.explain_failure("") is None
+    # P0 扩充的 CGAL 变体：不封闭 / 自相交 / 空几何 / 内存 / NaN
+    closed = compiler.explain_failure("WARNING: The given mesh is not closed!")
+    assert closed and "零件库" in closed, closed
+    selfint = compiler.explain_failure("CGAL: self-intersection detected")
+    assert selfint and "自相交" in selfint, selfint
+    empty = compiler.explain_failure("Current top level object is empty")
+    assert empty and "module" in empty, empty
+    mem = compiler.explain_failure("terminate called after throwing 'std::bad_alloc'")
+    assert mem and "$fn" in mem, mem
+    nan = compiler.explain_failure("ERROR: coordinate is nan")
+    assert nan and "NaN" in nan, nan
+    # 三个字母的特征片段不能做子串匹配：实测 `nano_gap` / `nanoseconds` 都会被
+    # 旧的 `"nan" in lowered` 当成「坐标出现 NaN」，自动修复循环因此拿到错的病因。
+    for text in (
+        "ERROR: Unknown variable 'nano_gap' in file model.scad, line 12.",
+        "WARNING: Ignoring unknown variable nanoseconds.",
+    ):
+        got = compiler.explain_failure(text)
+        assert not (got and "NaN" in got), f"无关文本被判成了 NaN 报错：{text} → {got}"
+        assert got and "未定义" in got, f"未定义变量该拿到逐字校对名字的改法：{text} → {got}"
+    # 上面两条还不能证明「整词匹配」真的生效（它们先被 unknown variable 那条接住了）。
+    # 这两条才是：文本里带 nano/nancy 但不属于任何已知失败 —— 按子串匹配会被
+    # `"nan"` 接走并编出一份 NaN 改法，按整词匹配则必须老实返回 None（不编造）。
+    for text in (
+        "WARNING: Variable nanoseconds is deprecated.",
+        "ERROR: Could not open input file C:\\Users\\nancy\\model.scad",
+    ):
+        got = compiler.explain_failure(text)
+        assert got is None, f"无关文本被 `nan` 子串匹配拉走了：{text} → {(got or '')[:40]}"
+    # 修复证据的拼装方式：改法在前、原文在后
+    source = inspect.getsource(jobs_mod.GenerationRunner._ensure_compilable)  # noqa: SLF001
+    assert "compile_result.advice" in source, "编译修复没有用上可执行改法"
+    # 换路径重生成（P0）：修复两轮仍失败时带硬约束重新生成一次
+    assert "_REGEN_EXTRA" in source, "编译修复两轮失败后没有换路径重生成"
+    return "编译报错翻译成可执行改法（含不封闭/自相交/空/内存/NaN），未知不编造，两轮失败换路径"
+
+
+def t_console_streams() -> str:
+    """`--noconsole` 打包后，诊断入口在无控制台句柄时也必须能跑完（离线）。
+
+    实测：打包版用快捷方式 / `Start-Process` 启动 `--check` 时
+    `sys.stdout` 是 `None`，`print()` 抛 AttributeError，进程退出码 1、
+    且什么都不显示 —— 用户看到的是「诊断跑完什么都没有，还失败了」。
+    """
+    import importlib.util
+
+    import main as main_mod  # type: ignore[import-not-found]
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("aiforge_main_probe", root / "main.py")
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert hasattr(mod, "_ensure_console_streams"), "main.py 缺少无控制台兜底"
+
+    saved = (sys.stdout, sys.stderr)
+    try:
+        sys.stdout = None  # type: ignore[assignment]
+        sys.stderr = None  # type: ignore[assignment]
+        mod._ensure_console_streams()
+        assert sys.stdout is not None and sys.stderr is not None, "兜底之后仍有 None 流"
+        sys.stdout.write("")  # 必须真的可写，不能只是非 None
+    finally:
+        sys.stdout, sys.stderr = saved
+
+    # `--check` 必须同时留一份报告文件，避免"没控制台就什么都看不到"
+    import inspect
+
+    check_source = inspect.getsource(mod._run_check)
+    assert "check-report.txt" in check_source, "--check 没有落地报告文件"
+    assert inspect.getsource(mod.main).index("_ensure_console_streams") < 200, (
+        "main() 必须在最前面就装好标准流兜底"
+    )
+    del main_mod
+    return "无控制台句柄时标准流有兜底（不再崩、退出码正确），--check 另存报告文件"
+
+
+def t_console_encoding() -> str:
+    """GBK 控制台下，打印中文/符号不能把脚本自己弄崩。
+
+    这条是实测出来的真问题（不是假想）：中文 Windows 默认代码页 936，而 Python
+    到 3.13 为止不会默认启用 UTF-8 模式。`scripts/selfcheck_design.py` 里有一行
+    明细带「−」（U+2212），在 GBK 控制台里跑就把整个自检带崩：不只这一项没结果，
+    后面的项、汇总、退出码全部丢失 —— 发布门禁会“看起来跑过了”。
+    这里分别验证：真子进程能跑通（含阴性对照）、降级路径不抛异常、
+    入口脚本都接上了、以及实现只有一份。
+    """
+    import ast
+    import io
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    scripts_dir = root / "scripts"
+    from aiforge import stdio as stdio_mod
+
+    tricky = "− 减号 （≥4.5:1）"  # 数学减号等不是 GBK 可表示字符，混在中文里
+    env = {**os.environ, "PYTHONIOENCODING": "gbk", "PYTHONUTF8": "0", "PYTHONPATH": str(scripts_dir)}
+    env.pop("PYTHONHOME", None)
+
+    def run(code: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            env=env,
+            cwd=str(root),
+            timeout=120,
+        )
+
+    # 1) 接上兜底：子进程里 stdout 必须是 UTF-8，这些字符能完整写出来
+    fixed = run(f"import console_utf8; print({tricky!r})")
+    assert fixed.returncode == 0, (
+        f"接上 console_utf8 仍崩：rc={fixed.returncode} "
+        f"stderr={fixed.stderr.decode('utf-8', 'replace')[-300:]}"
+    )
+    out = fixed.stdout.decode("utf-8", "replace")
+    assert tricky in out, f"兜底后输出不对（实际 {out!r}）"
+
+    # 2) 阴性对照：同样的字符不兜底时必须崩，否则这条用例在验一个不存在的问题
+    broken = run(f"print({tricky!r})")
+    assert broken.returncode != 0, "GBK 下打印这些字符居然没崩 —— 用例前提变了，重新看这里"
+    assert b"UnicodeEncodeError" in broken.stderr, broken.stderr[-300:]
+
+    # 3) 降级路径：写不进去也不能抛异常，而是退化成 \uXXXX（信息不丢）
+    buf = io.BytesIO()
+    strict_ascii = io.TextIOWrapper(buf, encoding="ascii", errors="strict")
+    assert stdio_mod.safe_print(tricky, file=strict_ascii) is True
+    assert b"\\u2212" in buf.getvalue(), buf.getvalue()
+
+    # 4) 入口脚本都接上了，而且比第一个 print 先执行（用 AST 看，不会被注释/文档骗到）
+    missing, late, guarded = [], [], 0
+    for path in sorted(scripts_dir.glob("*.py")):
+        if path.name == "console_utf8.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        printed = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+        ]
+        if not printed:
+            continue
+        wired = next(
+            (
+                node.lineno
+                for node in tree.body
+                if isinstance(node, ast.Import)
+                and any(alias.name == "console_utf8" for alias in node.names)
+            ),
+            None,
+        )
+        if wired is None:
+            missing.append(path.name)
+        elif wired > min(printed):
+            late.append(path.name)
+        else:
+            guarded += 1
+    assert not missing, f"这些脚本会打印中文却没接兜底：{missing}"
+    assert not late, f"这些脚本的 console_utf8 导入太晚（必须比第一个 print 先）：{late}"
+    assert guarded >= 15, f"只量到 {guarded} 个脚本接了兜底，与预期不符（是不是 glob 不对？）"
+
+    # 5) 实现只有一份：main.py 不能又写一份自己的（两处漂移就是这次的成因）
+    main_src = (root / "main.py").read_text(encoding="utf-8")
+    assert "from aiforge import stdio" in main_src, "main.py 不再共用 aiforge.stdio"
+    assert "TextIOWrapper" not in main_src, "main.py 里又写了一份自己的标准流实现"
+    return (
+        f"GBK 子进程已修好（含阴性对照）、写不进时降级为 \\uXXXX、"
+        f"{guarded} 个入口脚本已接入且导入时机正确"
+    )
+
+
+def t_dpi_workarea() -> str:
+    """高 DPI 适配：窗口尺寸夹紧必须拿到**真实工作区**，而不是任意一个系统度量。
+
+    这条来自一个用户天天碰得到、而自检一项都没覆盖的缺陷（`dpi.py`）：它把
+    `GetSystemMetrics(48) / (49)` 当成 `SM_CXWORKAREA / SM_CYWORKAREA` 使用，
+    而 **winuser.h 里没有这两个索引** —— 48 是 SM_CYMINSPACING（小图标纵向间距）、
+    49 是 SM_CXMINTRACK（最小窗口跟踪宽度），本机实测读到 34 与 16。
+    于是 `work_dip=(27,16)`，`window_geometry` 把 min 抬到 floor、又把 preferred
+    夹到 `work-8`，**任何机器上恒返回 (720,520) 且 min_size == size**：用户永远
+    拿不到设计尺寸 1360×880，窗口还被钉死不能放大；同时「高缩放小屏上窗口比
+    屏幕还大」这个它真正要保护的场景一次也没被保护过。又因为读数不是 0，
+    「拿不到就退回屏幕尺寸」的兜底也一起失效。
+
+    为什么以前没被抓到：全仓没有一处对 `window_geometry` / `ensure_dpi_awareness`
+    做断言，`verify-hdpi` 跑在浏览器 CDP 里量不到原生窗口。**基线全绿不等于没问题。**
+
+    同一个模块里还钉了第二条（下面第 4 段）：`shcore.SetProcessDpiAwareness` 的
+    返回值是 HRESULT，**失败时不抛异常**（本机实测：已经有感知时返回 0x80070005）。
+    旧写法把「没抛异常」当「设成功了」，于是诊断页与日志一起谎报 `mode=per_monitor`，
+    还顺手跳过下面那条 `SetProcessDPIAware()` 兜底 —— 用户报「界面发虚」时，
+    拿到的第一条排查线索本身就是假的。
+
+    尺子本身也是实测出来的（不能再省一步）：`shcore.GetProcessDpiAwareness(NULL)` 读的是
+    Win8.1 那套进程 slot，用 `SetProcessDpiAwarenessContext` 设的感知它看不见（本机实测
+    钉成 system 后它返回 0=unaware，而 GetThreadDpiAwarenessContext 返回 -1）。
+    拿它当「真值」会把正确的产品代码判红 —— 第一版守卫就是这么红的，错在尺子不在代码。
+    """
+    import ctypes
+    import ctypes.wintypes
+    import subprocess as sp
+
+    from aiforge import dpi as dpi_mod
+
+    # 1) 纯几何：夹紧逻辑本身（不依赖本机屏幕，三档都要对）
+    big = dpi_mod.DpiState(aware=True, mode="per_monitor_v2", dpi=120, scale=1.25,
+                           screen_px=(2880, 1620), work_px=(2880, 1620))
+    size, mins = dpi_mod.window_geometry((1360, 880), (1080, 700), state=big)
+    assert size == (1360, 880) and mins == (1080, 700), (
+        f"宽裕的工作区不该夹紧，却算成 {size}/{mins}"
+    )
+
+    small = dpi_mod.DpiState(aware=True, mode="per_monitor_v2", dpi=192, scale=2.0,
+                             screen_px=(1920, 1080), work_px=(1920, 1000))
+    size, mins = dpi_mod.window_geometry((1360, 880), (1080, 700), state=small)
+    assert small.work_dip == (960, 500), small.work_dip
+    assert size[0] <= small.work_dip[0] and mins[0] < 1080, (
+        f"200%/1080p 上窗口或最小尺寸仍比屏幕宽：size={size} min={mins}"
+    )
+
+    blind = dpi_mod.DpiState()  # 什么屏幕信息都没拿到
+    size, mins = dpi_mod.window_geometry((1360, 880), (1080, 700), state=blind)
+    assert size == (1360, 880) and mins == (1080, 700), (
+        f"拿不到屏幕信息时必须保持原样（给定的默认值不能用 0 尺寸替它），却算成 {size}/{mins}"
+    )
+
+    if os.name != "nt":
+        return "窗口夹紧三档正确（宽屏原样 / 200% 小屏夹紧 / 无信息不返回 0）；非 Windows 不取屏幕度量"
+
+    # 2) 本机真值对账：产品读的工作区必须 == 系统真实工作区
+    state = dpi_mod.ensure_dpi_awareness()
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    rect = ctypes.wintypes.RECT()
+    if not user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+        return "夹紧三档正确；本会话取不到工作区（无交互桌面），真值对账未跑"
+    truth = (int(rect.right - rect.left), int(rect.bottom - rect.top))
+    assert tuple(state.work_px) == truth, (
+        f"dpi 读到的工作区 {tuple(state.work_px)} 不是系统真值 {truth} —— "
+        "八成又拿某个 GetSystemMetrics 索引当真值用了"
+    )
+    assert min(truth) > 200, f"工作区读数 {truth} 小得不像屏幕"
+    assert (
+        state.work_px[0] <= state.screen_px[0] and state.work_px[1] <= state.screen_px[1]
+    ), (f"工作区比整屏还大：work={state.work_px} screen={state.screen_px}")
+
+    # 3) 负向锁定：旧写法读的是索引 48/49，直接拿那两个字面值对一遍
+    wrong = (int(user32.GetSystemMetrics(48)), int(user32.GetSystemMetrics(49)))
+    assert tuple(state.work_px) != wrong, f"工作区又读成了 GetSystemMetrics(48)/(49)={wrong}"
+
+    size, _mins = dpi_mod.window_geometry((1360, 880), (1080, 700), state=state)
+    assert size == (1360, 880), (
+        f"这台机器上窗口被夹成 {size}（旧缺陷下恒为 (720,520) 且 min_size == size）"
+    )
+
+    # 4) 感知模式必须报真话。DPI 感知是**进程级且不可逆**的，所以必须在子进程里做：
+    #    先把子进程钉成 system aware（模拟「清单/引导程序已经设过」的机器），
+    #    这时 dpi.py 的三档 Context 与 shcore 一律失败 —— 旧写法恰恰在这里谎报成功。
+    #    真值读法用 GetThreadDpiAwarenessContext：预设走的是 Set…Context，
+    #    两者方向不同（一写一读），而旧代码根本不做任何读回（拿返回值造个模式）。
+    child_src = (
+        "import ctypes, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "u = ctypes.windll.user32\n"
+        "u.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]\n"
+        "u.SetProcessDpiAwarenessContext.restype = ctypes.c_bool\n"
+        "preset = bool(u.SetProcessDpiAwarenessContext(ctypes.c_void_p(-1)))\n"
+        "truth = 'unknown'\n"
+        "try:\n"
+        "    u.GetThreadDpiAwarenessContext.restype = ctypes.c_void_p\n"
+        "    h = u.GetThreadDpiAwarenessContext()\n"
+        "    eq = u.AreDpiAwarenessContextsEqual\n"
+        "    eq.argtypes = [ctypes.c_void_p, ctypes.c_void_p]\n"
+        "    eq.restype = ctypes.c_bool\n"
+        "    for val, label in ((-4, 'per_monitor_v2'), (-3, 'per_monitor'), (-1, 'system')):\n"
+        "        if h and eq(ctypes.c_void_p(h), ctypes.c_void_p(val)):\n"
+        "            truth = label\n"
+        "            break\n"
+        "except Exception:\n"
+        "    pass\n"
+        "from aiforge import dpi\n"
+        "st = dpi.ensure_dpi_awareness()\n"
+        "print('PRESET=%s TRUTH=%s REPORTED=%s AWARE=%s DPI=%d'\n"
+        "      % (preset, truth, st.mode, st.aware, st.dpi))\n"
+    )
+    sandbox = ROOT / "build" / "work" / f"dpi-mode-{os.getpid()}"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    child_script = sandbox / "dpi_mode_child.py"
+    child_script.write_text(child_src, encoding="utf-8", newline="\n")
+    proc = sp.run(
+        [sys.executable, "-X", "utf8", str(child_script), str(SRC)],
+        capture_output=True,
+        cwd=str(ROOT),
+        timeout=180,
+    )
+    tail = [ln for ln in (proc.stdout or b"").decode("utf-8", "replace").splitlines() if "REPORTED=" in ln]
+    fields = dict(tok.split("=", 1) for tok in (tail[-1].split() if tail else []))
+    mode_note = "感知模式对账未跑（子进程读不到真值）"
+    if proc.returncode != 0 and not fields:
+        raise AssertionError(
+            f"子进程跑挂了（rc={proc.returncode}）："
+            f"{(proc.stderr or b'').decode('utf-8', 'replace')[-300:]}"
+        )
+    if fields.get("PRESET") == "True" and fields.get("TRUTH") not in (None, "unknown"):
+        assert fields["REPORTED"] == fields["TRUTH"], (
+            f"子进程的感知真值是 {fields['TRUTH']}，dpi 却报 {fields['REPORTED']} —— "
+            "setter 的返回值是 HRESULT，非 0（失败）也不抛异常：拿「没抛」当「成功」"
+            "既谎报模式，又跳过了 SetProcessDPIAware 兜底"
+        )
+        assert fields["AWARE"] == "True", (
+            f"真值是 {fields['TRUTH']}（已感知），dpi 报 AWARE={fields['AWARE']} —— "
+            "把已经感知的进程写成 unaware 是反方向谎报，用户会照着「未适配」白折腾"
+        )
+        mode_note = (
+            f"感知已由别处设定时报真值 {fields['REPORTED']}（不是造出来的 per_monitor）"
+        )
+
+    return (
+        f"工作区走 SPI_GETWORKAREA（实测 {truth[0]}×{truth[1]} 与系统一致）；"
+        f"窗口回到设计尺寸，200% 小屏夹紧真能生效；{mode_note}"
+    )
+
+
+def t_restore_revision() -> str:
+    """回退历史版本：**归档编号必须对得上**，恢复出来的必须是那一版。
+
+    这条来自实测发现的功能缺口 + 一个真 Bug：
+      * 用户说明书写着「随时可以回到之前的版本」，但后端**根本没有恢复接口** ——
+        归档了却回不去；
+      * 更糟的是归档本身错位：编译会把新的 model.scad / model.stl 直接写进项目目录，
+        而归档发生在收尾阶段，于是 revisions/rNNN 里存的是**第 N+1 版**的内容。
+        两个问题叠在一起，用户点"回退"只会拿到一个错误的模型。
+
+    用**手写的最小 STL**（不依赖 OpenSCAD）造出两版真实文件，然后走真实接口验证。
+    """
+    import json
+    import tempfile
+
+    from fastapi.testclient import TestClient
+
+    from aiforge import projects as projects_mod
+    from aiforge.app import create_app
+
+    def cube_stl(size: float) -> bytes:
+        """一个 ASCII STL 立方体（尺寸可控，便于按体积区分版本）。"""
+        s = size
+        triangles = [
+            ((0, 0, 0), (s, 0, 0), (s, s, 0)), ((0, 0, 0), (s, s, 0), (0, s, 0)),
+            ((0, 0, s), (s, s, s), (s, 0, s)), ((0, 0, s), (0, s, s), (s, s, s)),
+            ((0, 0, 0), (0, 0, s), (s, 0, s)), ((0, 0, 0), (s, 0, s), (s, 0, 0)),
+            ((0, s, 0), (s, s, 0), (s, s, s)), ((0, s, 0), (s, s, s), (0, s, s)),
+            ((0, 0, 0), (0, s, 0), (0, s, s)), ((0, 0, 0), (0, s, s), (0, 0, s)),
+            ((s, 0, 0), (s, s, s), (s, s, 0)), ((s, 0, 0), (s, 0, s), (s, s, s)),
+        ]
+        lines = ["solid v"]
+        for a, b, c in triangles:
+            lines.append("facet normal 0 0 0")
+            lines.append("  outer loop")
+            for vertex in (a, b, c):
+                lines.append(f"    vertex {vertex[0]} {vertex[1]} {vertex[2]}")
+            lines.append("  endloop")
+            lines.append("endfacet")
+        lines.append("endsolid v")
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+    with tempfile.TemporaryDirectory(prefix="restore_") as tmp:
+        project_dir = Path(tmp) / "AI-3D-Forge" / "Projects"
+        os.environ["AIFORGE_PROJECTS_DIR"] = str(project_dir)
+        projects_mod.reset_for_tests()
+        store = projects_mod.store()
+        project = store.create("回退测试")
+        # 第 1 版：10mm 立方体
+        project.scad_path.write_text("// @name 回退测试\ncube([10, 10, 10]);\n", encoding="utf-8")
+        project.stl_path.write_bytes(cube_stl(10.0))
+        project.revision = 1
+        project.metrics = {"bbox": {"x": 10.0, "y": 10.0, "z": 10.0}}
+        store.save(project)
+        store.append_history(
+            project,
+            projects_mod.HistoryEntry(
+                revision=1, created_at=projects_mod.now_iso(), prompt="做一个 10mm 立方体",
+                summary="10mm 立方体", name=project.name, stl=True, metrics=project.metrics,
+            ),
+        )
+        # 第 2 版：20mm 立方体（模拟用户改过尺寸）
+        store.archive_revision(project, 1, keep_stl=True)          # 先归档第 1 版
+        project.scad_path.write_text("// @name 回退测试\ncube([20, 20, 20]);\n", encoding="utf-8")
+        project.stl_path.write_bytes(cube_stl(20.0))
+        project.revision = 2
+        project.metrics = {"bbox": {"x": 20.0, "y": 20.0, "z": 20.0}}
+        store.save(project)
+        store.append_history(
+            project,
+            projects_mod.HistoryEntry(
+                revision=2, created_at=projects_mod.now_iso(), instruction="改成 20mm",
+                summary="20mm 立方体", name=project.name, stl=True, metrics=project.metrics,
+            ),
+        )
+
+        # 归档编号必须对应「那一版」的实际内容（这次实测踩到的错位）
+        archived = (project.revision_dir(1) / "model.scad").read_text(encoding="utf-8")
+        assert "cube([10, 10, 10])" in archived, f"r001 里应当是第 1 版的内容，实际：{archived[:80]!r}"
+        assert (project.revision_dir(1) / "model.stl").is_file(), "第 1 版应当带 STL"
+
+        client = TestClient(create_app(), base_url="http://127.0.0.1:8760", raise_server_exceptions=False)
+        listing = client.get(f"/api/projects/{project.id}").json()
+        assert len(listing["history"]) >= 2, listing["history"]
+
+        restored = client.post(f"/api/projects/{project.id}/restore", json={"revision": 1})
+        assert restored.status_code == 200, restored.text
+        payload = restored.json()
+        assert payload["restored_from"] == 1 and payload["revision"] == 3, payload
+
+        now_scad = project.scad_path.read_text(encoding="utf-8")
+        assert "cube([10, 10, 10])" in now_scad, f"回退后应当是第 1 版的源码：{now_scad[:80]!r}"
+        from aiforge import mesh as mesh_mod
+
+        metrics = mesh_mod.analyze(project.stl_path)
+        assert abs(metrics.bbox[0] - 10.0) < 0.01, f"回退后的模型应当是 10mm 立方体，实际 {metrics.bbox}"
+        # 回退会生成**新的一版**，历史只追加不重写
+        detail = client.get(f"/api/projects/{project.id}").json()
+        assert detail["revision"] == 3, detail["revision"]
+        assert any("回退" in (entry.get("instruction") or "") for entry in detail["history"]), detail["history"]
+        # 第 2 版仍在历史里（用户回退错了还能回来）
+        assert (project.revision_dir(2) / "model.scad").is_file(), "回退不该抹掉被回退掉的那一版"
+
+        # 不存在的版本必须给出明确错误，而不是静默成功
+        missing = client.post(f"/api/projects/{project.id}/restore", json={"revision": 99})
+        assert missing.status_code == 404, missing.text
+        # 缺 STL 的历史版本也不能假装成功
+        (project.revision_dir(1) / "model.stl").unlink()
+        no_stl = client.post(f"/api/projects/{project.id}/restore", json={"revision": 1})
+        assert no_stl.status_code == 409, no_stl.text
+
+        shutil.rmtree(project_dir, ignore_errors=True)
+    return "归档编号与内容一致、恢复的是那一版、历史只追加、缺版本/缺 STL 明确报错"
+
+
+def t_mesh_quality_adoption() -> str:
+    """修复候选的「网格质量不比原版差」判据（钉住实测踩过的那两个数）。
+
+    为什么这条必须有：三个采纳点原本都写成
+    `retry.watertight or not best.watertight`，原版不水密时恒为真 ——
+    第三轮基准实测到逐轴校正把 28 条非流形边（流形边占比 0.9948）
+    换成 287 条（占比 0.3376）还当成功采纳，交付出去切片就是废件。
+    """
+    from aiforge import jobs, mesh
+
+    def mk(*, watertight, ratio, boundary=0, nonmanifold=0, degenerate=0):
+        return mesh.MeshMetrics(
+            watertight=watertight, watertight_ratio=ratio, boundary_edges=boundary,
+            non_manifold_edges=nonmanifold, degenerate_triangles=degenerate,
+        )
+
+    before = mk(watertight=False, ratio=0.9948, nonmanifold=28)
+    worse = mk(watertight=False, ratio=0.3376, nonmanifold=287)
+    assert jobs._mesh_quality_not_worse(before, before), "同一版该判为不差"
+    assert not jobs._mesh_quality_not_worse(before, worse), \
+        "28 条非流形边换成 287 条必须判为更差（实测踩过的坑）"
+    assert jobs._mesh_quality_not_worse(before, mk(watertight=True, ratio=1.0)), "修好了要允许采纳"
+    assert not jobs._mesh_quality_not_worse(
+        mk(watertight=True, ratio=1.0), mk(watertight=False, ratio=0.999, nonmanifold=1)
+    ), "原版水密时不能用别的指标换封闭性"
+    assert not jobs._mesh_quality_not_worse(
+        mk(watertight=False, ratio=0.9, boundary=5),
+        mk(watertight=False, ratio=0.95, boundary=9),
+    ), "开放边变多就是变差，占比涨了也不行"
+    # rank 的末项必须是连续量：28 与 287 条非流形边不能同分
+    assert jobs._integrity_rank(before) < jobs._integrity_rank(worse), \
+        "rank 分不出脏净，修复循环就会在两个破网格中随机挑"
+
+    # 接线：三个采纳点都必须改用这个判据（不许再出现布尔写法）
+    import inspect
+
+    src = inspect.getsource(jobs.GenerationRunner._repair_geometry_integrity)
+    assert "retry_metrics.watertight or not best_metrics.watertight" not in src, \
+        "又用回了「两边都不水密就放行」的布尔判据"
+    used = src.count("_mesh_quality_not_worse(best_metrics, retry_metrics)")
+    assert used >= 3, f"三个采纳点应各用一次，实际 {used} 次"
+    return "网格质量判据按实测数字生效（28→287 非流形边被拒），三个采纳点全部接线"
+
+
 def t_geometry_repair() -> str:
     """尺寸/结构自动修复的判定逻辑（离线，不调用 AI）。
 
@@ -1724,10 +5679,10 @@ def t_geometry_repair() -> str:
     # 合格模型：一整件、尺寸达标、网格封闭 → 不该触发任何修复
     clean = mesh.MeshMetrics(
         solid_parts=1, stray_parts=0, cavity_islands=[], watertight=True,
-        boundary_edges=0, non_manifold_edges=0,
+        boundary_edges=0, non_manifold_edges=0, watertight_ratio=1.0,
     )
     assert jobs._geometry_integrity_problems(clean) == [], "合格模型不该触发修复"
-    assert jobs._integrity_rank(clean) == (0, 0, 0, 0, 0)
+    assert jobs._integrity_rank(clean) == (0, 0, 0, 0, 0, 0, 0)
 
     # 散件：证据里必须出现实测的零件数
     stray = mesh.MeshMetrics(solid_parts=80, stray_parts=79, cavity_islands=[])
@@ -1745,8 +5700,14 @@ def t_geometry_repair() -> str:
     assert "9mm 处 4 处" in problems[0] and "37mm 处 4 处" in problems[0], problems[0]
     assert "穿进了腔体" in problems[0], problems[0]
 
+    # 注意：下面凡是 watertight=True 的夹具都必须显式写 watertight_ratio=1.0。
+    # rank 的末项是「1 - 流形边占比」的连续量，字段默认 0.0 意味着「面全穿插」，
+    # 漏写会让一个自称封闭的夹具在末项上白白背负 1000 分，比较结果就不可信了。
     # 两类同时存在时都要报出来（AI 需要一次看全）
-    both = mesh.MeshMetrics(solid_parts=3, stray_parts=2, cavity_islands=[(5.0, 1)], watertight=True)
+    both = mesh.MeshMetrics(
+        solid_parts=3, stray_parts=2, cavity_islands=[(5.0, 1)],
+        watertight=True, watertight_ratio=1.0,
+    )
     assert len(jobs._geometry_integrity_problems(both)) == 2
 
     # ---- 用户点名的整体尺寸必须被核对（首次生成也要，不只是改动流程）----
@@ -1762,15 +5723,17 @@ def t_geometry_repair() -> str:
         ],
     )
     declared = jobs._spec_declared_dimensions(spec)
-    assert declared[2] == ("支架高度", 100.0), declared
-    assert declared[0] == ("支架宽度", 80.0), declared
+    # 返回 (给人看的标签, 期望值, 规格名)。规格名必须带上 —— 判断"这一项本次是否
+    # 被授权修改"要用它（契约里用的是规格名，而标签是中文）。
+    assert declared[2] == ("支架高度", 100.0, "height"), declared
+    assert declared[0] == ("支架宽度", 80.0, "width"), declared
     assert 1 not in declared, "用户没指定的方向不该编出一个期望值"
-    assert all(label != "壁厚" for label, _ in declared.values()), (
+    assert all(label != "壁厚" for label, _value, _name in declared.values()), (
         "壁厚是零件内部尺寸，不能拿去和包围盒比"
     )
 
     # 实测远小于声明值 → 必须报出来，并带上双方的具体数字
-    short = mesh.MeshMetrics(bbox=(80.0, 50.0, 62.0), watertight=True)
+    short = mesh.MeshMetrics(bbox=(80.0, 50.0, 62.0), watertight=True, watertight_ratio=1.0)
     dim_problems = jobs._spec_dimension_problems(spec, short)
     assert len(dim_problems) == 1, dim_problems
     assert "支架高度 要求 100mm" in dim_problems[0] and "只有 62.0mm" in dim_problems[0], dim_problems[0]
@@ -1790,7 +5753,8 @@ def t_geometry_repair() -> str:
     assert "支架宽度 要求 80mm" in width_problems[0], width_problems[0]
     assert "倾斜件" not in width_problems[0], width_problems[0]
 
-    assert jobs._integrity_rank(short, spec) == (0, 0, 1, 0, 0)
+    # 唯一的缺陷就是「点名的尺寸没做到」（第 2 项），其余各项归零
+    assert jobs._integrity_rank(short, spec) == (0, 0, 1, 0, 0, 0, 0)
 
     # 实测偏大是正常的（模型常多出底座/托边），绝不能误报
     taller = mesh.MeshMetrics(bbox=(80.0, 50.0, 140.0))
@@ -1801,19 +5765,57 @@ def t_geometry_repair() -> str:
     borderline = mesh.MeshMetrics(bbox=(80.0, 50.0, 92.0))
     assert jobs._spec_dimension_problems(spec, borderline) == []
 
+    # ---- 但「远远超出」必须报出来（圆件的主要整体尺寸以前根本没校验）----
+    # 实测：用户要 Ø80 的笔筒，AI 把周向的筋画到了错误的平面，
+    # 出来一个 92×145.8×100 的块料；程序全程沉默（直径被当成"内部尺寸"跳过），
+    # 只给了个 warn。现在外径要按**水平最大尺寸**核对，且超出 50% 就报。
+    round_spec = DesignSpec(
+        kind="圆形笔筒",
+        specs=[
+            SpecItem(name="outer_diameter", label="外径", value=80, unit="mm", user_specified=True),
+            SpecItem(name="height", label="总高", value=100, unit="mm", user_specified=True),
+        ],
+    )
+    declared_round = jobs._spec_declared_dimensions(round_spec)
+    assert declared_round[jobs.HORIZONTAL_ENVELOPE_AXIS][1] == 80.0, declared_round
+    good_round = mesh.MeshMetrics(bbox=(82.4, 82.4, 100.0), watertight=True)
+    assert jobs._spec_dimension_problems(round_spec, good_round) == [], "Ø82 的笔筒是达标的"
+    blob = mesh.MeshMetrics(bbox=(92.28, 145.83, 100.0), watertight=True)
+    blob_problems = jobs._spec_dimension_problems(round_spec, blob)
+    assert len(blob_problems) == 1, blob_problems
+    assert "外径 要求 80mm" in blob_problems[0], blob_problems[0]
+    assert "145.8mm" in blob_problems[0] and "82%" in blob_problems[0], blob_problems[0]
+    assert "错误的平面" in blob_problems[0], blob_problems[0]
+    # 内部直径（孔径/内径/螺孔）仍然不能拿去跟外形比
+    for label, name in (("孔径", "hole_diameter"), ("内径", "inner_diameter"),
+                        ("螺纹外径", "thread_dia")):
+        inner_spec = DesignSpec(
+            kind="件",
+            specs=[SpecItem(name=name, label=label, value=8, unit="mm", user_specified=True)],
+        )
+        assert not jobs._spec_declared_dimensions(inner_spec), f"{label} 是内部尺寸，不该拿去比外形"
+
     # 采纳条件：先比散件、再比点名尺寸、再比穿腔、最后比封闭性；平手必须判为「没有更好」
-    assert jobs._integrity_rank(both) == (0, 2, 0, 1, 0)
+    assert jobs._integrity_rank(both) == (0, 2, 0, 1, 0, 0, 0)
     assert jobs._integrity_rank(
-        mesh.MeshMetrics(stray_parts=2, cavity_islands=[], watertight=True)
+        mesh.MeshMetrics(
+            stray_parts=2, cavity_islands=[], watertight=True, watertight_ratio=1.0
+        )
     ) < jobs._integrity_rank(both)
     assert not (
-        jobs._integrity_rank(mesh.MeshMetrics(stray_parts=2, cavity_islands=[(5.0, 1)], watertight=True))
+        jobs._integrity_rank(
+            mesh.MeshMetrics(
+                stray_parts=2, cavity_islands=[(5.0, 1)], watertight=True, watertight_ratio=1.0
+            )
+        )
         < jobs._integrity_rank(both)
     ), "完全相同的结果不能算改善，否则会白白换掉用户已经在看的模型"
     # 优先级：用户说过的数字做不到（rank 更大=更差）比腔内有孤岛更严重，
     # 因为前者意味着「根本没听懂需求」，后者是内部结构瑕疵。
     # 两个模型都用同一个 spec 比较，保证是同一把尺子。
-    island_only = mesh.MeshMetrics(bbox=(80.0, 50.0, 100.0), cavity_islands=[(5.0, 1)], watertight=True)
+    island_only = mesh.MeshMetrics(
+        bbox=(80.0, 50.0, 100.0), cavity_islands=[(5.0, 1)], watertight=True, watertight_ratio=1.0
+    )
     assert jobs._spec_dimension_problems(spec, island_only) == [], "这个模型的尺寸是达标的"
     assert jobs._integrity_rank(short, spec) > jobs._integrity_rank(island_only, spec), (
         "「点名尺寸没做到」应当排在「腔内有孤岛」前面（更严重）"
@@ -1830,7 +5832,7 @@ def t_geometry_repair() -> str:
     )
     sealed = mesh.MeshMetrics(
         solid_parts=1, stray_parts=0, cavity_islands=[], watertight=True,
-        boundary_edges=0, non_manifold_edges=0,
+        boundary_edges=0, non_manifold_edges=0, watertight_ratio=1.0,
     )
     hole_problems = jobs._geometry_integrity_problems(holed)
     assert len(hole_problems) == 1, hole_problems
@@ -1856,7 +5858,9 @@ def t_geometry_repair() -> str:
     # 封闭性**绝不能**压过「是不是一整件」：多出一个散件换网格封闭不算改善
     assert jobs._integrity_rank(
         mesh.MeshMetrics(stray_parts=0, watertight=False, boundary_edges=736)
-    ) < jobs._integrity_rank(mesh.MeshMetrics(stray_parts=1, watertight=True)), (
+    ) < jobs._integrity_rank(
+        mesh.MeshMetrics(stray_parts=1, watertight=True, watertight_ratio=1.0)
+    ), (
         "散件（是不是一件东西）必须排在封闭性前面 —— 不能拿「多一件」去换「网格封闭」"
     )
 
@@ -1888,19 +5892,22 @@ def t_geometry_repair() -> str:
     body = inspect.getsource(runner._repair_geometry_integrity)
     assert "return source, compile_result, metrics" in body, "修复失败必须保留原结果"
     # 每一处「修不动」的分支都必须 early-break 出循环，最后由统一的出口保留原版；
-    # 采纳只发生在 `_integrity_rank(retry_metrics, spec) < best_rank` 这一个条件里。
-    assert body.count("best_rank = _integrity_rank(retry_metrics, spec)") == 1, (
-        "采纳新版本的路径必须唯一，否则很容易漏掉「平手也不算改善」这条规矩"
+    # 采纳只发生在 `_integrity_rank(retry_metrics, ...) < best_rank` 这一个条件里。
+    # （排序键现在多带一个契约参数 —— 授权改动不该被旧规格扣分，见 t_repair_wiring）
+    # 采纳路径现在有两处，各自有独立门：
+    #   1) 修复环：rank 严格更好 + 封闭性不变差；
+    #   2) 逐轴校正兜底：实测尺寸偏差严格更小（rank 对「偏 8% 但没报问题」不敏感）。
+    assert body.count("best_rank = _integrity_rank(retry_metrics, spec, self._change_contract)") == 2, (
+        "采纳路径应为两处：修复环的 rank 比较 + 逐轴校正的偏差比较"
     )
-    assert "retry_metrics.watertight and _integrity_rank(retry_metrics, spec) < best_rank" in body or (
-        "watertight_not_worse and _integrity_rank(retry_metrics, spec) < best_rank" in body
-    ), "只有封闭性不变差且严格更好的版本才允许采纳"
-    # 封门条件必须写成「不比原版更差」，而不是「候选必须封闭」。
-    # 后者会让「原版本来就不封闭」时的有效修复永远无法采纳
-    # （把 3 个散件修成一整件，仍因不封闭被拒，用户只能继续拿差的那版）。
-    assert "watertight_not_worse = retry_metrics.watertight or not best_metrics.watertight" in body, (
-        "采纳判据必须是「封闭性不变差」，不能是「候选必须封闭」"
+    assert "dev_after < dev_before - 1e-3" in body, "逐轴校正采纳必须用实测偏差更小作门"
+    assert "_mesh_quality_not_worse(best_metrics, retry_metrics) and _integrity_rank(retry_metrics, spec, self._change_contract) < best_rank" in body, (
+        "只有网格质量不变差且严格更好的版本才允许采纳"
     )
+    # 封门条件必须写成「网格质量不比原版差」，而不是「候选必须封闭」，
+    # 也不是只比 watertight 布尔值（后者在原版已经封闭时才等价，
+    # 原版不封闭时等于「修成多破都行」，实测就因此把 28 条非流形边换成 287 条）。
+    # 完整判据与接线见 t_mesh_quality_adoption，这里只钉住修复环入口。
     assert "for attempt in (1, 2)" in body, "散件修复必须允许第二轮换策略"
     assert "spec" in inspect.signature(runner._repair_geometry_integrity).parameters, (
         "核对点名尺寸需要拿到规格，签名里必须有 spec"
@@ -2095,6 +6102,19 @@ def t_visual_review() -> str:
     review_body = inspect.getsource(llm.DeepSeekClient.review_snapshot)
     assert '"length"' in review_body, "必须识别「额度用尽导致的空正文」，不能当成没问题"
     assert "VISION_MAX_TOKENS_RETRY" in review_body, "额度用尽后必须放大额度重试一次"
+    # 本轮清查出的真缺陷：那份系统提示词写好了却从没发出去过，而用户提示里还写着
+    # 「请按系统提示复核」—— parse_snapshot_verdict 的第一行契约判定因此始终落空，
+    # 只能退到全文关键词兜底（看起来能跑，实际把最可靠的一层判据去掉了）。
+    # 光靠「常量有没人引用」不够，必须钉住发出去的 messages 里有 system 这一条。
+    assert '"role": "system"' in review_body, (
+        "视觉复核必须把系统提示词发出去：第一行契约就写在那份提示词里"
+    )
+    assert "SNAPSHOT_REVIEW_SYSTEM_PROMPT" in review_body, (
+        "视觉复核的 system 消息必须是 SNAPSHOT_REVIEW_SYSTEM_PROMPT，不能只塞个空壳"
+    )
+    assert "请按系统提示" in llm.snapshot_review_user_prompt("x", "y"), (
+        "用户提示词里「请按系统提示复核」这句话与上面的断言是一对：删了这行就要同步改那行"
+    )
 
     runner = jobs.GenerationRunner
     assert hasattr(runner, "_review_snapshot"), "生成流程缺少外观复核环节"
@@ -2104,10 +6124,55 @@ def t_visual_review() -> str:
         "外观复核必须排在几何修复之前，否则它发现的程序测不出来的问题进不了修复证据"
     )
 
+    # --- 抽样渲染的告警必须真的发出去（本轮修的真缺陷）---
+    # 原来写的是 `if sampled := any(shot.sampled for shot in shots):` 却从不读
+    # `sampled` —— 告警语句永远不执行。用户在开着线框/大模型时以为看到的是
+    # 完整渲染，实际是抽稀的，而界面一声不吭。这类"算出来却不用"编译器
+    # 不报错、运行不报错，只能钉住"这句告警确实在可达路径上"。
+    review_body = inspect.getsource(runner._review_snapshot)
+    assert "抽样渲染图" in review_body, (
+        "面数过多时的抽样渲染告警被删了 —— 用户看到的抽稀图没有任何提示"
+    )
+    # 判据必须由 render 真实上报的 sampled 驱动，不能写死。
+    assert "shot.sampled" in review_body, (
+        "抽样告警必须由 render 上报的 sampled 决定，不能凭空判断"
+    )
+    # 阴性对照：不能是"赋值了却不读"的形状。这里用 AST 而不是正则 ——
+    # 正则会连注释里写的 `if x := ...` 示例一起匹配（实测踩到：修好代码后
+    # 守卫因为我自己写的解释性注释而变红），而注释不是代码。
+    # 判据：NamedExpr（海象）如果所在函数体里再没出现过同一个名字，就是算了不用。
+    import ast as _ast
+
+    tree = _ast.parse(inspect.cleandoc(inspect.getsource(runner._review_snapshot)))
+    assigned_only: list[str] = []
+    for fn in [n for n in _ast.walk(tree) if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))]:
+        walruses = [
+            n.target.id
+            for n in _ast.walk(fn)
+            if isinstance(n, _ast.NamedExpr) and isinstance(n.target, _ast.Name)
+        ]
+        loaded = {
+            n.id
+            for n in _ast.walk(fn)
+            if isinstance(n, _ast.Name) and isinstance(n.ctx, _ast.Load)
+        }
+        assigned_only.extend(name for name in walruses if name not in loaded)
+    assert not assigned_only, (
+        f"_review_snapshot 里这些名字赋值后从未被读：{'、'.join(assigned_only)} —— "
+        "那正是本缺陷的原始形状（判据算出来了却不生效）"
+    )
+
+    # 告警要在 AI 结论**之前**发出：否则用户先看到「未发现明显问题」，
+    # 注意力已经被带走，抽稀这件事就再也看不见了。
+    if "抽样渲染图" in review_body and "review_snapshot(images" in review_body:
+        assert review_body.index("抽样渲染图") < review_body.index("review_snapshot(images"), (
+            "抽样告警必须排在 AI 复核请求之前，否则用户先看到结论、后看到告警"
+        )
+
     return (
         f"渲染 {len(shots)} 视角（非背景占比 "
         f"{min(non_background_ratio(s.path) for s in shots):.0%}）、确定性、"
-        "判读门槛、模型与额度约束 全部正确"
+        "判读门槛、模型与额度约束、抽样告警真的发得出去 全部正确"
     )
 
 
@@ -2147,6 +6212,10 @@ def t_declared_dependencies() -> str:
     }
     # 本项目根目录下的顶层模块（main.py）与 scripts 目录里的脚本互导
     local_modules |= {"aiforge", "main", "scripts"}
+    # 脚本之间按裸名互导（`python scripts\x.py` 时 sys.path[0] 就是 scripts/，
+    # 所以是 `import console_utf8` 而不是 `import scripts.console_utf8`）。
+    # 少了这一行，任何一个脚本 import 兄弟脚本都会被当成未声明的第三方依赖报出来。
+    local_modules |= {p.stem for p in (ROOT / "scripts").glob("*.py")}
 
     declared: set[str] = set()
     declared_files = []
@@ -2226,6 +6295,110 @@ def t_declared_dependencies() -> str:
     )
 
 
+def _requirement_packages(name: str) -> list[str]:
+    """读 requirements*.txt 里的包名（去掉注释、空行与 `-r xxx` 引用行）。"""
+    import re
+
+    path = ROOT / name
+    assert path.is_file(), f"缺少 {name}"
+    packages: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.split("#", 1)[0].strip()
+        if not text or text.startswith("-"):
+            continue
+        packages.append(re.split(r"[<>=!\[;]", text)[0].strip().lower())
+    return packages
+
+
+def t_bundle_budget() -> str:
+    """体积与依赖预算：“小而美”得是一个会被违反的数字。
+
+    为什么要单独钉一条（`依赖声明完整性` 管的是“用了没声明”，管不到“声明得太多”）：
+    每多一个运行期依赖，用户盘上就是一堆 .pyd/.dll；每多一个前端依赖，就是打进
+    bundle 的源码。这些东西**只会悄悄长**：加功能的人看不到全貌，谁也不会为
+    “就多一个包”单独做一次决策，等安装包从 16MB 变成 60MB 再回就晚了。
+    所以把实测基线写成天花板：要加东西可以，但得明着改这里的数字。
+
+    基线（本机实测）：运行期依赖 7 个、构建期再加 1 个；前端 dependencies 4 个；
+    dist JS 831 KB / CSS 54 KB；免安装版 39.2 MB / 217 文件；安装包 16.5 MB。
+    这轮加“一键送到切片软件”没引入任何新依赖（只用标准库），就是这条规则的执行。
+    """
+    import json
+
+    checked: list[str] = []
+    absent: list[str] = []
+    over: list[str] = []  # 一项超预算就记下全部，不撞到第一个就停
+
+    runtime = _requirement_packages("requirements.txt")
+    if len(runtime) > 8:
+        over.append(
+            f"运行期依赖从 7 个涨到 {len(runtime)} 个：{sorted(runtime)}。"
+            "它们会被 PyInstaller 全部装进用户机器；确实要加，请连这里的基线一起改并写明理由。"
+        )
+    checked.append(f"运行期依赖 {len(runtime)}/8")
+
+    extra_build = [p for p in _requirement_packages("requirements-build.txt") if p not in runtime]
+    if len(extra_build) > 2:
+        over.append(f"构建期专属依赖 {extra_build} 超过预算 2 个（它们不进用户包，但拖慢 CI）")
+    checked.append(f"构建期额外 {len(extra_build)}/2")
+
+    package_json = ROOT / "webui" / "package.json"
+    assert package_json.is_file(), "缺少 webui/package.json"
+    meta = json.loads(package_json.read_text(encoding="utf-8"))
+    front = sorted(meta.get("dependencies", {}))
+    if len(front) > 5:
+        over.append(
+            f"前端 dependencies {front} 超过预算 5 个 —— 这些会被打进用户加载的 bundle；"
+            "能用现有依赖做到的就别新增包"
+        )
+    checked.append(f"前端依赖 {len(front)}/5")
+
+    # 产物体积：没构建过的仓库里没这些文件，诚实地写进结果里，不拿“没查到”当“通过”
+    dist = ROOT / "webui" / "dist"
+    if dist.is_dir():
+        for label, suffix, limit_kb in (("JS", ".js", 900), ("CSS", ".css", 64)):
+            group = [p for p in dist.rglob(f"*{suffix}") if p.is_file()]
+            assert group, f"webui/dist 存在但没有 {label} 产物"
+            biggest = max(group, key=lambda p: p.stat().st_size)
+            kb = biggest.stat().st_size / 1024
+            if kb > limit_kb:
+                over.append(
+                    f"{label} 产物 {biggest.name} 已经 {kb:.0f} KB，超预算 {limit_kb} KB"
+                    "（基线 JS 831 KB / CSS 54 KB）。先看能不能剔掉不用的部分；"
+                    "确实需要，就连基线一起改并写明原因。"
+                )
+            checked.append(f"{label} {kb:.0f}/{limit_kb} KB")
+    else:
+        absent.append("webui/dist")
+
+    app_dir = ROOT / "build" / "dist" / "AI-3D-Forge"
+    if app_dir.is_dir():
+        files = [p for p in app_dir.rglob("*") if p.is_file()]
+        total_mb = sum(p.stat().st_size for p in files) / 1024 / 1024
+        if total_mb > 44:
+            over.append(f"免安装版 {total_mb:.1f} MB 超预算 44 MB（基线 39.2 MB）")
+        if len(files) > 240:
+            over.append(f"免安装版 {len(files)} 个文件，超预算 240（基线 217）")
+        checked.append(f"免安装版 {total_mb:.1f}/44 MB・{len(files)}/240 文件")
+    else:
+        absent.append("免安装版")
+
+    setup = ROOT / "installer" / "Output" / "AI-3D-Forge-Setup.exe"
+    if setup.is_file():
+        mb = setup.stat().st_size / 1024 / 1024
+        if mb > 19:
+            over.append(f"安装包 {mb:.1f} MB 超预算 19 MB（基线 16.5 MB）")
+        checked.append(f"安装包 {mb:.1f}/19 MB")
+    else:
+        absent.append("安装包")
+
+    assert not over, "体积/依赖超预算：" + "；".join(over)
+    # 同上：一条什么都没查的守卫给的是假安全感
+    assert len(checked) >= 4, f"预算守卫只核对了 {len(checked)} 项，太少（守卫没生效？）：{checked}"
+    tail = f"（未构建，本次没核对：{'、'.join(absent)}）" if absent else ""
+    return "预算内：" + "、".join(checked) + tail
+
+
 def t_projects() -> str:
     from aiforge import projects
 
@@ -2301,9 +6474,50 @@ def t_projects() -> str:
         assert (back.metrics or {}).get("usage", {}).get("total_grams") == 42.0, back.metrics
         assert (back.printability or {}).get("visual_review") == "结论：无明显问题", back.printability
         assert (back.spec or {}).get("fingerprint") == "abc123", back.spec
+
+        # ---- 列表与查找必须用同一把 id ----
+        # meta.json 缺 id 时（被手改过 / 早期版本写坏），旧写法 `list()` 拿「目录名后
+        # 6 位」凑一个 id 给用户看，而 `directory_for()` 只比对 meta 里的 id 字段 ——
+        # 侧栏里看得见、点进去就是 404，用户的感受是「软件把我的项目弄丢了」。
+        orphan = store.root / "缺id项目-ab12cd"
+        orphan.mkdir(parents=True, exist_ok=True)
+        # 直接写字面 JSON，不依赖 `import json`：本函数里没有这个导入，上一版
+        # 在这儿用了 `json.dumps` → NameError，而两条投毒看上去都「转红了」——
+        # 那是假证据：红的原因是 NameError，不是断言咬住了缺陷。
+        (orphan / "meta.json").write_text(
+            '{"name": "缺 id 的项目"}', encoding="utf-8", newline="\n"
+        )
+        listed_orphans = [p for p in store.list() if p.dir == orphan]
+        assert listed_orphans, "没有 id 的项目也必须出现在列表里（它里的 scad/stl 是用户数据）"
+        shown = listed_orphans[0]
+        back_orphan = store.get(shown.id)
+        assert back_orphan is not None, (
+            f"列表自己给出去的 id={shown.id!r} 查不回来 —— 侧栏能看见、点进去 404"
+        )
+        assert back_orphan.name == "缺 id 的项目", back_orphan.name
+        assert store.delete(shown.id), "没有 id 的项目连「移入回收站」也做不到"
+        assert not orphan.exists(), "删除后原目录应已移走"
+
+        # ---- 截断到 40 位不能留下尾点（实测 Win32 会把尾部点号规范化掉）----
+        # 旧写法只剪一次尾巴就截断：`"a"*39 + "." + "b"*8` 切到 40 位正好停在**点号**上，
+        # 于是磁盘上的真目录名是 39 个 a，而代码里拿着的名字多一个点 ——
+        # 读写靠路径规范化还能命中，但任何拿目录名做相等比较的地方两边对不上。
+        longdot = "a" * 39 + "." + "b" * 8
+        made = projects.safe_name(longdot)
+        assert not made.endswith((".", " ")), f"safe_name 产出以点号/空格结尾的名字：{made!r}"
+        dotproj = store.create(longdot)
+        try:
+            on_disk = sorted(
+                p.name for p in store.root.iterdir() if p.is_dir() and p.name.startswith("aaa")
+            )
+            assert on_disk and dotproj.dir.name == on_disk[0], (
+                f"代码里的目录名 {dotproj.dir.name!r} 与磁盘真名 {on_disk} 不一致（尾点被系统吃掉了）"
+            )
+        finally:
+            shutil.rmtree(dotproj.dir, ignore_errors=True)
     finally:
         shutil.rmtree(project.dir, ignore_errors=True)
-    return f"创建/读写/历史/重命名/删除/回收站/名字安全/往返不丢字段 全部正确（{store.root}）"
+    return f"创建/读写/历史/重命名/删除/回收站/名字安全/往返不丢字段/无 id 项目可点开 全部正确（{store.root}）"
 
 
 def t_config_and_secrets() -> str:
@@ -2346,6 +6560,101 @@ def t_config_and_secrets() -> str:
     return f"掩码正确，配置持久化正常，BOM 容错（密钥后端：{backend}）"
 
 
+def t_appearance_settings() -> str:
+    """界面材质（普通 / 液态玻璃）与玻璃透明度。
+
+    为什么必须钉住这四件事：
+      1. 夹取语义：上限是拿截图像素实测定的（`webui/scripts/verify-glass-contrast.mjs`），
+         后端不夹取，用户就能从 API 写进一个让字读不动的值。
+      2. 前后端常量一致：只改一边会出现「滑块能拖到 80，存盘回到 60」。
+      3. 非法值必须「忽略并保持原值」：材质是观感字段，最坏也应该是不变，
+         而不是把配置写坏之后重启什么都不剩。
+      4. 浮层的厚玻璃下限：iOS 26 被骂「太透看不清字」就是弹窗这类浮层失守。
+         它只活在 CSS 里，一次「统一简化玻璃令牌」的重构就能抹掉 —— 所以源码守卫
+         比截图验收更便宜（verify-glass-contrast 要跑浏览器，不在自检里）。
+    """
+    import re
+
+    from aiforge import config as config_mod
+    from aiforge.config import clamp_glass_transparency as clamp
+
+    default = config_mod.GLASS_TRANSPARENCY_DEFAULT
+    upper = config_mod.GLASS_TRANSPARENCY_MAX
+
+    # ---- 1) 夹取 ----
+    assert clamp(None) == default, "无法解析的值回默认值，不是 0"
+    assert clamp("abc") == default
+    assert clamp({}) == default
+    assert clamp(-10) == config_mod.GLASS_TRANSPARENCY_MIN
+    assert clamp(999) == upper
+    assert clamp("42") == 42, "字符串数字要能用（表单交上来就是字符串）"
+    assert clamp(25.6) == 26, "浮点应当四舍五入而不是截断"
+    assert isinstance(clamp(30), int)
+
+    # ---- 2) 前后端同一组数 ----
+    ts_src = (ROOT / "webui" / "src" / "hooks" / "useAppearance.ts").read_text(encoding="utf-8")
+    pairs = dict(re.findall(r"export const TRANSPARENCY_(MIN|MAX|DEFAULT) = (\d+)", ts_src))
+    assert set(pairs) == {"MIN", "MAX", "DEFAULT"}, f"前端常量读不到：{pairs}"
+    assert int(pairs["MIN"]) == config_mod.GLASS_TRANSPARENCY_MIN, "前端 MIN 与后端不一致"
+    assert int(pairs["MAX"]) == upper, "前端 MAX 与后端不一致：滑块能拖到后端不认的位置"
+    assert int(pairs["DEFAULT"]) == default, "前端默认值与后端不一致"
+
+    # ---- 3) 浮层厚玻璃下限还在 ----
+    tokens = (ROOT / "webui" / "src" / "styles" / "tokens.css").read_text(encoding="utf-8")
+    floor = re.search(r"--glass-solid-float:\s*max\(\s*(\d+)%", tokens)
+    assert floor, (
+        "浮层的实底下限被删了：弹窗/菜单会跟着滑块一起变透，"
+        "实测透明度 60% 时弹窗正文只剩 1.84:1（要求 4.5:1）"
+    )
+    assert int(floor.group(1)) >= 90, (
+        f"浮层下限被调到 {floor.group(1)}%：无下限对照里，实底 75%（透明度 25%）"
+        "就已经只剩 4.14:1，踩不进 4.5:1 的安全区"
+    )
+    assert "--glass-solid-float: 100%" in tokens, "降低透明度（系统级）时浮层也必须变实底"
+    app_css = (ROOT / "webui" / "src" / "styles" / "app.css").read_text(encoding="utf-8")
+    float_blocks = [b for b in app_css.split("}") if "--glass-fill-float" in b]
+    assert float_blocks, "没有任何浮层在用厚玻璃填充"
+    for sel in (".modal", ".menu", ".toast"):
+        assert any(sel in b for b in float_blocks), f"{sel} 没走厚玻璃（背后可都是密集文字）"
+
+    # ---- 4) HTTP 往返 ----
+    from fastapi.testclient import TestClient
+
+    from aiforge.app import create_app
+
+    client = TestClient(create_app(), base_url="http://127.0.0.1:8760", raise_server_exceptions=False)
+    before = client.get("/api/settings").json()
+    for field in ("appearance", "glass_transparency"):
+        assert field in before, f"GET /api/settings 缺字段 {field}"
+    try:
+        saved = client.put("/api/settings", json={"appearance": "glass", "glass_transparency": 999})
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["appearance"] == "glass"
+        assert saved.json()["glass_transparency"] == upper, saved.json()
+        assert client.get("/api/settings").json()["glass_transparency"] == upper, "必须真的落盘"
+
+        ignored = client.put("/api/settings", json={"appearance": "crystal"})
+        assert ignored.status_code == 200, ignored.text
+        assert ignored.json()["appearance"] == "glass", "非法材质应被忽略而不是写坏配置"
+
+        low = client.put("/api/settings", json={"glass_transparency": -5})
+        assert low.json()["glass_transparency"] == config_mod.GLASS_TRANSPARENCY_MIN
+        solid = client.put("/api/settings", json={"appearance": "solid"})
+        assert solid.json()["appearance"] == "solid"
+    finally:
+        client.put(
+            "/api/settings",
+            json={
+                "appearance": before["appearance"],
+                "glass_transparency": before["glass_transparency"],
+            },
+        )
+    return (
+        f"夹取 0–{upper} 正确、前后端常量一致、浮层厚玻璃下限 {floor.group(1)}% 仍在、"
+        "非法值忽略不写坏配置"
+    )
+
+
 def t_envcheck() -> str:
     import asyncio
 
@@ -2371,6 +6680,83 @@ def t_envcheck() -> str:
     return f"{report['ok_count']}/{report['total']} 项通过（overall={report['overall']}）"
 
 
+def t_api_surface() -> str:
+    """接口面不臃肿：路由 ↔ 契约文档 ↔ 前端调用 ↔ 错误码，四向都得对上。
+
+    为什么非要钉到这一步（都是实测出来的洞）：
+      * 加了接口不写文档 —— 契约静默腐烂，前端只能靠猜（切片软件那两个接口就这么漏了一次）；
+      * 加了接口没人调 —— 纯负担：多一处能坏的地方、多一份本机攻击面，而测试全是绿的
+        （做这次审计时发现曾有 8 条路由界面、mock、脚本都没人调）；
+      * 后端发了一个新错误码不登记 —— 前端拿不到人话兜底，用户只看到「出了点问题」。
+    只查路径不查方法（`request('/settings', {method:'PUT'})` 这种写法要拆 AST 才认得出方
+    法与路径的对应关系）：够用 —— 它能抱住“整条路径没人用”，方法写错另外有契约形状用例接。
+    """
+    import re
+
+    from aiforge.app import create_app
+
+    doc = (ROOT / "docs" / "API-CONTRACT.md").read_text(encoding="utf-8")
+
+    def norm(path: str) -> str:
+        """`{project_id}` / `{id}` 归一化成 `{}`：文档与代码的参数名从来不一样。"""
+        return re.sub(r"\{[^{}]+\}", "{}", path)
+
+    routes: set[tuple[str, str]] = set()
+    for route in create_app().routes:
+        path = str(getattr(route, "path", ""))
+        if not path.startswith("/api"):
+            continue
+        for method in sorted(getattr(route, "methods", set()) or set()):
+            if method in ("HEAD", "OPTIONS"):
+                continue
+            routes.add((method, norm(path)))
+    assert len(routes) >= 40, f"只枚举到 {len(routes)} 条 /api 路由，明显不对（守卫没生效？）"
+
+    # 1) 每一条路由都必须在契约里出现（标题、正文、表格里的写法都算）
+    documented = {
+        (method, norm(path))
+        for method, path in re.findall(
+            r"(GET|POST|PUT|PATCH|DELETE)\s+(/api/[^\s`\u3000)\]，。;；,]+)", doc
+        )
+    }
+    no_doc = sorted(routes - documented)
+    assert not no_doc, "这些接口没写进 docs/API-CONTRACT.md：" + "、".join(
+        f"{method} {path}" for method, path in no_doc
+    )
+
+    # 2) 每一条路由都必须真有人调（FastAPI 自带的自省页除外，界面本来就不该调它）
+    introspection = {("GET", "/api/docs"), ("GET", "/api/openapi.json")}
+    frontend_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for pattern in ("src/**/*.ts", "src/**/*.tsx")
+        for path in (ROOT / "webui").glob(pattern)
+    )
+    assert len(frontend_text) > 200_000, "没读到足够的前端源码，这条检查等于没做"
+    uncalled: list[str] = []
+    for method, path in sorted(routes - introspection):
+        needle = re.compile(norm(path).replace("/api", r"(?:/api)?").replace("{}", "[^/`\"]+"))
+        if not needle.search(frontend_text):
+            uncalled.append(f"{method} {path}")
+    assert not uncalled, "这些接口前端没人调用（多做出来的接口就是臃肿：接上它或者删掉它）：" + "、".join(uncalled)
+
+    # 3) 后端发出去的每一个错误码，都要同时出现在契约 §8 与前端 ApiErrorCode 里
+    emitted: set[str] = set()
+    for path in sorted((ROOT / "src" / "aiforge").rglob("*.py")):
+        emitted.update(re.findall(r'code="([A-Z_]+)"', path.read_text(encoding="utf-8")))
+    assert len(emitted) >= 6, f"只扫到 {len(emitted)} 个错误码，明显不对"
+    in_table = set(re.findall(r"^\|\s*`([A-Z_]+)`\s*\|", doc, re.MULTILINE))
+    types_text = (ROOT / "webui" / "src" / "api" / "types.ts").read_text(encoding="utf-8")
+    # （最后一行带分号，所以 `;?` 不能漏 —— 漏了就会把最后一个码误报成“没登记”）
+    in_types = set(re.findall(r"^\s*\|\s*'([A-Z_]+)'\s*;?\s*$", types_text, re.MULTILINE))
+    drift = sorted(code for code in emitted if code not in in_table or code not in in_types)
+    assert not drift, "这些错误码没登记到契约 §8 错误码表或前端 ApiErrorCode：" + "、".join(drift)
+
+    return (
+        f"{len(routes)} 条 /api 路由全部有文档、有调用方（自省页 2 条除外）；"
+        f"{len(emitted)} 个错误码全部登记在契约与前端类型里"
+    )
+
+
 def t_http_api() -> str:
     try:
         from fastapi.testclient import TestClient
@@ -2381,7 +6767,8 @@ def t_http_api() -> str:
 
     # 基址必须是回环地址：TestClient 默认用 "testserver"，会被本机来源保护正确拦截
     # raise_server_exceptions=False：让 500 也走我们自己的错误处理，验证错误结构真的可用
-    client = TestClient(create_app(), base_url="http://127.0.0.1:8760", raise_server_exceptions=False)
+    app = create_app()
+    client = TestClient(app, base_url="http://127.0.0.1:8760", raise_server_exceptions=False)
 
     health = client.get("/api/app/health")
     assert health.status_code == 200, health.text
@@ -2448,7 +6835,71 @@ def t_http_api() -> str:
     assert missing.status_code == 404, missing.text
     assert missing.json()["detail"], missing.json()
 
-    return "health/version/report/diagnostics/openscad/settings/安全拦截 全部通过"
+    # 未处理异常必须「两句都真」：给用户的 500 是人话，**并且**日志里真的有 traceback。
+    # 为什么要单独钉：界面收到的那句 detail 写着「已记录到日志」，而它完全依赖
+    # `log.exception()` 从**当前异常上下文**里取 traceback（Starlette 的 ServerErrorMiddleware
+    # 是在 `except` 块里 await 这个处理器的）。把那一行换成 `log.error()` 一样返回 500、
+    # 一样不弄坏其它任何检查，日志里却只剩一行没头没尾的中文 —— 用户在「系统诊断」
+    # 里捕不到堆栈，我们也捕不到，而软件对外说的是「已记录」。
+    # 让它真崩必须动**处理函数运行时调的那个属性**（下面注里说过的同一个坑）。
+    import logging
+
+    from aiforge import app as app_module
+    from aiforge.api import projects_routes
+
+    logged: list[tuple[str, bool]] = []
+
+    class _ErrorSink(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= logging.ERROR:
+                logged.append((record.getMessage(), record.exc_info is not None))
+
+    sink = _ErrorSink(level=logging.ERROR)
+    app_logger = logging.getLogger(app_module.log.name)
+    app_logger.addHandler(sink)
+    orig_store = projects_routes.projects_mod.store
+
+    def _boom(*_a: object, **_k: object) -> None:
+        raise RuntimeError("自检注入的未处理异常")
+
+    projects_routes.projects_mod.store = _boom  # type: ignore[assignment]
+    try:
+        crashed = client.get("/api/projects")
+    finally:
+        projects_routes.projects_mod.store = orig_store  # type: ignore[assignment]
+        app_logger.removeHandler(sink)
+    assert crashed.status_code == 500, crashed.text
+    body500 = crashed.json()
+    assert body500.get("code") == "INTERNAL" and body500.get("detail"), body500
+    assert any("未处理的异常" in msg and with_exc for msg, with_exc in logged), (
+        f"500 是给出去了，但日志里没有「带异常上下文」的那一行（实测捕到 {logged}）："
+        "那句「已记录到日志」就成了假承诺"
+    )
+
+    # 把每一条「不带参数的 GET」都真跑一遍。为什么要推：界面只在 mock 上跑验收，
+    # 真后端的接口挂了它在浏览器里看不出来（「一键安装」就是靠这个盲区把 500 发到了
+    # 用户手上）。这里不猜哪些接口重要，逐条跑；5xx 统一算挂。
+    # （投毒实测：要改**处理函数运行时调的那个属性**才能让它变红 ——
+    #   改 router 上的 endpoint 函数没用，FastAPI 在写装饰器时就把函数绑走了。）
+    sweep: list[str] = []
+    for route in app.routes:
+        methods = getattr(route, "methods", set()) or set()
+        path = getattr(route, "path", "")
+        if "GET" in methods and path.startswith("/api") and "{" not in path:
+            sweep.append(path)
+    assert len(sweep) >= 12, f"只枚举到 {len(sweep)} 条 GET，这条遍历等于没跑"
+    broken: list[str] = []
+    for path in sorted(set(sweep)):
+        got = client.get(path)
+        if got.status_code >= 500:
+            broken.append(f"{path} -> {got.status_code} {got.text[:120]}")
+    assert not broken, "有 GET 接口直接 500：" + "；".join(broken)
+
+    return (
+        f"health/version/report/diagnostics/openscad/settings/安全拦截 全部通过；"
+        f"{len(set(sweep))} 条无参数 GET 逐个跑过无 5xx；"
+        "未处理异常的 500 与人话同步校验（日志里确实带上了 traceback）"
+    )
 
 
 def t_llm_offline() -> str:
@@ -2852,14 +7303,6 @@ def t_busy_guard() -> str:
     )
 
 
-def t_shortcuts_readonly() -> str:
-    from aiforge import shortcuts
-
-    info = shortcuts.describe_shortcuts()
-    assert "executable" in info and info["executable"], info
-    return f"启动命令解析正常（{Path(info['executable']).name}）"
-
-
 def t_printer_knowledge() -> str:
     """打印机知识库的结构完整性与推导逻辑。"""
     from aiforge import printers
@@ -3172,12 +7615,13 @@ def t_printer_http() -> str:
     assert selected["printer"]["id"] == body["selected_id"], selected
     assert selected["note"], selected
 
-    # 切换机型
+    # 切换机型（`target` 必须真的被用上：以前这行只是把机型查出来就丢了，
+    # 底下又另写一份字面量，两者不一致时没人报 —— 见自检「赋值了却从未被读」那条判据）
     target = next(p for p in body["printers"] if p["id"] == "prusa-mini-04")
-    switched = client.post("/api/printers/select", json={"printer_id": "prusa-mini-04", "material": "PLA"})
+    switched = client.post("/api/printers/select", json={"printer_id": target["id"], "material": "PLA"})
     assert switched.status_code == 200, switched.text
-    assert switched.json()["printer"]["id"] == "prusa-mini-04"
-    assert client.get("/api/settings").json()["printer_id"] == "prusa-mini-04", "选择必须写进设置"
+    assert switched.json()["printer"]["id"] == target["id"]
+    assert client.get("/api/settings").json()["printer_id"] == target["id"], "选择必须写进设置"
 
     # 详情
     detail = client.get("/api/printers/prusa-mini-04")
@@ -3255,6 +7699,51 @@ def t_webview_runtime() -> str:
         # 缺失时必须给出「怎么办」，否则用户只会看到浏览器莫名其妙打开
         assert status.install_hint, "缺失时必须给出处理说明"
 
+    # 版本目录的选取必须是「数值上最新」，不是「字符串倒序第一个」。
+    # 本机实测过干扰形状：`...\\EdgeWebView\\Application` 里并列着 `SetupMetrics`
+    # 与 `154.0.4258.62`；而字符串序里 `9` 比 `1` 大，同时装了 99.x / 154.x 的机器
+    # 会把**旧**运行时当新的报给用户。
+    import tempfile
+
+    from aiforge.webview_runtime import _from_filesystem, _version_key
+
+    assert _version_key("154.0.4258.62") > _version_key("99.0.1150.38"), (
+        "版本排序还是字符串序（154 应大于 99）"
+    )
+    with tempfile.TemporaryDirectory(prefix="webview2-fixture-") as td:
+        fixture = Path(td)
+        for name in ("99.0.1150.38", "154.0.4258.62", "SetupMetrics"):
+            made = fixture / name
+            made.mkdir()
+            if name != "SetupMetrics":
+                (made / "msedgewebview2.exe").write_bytes(b"MZ")
+        picked, picked_source = _from_filesystem([fixture])
+        assert picked == "154.0.4258.62", (
+            f"从夹具里挑出的不是最新运行时，拿到的是 {picked!r}（旧字符串序会拿到 99.0.1150.38）"
+        )
+        assert picked_source == "filesystem", picked_source
+
+    # 两种证据对用户的意义不一样，结论必须分层写。
+    # 「注册表有登记」与「只在磁盘上找到文件」不能共用一句「已就绪」：
+    # WebView2 的官方 loader 是按注册表那个 GUID 项找运行时的，本机证不了
+    # 「有文件、无登记」时它能不能命中 —— 拿不定的那一层必须写给用户看。
+    saved_probes = (webview_runtime._from_registry, webview_runtime._from_filesystem)
+    try:
+        webview_runtime._from_registry = lambda: (None, None)
+        webview_runtime._from_filesystem = lambda roots=None: ("154.0.4258.62", "filesystem")
+        only_files = webview_runtime.detect()
+        assert only_files.installed is True, "只找到文件时仍然该说运行时在（关掉这条会直接把人推进浏览器）"
+        assert "未登记" in only_files.detail and "注册表" in only_files.detail, (
+            f"只找到文件却被说成系统已登记：{only_files.detail}"
+        )
+        webview_runtime._from_filesystem = lambda roots=None: (None, None)
+        webview_runtime._from_registry = lambda: ("154.0.4258.62", "registry")
+        registered = webview_runtime.detect()
+        assert "注册表已登记" in registered.detail, f"注册表证据应当明说来源：{registered.detail}"
+        assert registered.detail != only_files.detail, "两种证据写成了同一句话，上面那层区分等于没做"
+    finally:
+        (webview_runtime._from_registry, webview_runtime._from_filesystem) = saved_probes
+
     # 缓存不能因为重复调用而失效或变慢
     assert webview_runtime.cached_status() is webview_runtime.cached_status(), "应缓存结果"
     return f"检测耗时 {elapsed_ms:.1f} ms，installed={status.installed}，来源={status.source}"
@@ -3287,6 +7776,10 @@ def t_icon_assets() -> str:
     for index in range(count):
         offset = 6 + index * 16
         width, height = raw[offset], raw[offset + 1]
+        # 高也必须看：ICO 目录项里宽高是两个字节，只查宽会让一个**方形**图标需求
+        # 默默放过一张长条图（任务栏拉伸后变形，运行时不会报错）。
+        # 256px 在 ICO 里两字节都记 0，所以这里比的是同一个表示。
+        assert height == width, f"图标目录项不是方形：{width}×{height}"
         payload_len, payload_off = struct.unpack_from("<II", raw, offset + 8)
         assert payload_off + payload_len <= len(raw), "ICO 目录项越界"
         assert raw[payload_off : payload_off + 4] == b"\x89PNG", "条目应为 PNG 数据"
@@ -3411,7 +7904,58 @@ def t_browser_fallback_notice() -> str:
     body = inspect.getsource(server._notify_browser_mode)  # noqa: SLF001
     assert "退出" in body, "提示里必须告诉用户怎么退出"
     assert "不会自动关闭" in body, "提示里必须说明服务不会自动关闭"
-    return "回退有原因说明、有退出指引、有界面退出通道"
+
+    # 单向检查会放过真正的坑：后端一直会在 URL 上带标记，但前端从来没读过它，
+    # 于是用户手册承诺的「页面顶部说明原因 + 一键安装」其实并不存在（那两个接口也是死的）。
+    # 所以两头都得查：标记有人写，也得有人读、读到了要给出安装入口。
+    api_text = "\n".join(
+        p.read_text(encoding="utf-8")
+        for pattern in ("**/*.ts", "**/*.tsx")
+        for p in (ROOT / "webui" / "src").glob(pattern)
+    )
+    assert len(api_text) > 50_000, f"只读到 {len(api_text)} 字符前端源码，这条双向检查等于没做"
+    # 只能查“真在读它”的那个表达式，不能只查单词本身：App.tsx 写这个横幅的注释里
+    # 也出现了 `browser_fallback` 字样，只查单词的话，把读取删掉守卫还是绿的（投毒实测过）。
+    assert "get('browser_fallback')" in api_text, "前端没真读 URL 上的 browser_fallback 标记，回退时用户看不到任何说明"
+    assert "'/app/window-runtime/install'" in api_text, "前端没发安装请求，「一键安装」就是句空话"
+
+    # 地址上只该有标记，不该有一句说明文字：上一版还拼了 &reason=<中文句子>，
+    # 但前端从来没读过它（文案是拉接口拿的），于是它既是一个死参数，又把一长串
+    # 会被截断的中文塞进地址栏。这里把它钉死，防止再长回来一半。
+    assert "&reason=" not in source, "回退 URL 上不要拼 reason：界面不读它，只认 browser_fallback 标记"
+    # 弹窗里提到的按钮名必须跟界面上真的一样（写过「安装组件」，界面上叫「一键安装」）。
+    assert "安装组件" not in source, "提示里的按钮名与界面不一致（界面上那个叫「一键安装」）"
+    assert "一键安装" in source and "一键安装" in api_text, "提示与界面的按钮名需要互相对得上"
+
+    # 最后是真跑一次：横幅里的「一键安装」背后那条接口在打包版里必须是通的。
+    # （发出去的 1.0.2 里它就是死的 —— 见 t_no_undefined_names 的由来。）
+    from fastapi.testclient import TestClient
+
+    from aiforge import webview_runtime
+    from aiforge.app import create_app
+
+    real_try_install = webview_runtime.try_install
+    webview_runtime.try_install = lambda: (True, "自检桩：不会真的安装任何东西")
+    try:
+        http = TestClient(
+            create_app(), base_url="http://127.0.0.1:8760", raise_server_exceptions=False
+        )
+        status = http.get("/api/app/window-runtime")
+        assert status.status_code == 200, status.text
+        body = status.json()
+        for field in ("installed", "detail"):
+            assert field in body, f"横幅要读 {field}，但 /api/app/window-runtime 没返回"
+        installed = http.post("/api/app/window-runtime/install")
+        assert installed.status_code == 200, (
+            f"「一键安装」请求失败（{installed.status_code}）：{installed.text[:120]}"
+        )
+        assert installed.json().get("ok") is True, installed.json()
+    finally:
+        webview_runtime.try_install = real_try_install
+    return (
+        "回退有原因说明、有退出指引、有界面退出通道；前端确实读到标记，"
+        "且「一键安装」接口真的能跑通（桩替换了安装动作）"
+    )
 
 
 def t_ps1_are_ascii() -> str:
@@ -3435,35 +7979,1268 @@ def t_ps1_are_ascii() -> str:
     return f"{count} 个 .ps1 全部为纯 ASCII"
 
 
+def _ps_code_skeleton(text: str) -> list[str]:
+    """.ps1 的「代码骨架」：注释和字符串的内容换成空格，行数与列位置不变。
+
+    为什么要骨架：`2>&1` 出现在字符串里（`& cmd /c "prog > log 2>&1"`）是交给 cmd.exe
+    的重定向，跟 PowerShell 的错误流无关；出现在注释里更不算数。只有代码里的才是。
+    不处理 here-string —— 本仓 6 个 .ps1 里只有一处，且所在文件不含任何 `2>&1`；
+    真要出现，报的是「这一处算代码」，行号照旧给出来，一眼能判断。
+    """
+    out: list[str] = []
+    in_block = False
+    for line in text.split("\n"):
+        buf: list[str] = []
+        i = 0
+        quote = ""
+        while i < len(line):
+            ch = line[i]
+            if in_block:
+                if line.startswith("#>", i):
+                    in_block = False
+                    buf.append("  ")
+                    i += 2
+                else:
+                    buf.append(" ")
+                    i += 1
+                continue
+            if quote:
+                if ch == "`" and quote == '"':
+                    buf.append("  ")
+                    i += 2
+                    continue
+                if ch == quote:
+                    if line.startswith(quote * 2, i):  # 引号成对 = 转义
+                        buf.append("  ")
+                        i += 2
+                        continue
+                    quote = ""
+                buf.append(" ")
+                i += 1
+                continue
+            if line.startswith("<#", i):
+                in_block = True
+                buf.append("  ")
+                i += 2
+                continue
+            if ch == "#":
+                buf.append(" " * (len(line) - i))  # 行注释：整行余下抹掉
+                break
+            if ch in "\"'":
+                quote = ch
+                buf.append(" ")
+                i += 1
+                continue
+            buf.append(ch)
+            i += 1
+        out.append("".join(buf))
+    return out
+
+
+def t_ps1_native_stderr() -> str:
+    """.ps1 里合并原生命令的 stderr（`2>&1`），必须写在显式降过 $ErrorActionPreference 的函数里。
+
+    为什么钉这条 —— 本机 PowerShell 5.1 实测（原生命令往 stderr 写一行，然后 exit 0，
+    也就是「命令其实成功了，只是顺便说了句话」）：
+
+    - `cmd ... 2>&1 | Out-Null`      → RemoteException **终止脚本**
+    - `cmd ... 2>&1 | ForEach-Object` → 同上
+    - `$x = cmd ... 2>&1`（不接管道）  → 同上，有没有管道不是触发条件
+    - `cmd ... | Out-Null`（不合并）   → 活下来，退出码是真值
+    - 把 $ErrorActionPreference 降到 'Continue' 再合并 → 活下来，退出码是真值，文本也拿到
+
+    另一半：报错之后读 $LASTEXITCODE 也读不到命令的真实退出码——同一个 exit 0 的子进程，
+    分 5 次跑，4 次读到 -1、1 次读到真的 0（那一次就是侥幸）。所以「外面包个 try/catch
+    再读退出码」也修不好它 —— 正解见 scripts/build.ps1 的 Invoke-Native。
+
+    同一个坑本仓踩过两次：npm 那段注释写着「seen in practice」，然后一模一样的形状在
+    pip 那一行又把整个构建打死（pypi.org 读超时，pip 只是打印了一句 "WARNING: Retrying"），
+    报出来的还是 PowerShell 的 NativeCommandError 而不是 pip 的话 —— 成功和失败都报错，
+    两边都是错的。光靠注释没拦住，故有此守卫。
+    """
+    offenders: list[str] = []
+    sites = 0
+    paths = sorted((ROOT / "scripts").glob("*.ps1")) + sorted(ROOT.glob("*.ps1"))
+
+    def enclosing(skel: list[str], idx: int) -> tuple[str, int] | None:
+        """往上找包住这一行的 function；先撞到顶格 `}` 就算在顶层。
+
+        为什么不能简单用「最近的一个 function 行」：本仓的函数全定在文件开头，
+        函数之后的脚本体是顶层代码 —— 那样会把它们全算成最后一个函数内部的，
+        顶层的违规就检不出来了（投毒 P1 实测到的就是这个）。
+        """
+        for j in range(idx, -1, -1):
+            line = skel[j]
+            if re.match(r"^\}", line):
+                return None
+            m = re.match(r"^function\s+(\S+)", line)
+            if m:
+                return (m.group(1), j)
+        return None
+
+    for path in paths:
+        raw_lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
+        skel = _ps_code_skeleton("\n".join(raw_lines))
+        # 值只会在骨架里被抹掉，所以「降没降」看原文，「是不是注释」看骨架。
+        lowers = {
+            i
+            for i, raw in enumerate(raw_lines)
+            if skel[i].strip() and re.match(r"^\s*\$ErrorActionPreference\s*=\s*'Continue'", raw)
+        }
+
+        for i, line in enumerate(skel):
+            if "2>&1" not in line:
+                continue
+            sites += 1
+            owner = enclosing(skel, i)
+            if owner is None:
+                offenders.append(
+                    f"{path.name}:{i + 1} 在函数外（顶层，$ErrorActionPreference 默认为 Stop）合并了 stderr"
+                )
+                continue
+            name, start = owner
+            if not any(j in lowers for j in range(start, i)):
+                offenders.append(
+                    f"{path.name}:{i + 1} 所在函数 {name}() 里没有 $ErrorActionPreference = 'Continue'"
+                )
+    assert not offenders, (
+        "合并原生命令 stderr 的写法会在 PowerShell 5.1 下把成功当成致命错误："
+        + "；".join(offenders)
+        + "。改法：走 scripts/build.ps1 的 Invoke-Native，或在函数里先降 'Continue' 再合并"
+    )
+    return f"{len(paths)} 个 .ps1 里 {sites} 处合并原生命令 stderr，全部在降过 $ErrorActionPreference 的函数里"
+
+
+def t_no_dead_assignments() -> str:
+    """不得有「算出来却从未被读」的赋值（自己走 AST，不引 pyflakes）。
+
+    为什么钉这一条（实测踩过）：jobs.py 里写过 `if sampled := any(...)` —— 条件算完
+    就丢，抽样渲染的告警**一次都没发出过**：用户以为 AI 看的是完整模型，实际是抽稀图。
+    这类缺陷编译器不报、运行不报、老自检也查不到（「代码不养闲人」只查**顶层**死代码与
+    未用导入，函数里少一个没人读的局部它看不见）。上一轮是靠外部 pyflakes 扫出来的，
+    而项目明确不引 pyflakes/ruff（多一个依赖多一分臃肿）—— 所以这一面自己守住：
+    修好的 bug 不该有无声无息长回来的机会。
+
+    扫描面 = 产品代码（src/aiforge + main.py）+ 自检主干（selfcheck.py / selfcheck_design.py）。
+    自检主干也进是因为：判据脚本里一个算了不用的值，就是一条**本来打算写却没写**的断言
+    —— selfcheck_design.py 的 `clean` 就是这么被抓住的（它是当时全仓唯一一处 F841）。
+    build/ 下的一次性取数探针不扫（那是用完就扔的工具，不是产品也不是判据）。
+
+    只收**赋值语句**（`=` / `:=` / `+=` / 带注解赋值）：不收 for 循环变量与
+    `with ... as` 句柄 —— 那两种「没用上」大多只是写啰嗦了，不是一种失明；把它们
+    拉进来只会让守卫一修就红，反而没人看它报的东西。
+    """
+    import ast
+    import textwrap          # 只给下面的对照集用，不往模块级拉（那里已经挤了 8 个标准库）
+
+    def own_scope_nodes(fn):
+        """只走 fn **自己那一层**作用域的节点，遇到嵌套 def/lambda/class 就停。
+
+        不停会怎样：`class Fake: calls = 0` 写在函数体里，`calls` 是**类属性**，
+        读它用的是 `Fake.calls` —— 裸名永远不出现在 Load 里。不处理嵌套作用域时，
+        11 处命中里 10 处是这种假阳（pyflakes 一处都不报）—— 假阳多到一定程度的
+        守卫跟没有一样：下一次真报红的时候没人信它。
+        """
+        stack = list(fn.body)
+        while stack:
+            node = stack.pop()
+            yield node
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                continue  # 另起一层作用域，它自己的局部由它自己那一轮扫
+            stack.extend(ast.iter_child_nodes(node))
+
+    def unused_assigns(src: str, filename: str) -> list[tuple[int, str, str]]:
+        tree = ast.parse(src, filename=filename)
+        hits: list[tuple[int, str, str]] = []
+        funcs = [n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        for fn in funcs:
+            # 「读」走整棵子树（含嵌套）：内层函数读外层变量算读到了，不报
+            loads: set[str] = set()
+            declared: set[str] = set()
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    loads.add(node.id)
+                elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                    declared.update(node.names)
+                elif isinstance(node, ast.Delete):
+                    loads.update(t.id for t in node.targets if isinstance(t, ast.Name))
+            for node in own_scope_nodes(fn):
+                if isinstance(node, ast.Assign):
+                    raw_targets: list[ast.expr] = list(node.targets)
+                elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                    raw_targets = [node.target]
+                elif isinstance(node, ast.NamedExpr):
+                    raw_targets = [node.target]
+                else:
+                    continue
+                for tgt in raw_targets:
+                    if not isinstance(tgt, ast.Name):
+                        continue  # a.b = 1 / a, b = ... 不在这张网里
+                    if tgt.id.startswith("_") or tgt.id in loads or tgt.id in declared:
+                        continue
+                    hits.append((tgt.lineno, tgt.id, fn.name))
+        return hits
+
+    # --- 阳性/阴性对照：这张网必须既能抓到、又不抓错 ---
+    fixture = '''
+    def bad_simple():
+        got = 1 + 1
+        return 2
+
+    def bad_walrus(items):
+        if picked := any(items):
+            return "yes"
+        return "no"
+
+    def ok_underscore():
+        _ = 1 + 1
+        value = 2
+        return value
+
+    def ok_closure():
+        outer = 5
+        def inner():
+            return outer
+        return inner
+
+    def ok_class_attr():
+        class Fake:
+            calls = 0
+            def bump(self):
+                Fake.calls += 1
+                return Fake.calls
+        return Fake
+
+    def ok_del():
+        tmp = [1, 2]
+        del tmp
+        return 1
+    '''
+    caught = {(name, fn) for _ln, name, fn in unused_assigns(textwrap.dedent(fixture), "<fixture>")}
+    assert caught == {("got", "bad_simple"), ("picked", "bad_walrus")}, (
+        f"对照集判错了（实测抓到 {sorted(caught)}）：这把「算了不用」的尺子自己先不准，"
+        "报出来的绿也不能信 —— 要查 own_scope_nodes / Load 判定"
+    )
+
+    pkg = ROOT / "src" / "aiforge"
+    targets = sorted(p for p in pkg.rglob("*.py") if "__pycache__" not in p.parts)
+    targets += [ROOT / "main.py",
+                ROOT / "scripts" / "selfcheck.py",
+                ROOT / "scripts" / "selfcheck_design.py"]
+    assert len(targets) >= 40, f"只扫到 {len(targets)} 个文件，这条检查等于没跑"
+
+    offenders: list[str] = []
+    for path in targets:
+        for line, name, fn in unused_assigns(path.read_text(encoding="utf-8", errors="ignore"), str(path)):
+            offenders.append(f"{path.relative_to(ROOT).as_posix()}:{line} {fn}() 里的 {name}")
+    assert not offenders, (
+        f"{len(targets)} 个文件里找到 {len(offenders)} 处「赋值了却从未被读」：" + "；".join(offenders)
+        + "。改法：要么把它用起来（告警/断言/返回值），要么不要绑定名字"
+        "（直接写调用、或赋给 `_`）—— 算了不用就是那里本来该有一句话却没写"
+    )
+    return (
+        f"{len(targets)} 个文件（产品代码 + main.py + 自检主干）扫过，0 处「赋值了却从未被读」；"
+        "对照集双向都对：裸赋值/海象算完即丢必报，下划线/闭包/类属性/del 必不报"
+        "（类属性那一条是实测假阳：不区分作用域时 10/11 条命中都是它）"
+    )
+
+
+def t_no_shadowed_imports() -> str:
+    """产品代码里不得有"函数内重复导入模块级已有名字"（会做出 500）。
+
+    为什么钉这一条（实测踩到）：`settings_routes.update_settings` 里写了
+    `from .errors import AppError`（函数内），Python 就把 AppError 当成**整个函数的局部变量**；
+    那行导入只在"选了不存在的 OpenSCAD 路径"时执行，所以其余分支里的
+    `raise AppError(...)`（打印机不存在、切片软件没检测到）全部先撞
+    `UnboundLocalError` → 用户只看到一个含义不明的 500「软件内部出现了意外问题」，
+    而自检、录入接口、类型检查都看不出来（它只在那条分支被走到时才炸）。
+
+    只扫 src/aiforge：scripts/ 下的自检脚本里那些带 `as _xxx` 别名或开头就导入的写法
+    不会造成这个 bug，而产品代码里一个 500 就是用户看到的故障。
+    """
+    import ast
+
+    pkg = ROOT / "src" / "aiforge"
+    offenders: list[str] = []
+    scanned = 0
+    for path in sorted(pkg.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        scanned += 1
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        top: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                top |= {a.asname or a.name.split(".")[0] for a in node.names}
+        for func in (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            inner: dict[str, int] = {}
+            for node in ast.walk(func):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    for a in node.names:
+                        name = a.asname or a.name.split(".")[0]
+                        inner[name] = min(inner.get(name, 10**9), node.lineno)
+            for name, line in inner.items():
+                if name not in top:
+                    continue
+                # 除了这条 import 本身，函数里还用到这个名字 → 局部绑定会顶掉模块级的
+                if any(
+                    isinstance(n, ast.Name) and n.id == name and n.lineno != line
+                    for n in ast.walk(func)
+                ):
+                    offenders.append(f"{path.relative_to(ROOT)}:{line} {func.name} 局部导入 {name}")
+    assert not offenders, (
+        "函数内重复导入了模块级已有的名字，会让它在整个函数里变成未赋值的局部变量：" + "；".join(offenders)
+    )
+    return f"{scanned} 个模块无遮蔽导入（函数内不重复导入模块级名字）"
+
+
+def _collect_top_level_bindings(stmts: list, into: set, ast_mod) -> None:
+    """模块级绑定：穿过 if/try/for 等复合语句，但不进入 def/class 体。"""
+    for st in stmts:
+        if isinstance(st, (ast_mod.FunctionDef, ast_mod.AsyncFunctionDef, ast_mod.ClassDef)):
+            into.add(st.name)
+        elif isinstance(st, ast_mod.Assign):
+            for t in st.targets:
+                _collect_bind_target(t, into, ast_mod)
+        elif isinstance(st, (ast_mod.AnnAssign, ast_mod.AugAssign)):
+            _collect_bind_target(st.target, into, ast_mod)
+        elif isinstance(st, (ast_mod.Import, ast_mod.ImportFrom)):
+            for a in st.names:
+                into.add("*" if a.name == "*" else (a.asname or a.name.split(".")[0]))
+        elif isinstance(st, (ast_mod.For, ast_mod.AsyncFor)):
+            _collect_bind_target(st.target, into, ast_mod)
+        elif isinstance(st, (ast_mod.With, ast_mod.AsyncWith)):
+            for item in st.items:
+                if item.optional_vars:
+                    _collect_bind_target(item.optional_vars, into, ast_mod)
+        elif isinstance(st, ast_mod.Try):
+            for h in st.handlers:
+                if h.name:
+                    into.add(h.name)
+                _collect_top_level_bindings(h.body, into, ast_mod)
+            _collect_top_level_bindings(st.body + st.orelse + st.finalbody, into, ast_mod)
+        elif isinstance(st, (ast_mod.If, ast_mod.While)):
+            _collect_top_level_bindings(st.body + st.orelse, into, ast_mod)
+
+
+def _collect_bind_target(node, into: set, ast_mod) -> None:
+    if isinstance(node, ast_mod.Name):
+        into.add(node.id)
+    elif isinstance(node, (ast_mod.Tuple, ast_mod.List)):
+        for elt in node.elts:
+            _collect_bind_target(elt, into, ast_mod)
+    elif isinstance(node, ast_mod.Starred):
+        _collect_bind_target(node.value, into, ast_mod)
+
+
+def _collect_any_binding(node, into: set, ast_mod) -> None:
+    """一个函数子树里出现过的所有绑定（过近似：宁可漏报，不要误报）。"""
+    for sub in ast_mod.walk(node):
+        if isinstance(sub, ast_mod.Name) and isinstance(sub.ctx, (ast_mod.Store, ast_mod.Del)):
+            into.add(sub.id)
+        elif isinstance(sub, ast_mod.arg):
+            into.add(sub.arg)
+        elif isinstance(sub, (ast_mod.Import, ast_mod.ImportFrom)):
+            for a in sub.names:
+                into.add(a.asname or a.name.split(".")[0])
+        elif isinstance(sub, ast_mod.ExceptHandler) and sub.name:
+            into.add(sub.name)
+        elif isinstance(sub, (ast_mod.FunctionDef, ast_mod.AsyncFunctionDef, ast_mod.ClassDef)):
+            into.add(sub.name)
+        elif isinstance(sub, ast_mod.Global):
+            into.update(sub.names)
+
+
+def _scan_undefined_names(source: str, ast_mod, ignore: set[str]) -> list[tuple[int, str, str]]:
+    """返回 [(行号, 函数名, 用到的名字)]：这些名字在该名字的可见作用域里根本不存在。"""
+    tree = ast_mod.parse(source)
+    module_scope: set[str] = set()
+    _collect_top_level_bindings(tree.body, module_scope, ast_mod)
+    if "*" in module_scope:  # 有 import * 就没法判断，直接跳过整个文件
+        return []
+
+    parent: dict = {}
+    for node in ast_mod.walk(tree):
+        for child in ast_mod.iter_child_nodes(node):
+            parent[child] = node
+
+    problems: list[tuple[int, str, str]] = []
+    funcs = tuple((ast_mod.FunctionDef, ast_mod.AsyncFunctionDef, ast_mod.ClassDef))
+    for st in ast_mod.walk(tree):
+        if not isinstance(st, funcs):
+            continue
+        scope = set(module_scope)
+        _collect_any_binding(st, scope, ast_mod)
+        cur = parent.get(st)
+        while cur is not None:  # 外层函数里的局部名字对闭包可见
+            if isinstance(cur, funcs):
+                _collect_any_binding(cur, scope, ast_mod)
+            cur = parent.get(cur)
+        for node in ast_mod.walk(st):
+            if (
+                isinstance(node, ast_mod.Name)
+                and isinstance(node.ctx, ast_mod.Load)
+                and node.id not in scope
+                and node.id not in ignore
+            ):
+                problems.append((node.lineno, st.name, node.id))
+    return sorted(set(problems))
+
+
+def t_no_undefined_names() -> str:
+    """产品代码里不得用到「整个模块根本没有」的名字（一走到就是 NameError → 500）。
+
+    为什么单独钉这一条（已发到用户手上的版本里踩到了）：
+    `api/app_routes.py` 的 `install_window_runtime` 用了 `asyncio.to_thread(...)`，
+    可整个模块没有顶层 `import asyncio` —— 唯一那一行写在**另一个**函数 `shutdown()` 里，
+    而函数内导入只对那个函数生效。结果用户手册承诺的「一键安装」一点就是 500，
+    而它跟「函数内导入顶掉模块级名字」（t_no_shadowed_imports）是同一枚硬币的两面，
+    那个守卫抓不到这一面，所以自己查一遍（不引入 pyflakes/ruff：多一个依赖多一分臃肿）。
+
+    只查 src/aiforge + main.py：脚本里的临时探针不受这条约束。
+    内置一个阳性对照（自己种一个缺陷，必须能抓到），防止守卫默默变成空跑。
+    """
+    import ast
+    import builtins
+
+    ignore = set(dir(builtins)) | {
+        "__file__",
+        "__name__",
+        "__doc__",
+        "__spec__",
+        "__package__",
+        "__builtins__",
+    }
+
+    # 对照 1：正确写法不得报（防误伤）；对照 2：坏写法必须报（防空跑）。
+    ok = _scan_undefined_names(
+        "import asyncio\n\n\nasync def a(p):\n    return await asyncio.to_thread(int, p)\n",
+        ast,
+        ignore,
+    )
+    assert not ok, f"这条守卫对正确写法也报错，会把日常开发堵死：{ok}"
+    planted = _scan_undefined_names(
+        "import os\n\n\ndef a():\n    return os.getcwd()\n\n\ndef b():\n    return asyncio.to_thread(int)\n",
+        ast,
+        ignore,
+    )
+    assert planted, "这条守卫连自己种的缺陷都抓不到，等于没做"
+    assert planted[0][2] == "asyncio", f"抓到的不是预期的名字：{planted}"
+
+    targets = sorted((ROOT / "src" / "aiforge").rglob("*.py")) + [ROOT / "main.py"]
+    files = [p for p in targets if "__pycache__" not in p.parts]
+    assert len(files) >= 30, f"只扫到 {len(files)} 个文件，这条检查范围不对"
+    offenders: list[str] = []
+    for path in files:
+        for line, func, name in _scan_undefined_names(path.read_text(encoding="utf-8"), ast, ignore):
+            offenders.append(f"{path.relative_to(ROOT)}:{line} {func}() 用了未定义的 {name}")
+    assert not offenders, "函数里用到了模块根本没有的名字，走到就 NameError：" + "；".join(offenders)
+    return f"{len(files)} 个产品文件的局部名字全部可解析（含阳性/阴性对照）"
+
+
+def _strip_code_prose(src: str) -> str:
+    """把 # 注释截掉、docstring 抹成空行（它们里的名字是给人看的，不算引用）。
+
+    注意行尾注释只能截 `#` 之后的部分：上一版把整行抹掉，于是
+    `chosen = jobs._prefer(..., spec)  # noqa: SLF001` 这类写法让真实调用凭空消失，
+    守卫一口气把十几个好好工作的函数报成死代码。误伤比漏报贵得多。
+    """
+    import ast
+    import io
+    import tokenize
+
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return src
+    prose_lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            prose_lines.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+    cut_col: dict[int, int] = {}
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type == tokenize.COMMENT:
+                ln = tok.start[0]
+                cut_col[ln] = min(cut_col.get(ln, 10**9), tok.start[1])
+    except (tokenize.TokenError, IndentationError):
+        pass
+    out: list[str] = []
+    for i, line in enumerate(src.splitlines(), 1):
+        if i in prose_lines:
+            out.append("")
+        elif i in cut_col:
+            out.append(line[: cut_col[i]].rstrip())
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _strip_code_prose_ts(src: str) -> str:
+    """抹掉 JS/TS 注释，保留行号。
+
+    不抹的话，「这个导出其实没人用了，只在注释里提了一嘴」会被注释洗白。
+    但只认**行首**的 `//` 与 `/*`（JSDoc 形状）：字符串里也会碰见 `/*`（实测
+    Viewer3D.tsx 里有一句 `"/*' } })"`），拿正则跨行配对会一路吞掉上百行真代码。
+    同一行尾巴上的 `//` 可以截，但要先看前面引号是否成对（URL 里的 `//` 不是注释）。
+    所有判断失败的方向都是「少抹」，只会漏报不会误伤。
+    """
+    lines = src.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        if stripped.startswith("//"):
+            out.append("")
+            i += 1
+            continue
+        if stripped.startswith("/*"):
+            end = -1
+            for j in range(i, min(i + 20, len(lines))):  # 块注释超 20 行 = 配对坏了，不认
+                if "*/" in lines[j]:
+                    end = j
+                    break
+            if end == -1:
+                out.append(line)
+                i += 1
+                continue
+            for j in range(i, end):
+                out.append("")
+            tail = lines[end].split("*/", 1)[1]
+            out.append(tail if tail.strip() else "")
+            i = end + 1
+            continue
+        cut = -1
+        k = line.find("//")
+        while k != -1:
+            head = line[:k]
+            if (head.count('"') + head.count("'") + head.count("`")) % 2 == 0:
+                cut = k
+                break
+            k = line.find("//", k + 2)
+        out.append(line[:cut].rstrip() if cut != -1 else line)
+        i += 1
+    return "\n".join(out)
+
+
+def _strip_prose(path, text: str) -> str:
+    """按语言抹注释；认不出的语言原样返回（宁可漏报也不误伤）。"""
+    if path.suffix in {".ts", ".tsx", ".js", ".mjs"}:
+        return _strip_code_prose_ts(text)
+    return _strip_code_prose(text)
+
+
+def t_no_dead_symbols() -> str:
+    """代码不养闲人：顶层函数/常量/组件不得「整个仓库没有任何代码引用」，导入不得不用。
+
+    为什么钉这一条（本轮按「小而美」清查实测捣出来 24 处）：死代码比 bug 贵 ——
+    它会长期骗人。一个 OpenSCAD 数字签名检查函数根本没人调，文档里却写着
+    「这一点写在某某函数里」；三个网格兜底常量早就被机型知识库里的同名字段取代，
+    读代码的人仍会以为那里有一层默认值；还有 7 个从未渲染过的图标。
+    最坏的一类是**反向**的：一份专门写好的图片复核系统提示词没接上，
+    而解析器就按那份提示词的第一行契约判定 —— 守卫把它钉住之后，
+    这类「写了但没接上」的东西要么接上、要么删掉，不许继续躺着。
+
+    判据（宁可漏报也不误伤日常开发）：
+      * 只算「名字在整个代码语料里只出现 1 次」的顶层符号 —— 那 1 次就是它的定义行；
+        注释与 docstring **不算**引用（不然守卫自己的文案就会把要它查的名字洗白）；
+        但 `mod.func()` 这种点号调用**算**引用（否则跨模块调用全部隐身）；
+      * 语料 = 产品代码 + 前端源码 + 自检/构建脚本 + mock + 打包配置，
+        所以「只被自检调用」算有人用（那是刻意保留的可测接口）；
+      * 带装饰器的函数跳过：框架拿装饰器注册，名字不会出现在调用处；
+      * 自带一个阳性对照，防止守卫默默变成空跑。
+
+    废导入的判据**和上面不一样**，必须按文件判（见 `_unused_imports`）：
+      上一版这里也套了「全仓只出现 1 次」这道过滤器，于是 `import tempfile` 只要
+      别的文件也写着 tempfile 就被洗白 —— 实测这条把产品里 9 处真没用的导入
+      全放过，而自检文案写着「含未用导入检查」并全绿。
+
+    还有一类必须按「双向」判：包 `__init__.py` 里的「包结构」清单（见 `_scan_package_map`）。
+    它光秃秃只写模块名，不带点号不带括号，所以上面那条文档引用守卫管不到它。
+    实测漏例：`shortcuts.py` 已随两个没人调的端点删掉，这张地图还留着它那一行。
+    """
+    import ast
+    import re
+
+    product_py = [
+        p
+        for p in sorted((ROOT / "src" / "aiforge").rglob("*.py"))
+        if "__pycache__" not in p.parts and p.name != "__init__.py"
+    ] + [ROOT / "main.py"]
+    web_ts = sorted(p for p in (ROOT / "webui" / "src").rglob("*.ts*") if p.suffix != ".d.ts")
+    corpus_files = (
+        product_py
+        + web_ts
+        + sorted((ROOT / "scripts").rglob("*.py"))
+        + sorted((ROOT / "scripts").rglob("*.ps1"))
+        + sorted((ROOT / "webui" / "scripts").glob("*.mjs"))
+        + [ROOT / "AI-3D-Forge.spec", ROOT / "webui" / "mock-server.mjs", ROOT / "webui" / "index.html"]
+        + sorted((ROOT / "installer").glob("*.iss"))
+    )
+    texts = {p: p.read_text(encoding="utf-8", errors="ignore") for p in corpus_files if p.is_file()}
+    assert len(texts) >= 80, f"只读到 {len(texts)} 个代码文件，这条检查的覆盖范围不对"
+    # 产品文件自己的定义行也得在语料里（所以计数 ≤ 1 才是「只有定义」）；
+    # 但别人的引用只算**代码**，注释/docstring 先抹掉。
+    stripped_corpus = "\n".join(_strip_prose(p, t) for p, t in texts.items())
+
+    def count_refs(name: str, corpus: str) -> int:
+        # 左边界只排除「名字自己是个长名字的后缀」，但**必须**让 `mod.func()` /
+        # `obj.CONST` 算引用：Python 跨模块调用就是点号形式，上一版多排除了
+        # 一个 `.`，直接把 35 个好好工作的函数报成死代码。
+        return len(re.findall(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])", corpus))
+
+    def refs(name: str) -> int:
+        return count_refs(name, stripped_corpus)
+
+    # ---- 阳性/阴性对照：种在隔离小语料里，不借用真实代码（否则 `live` 这种
+    # 常见词会被全仓引用污染，对照就成了自证）----
+    planted_src = (
+        "import os\nimport json\n\n\n"
+        "def _probe_live():\n    return os.getcwd()\n\n\n"
+        "def _probe_orphan():\n    return 1\n\n\n"
+        "_PROBE_USED = 3\n_PROBE_UNUSED = 4\n\n\n"
+        "probe_sink = (_probe_live, _PROBE_USED, os.getcwd)\n\n\n"
+        "def _probe_commented():  # 只在注释里提到\n    return 0\n"
+    )
+    planted_stripped = _strip_code_prose(planted_src)
+    planted_dead = sorted(n for n, _ in _scan_dead_python_symbols(planted_src, ast) if count_refs(n, planted_stripped) <= 1)
+    assert planted_dead == ["_PROBE_UNUSED", "_probe_commented", "_probe_orphan"], f"死代码对照失败：{planted_dead}"
+    planted_unused = sorted(n for n, _ in _scan_unused_imports(planted_src, ast))
+    assert planted_unused == ["json"], f"未用导入对照失败：{planted_unused}"
+
+    # 未用导入的对照必须打在**真实全仓语料**上：上面那段隔离小语料里 `json` 只出现
+    # 一次，所以它验不出「被全仓同名洗白」这个坑。这里三个名字在全仓都出现上百次：
+    # `json` 该被报出来，`tempfile`/`socket` 各靠一种**写下凭据**的方式豁免。
+    planted_unused_src = (
+        "import json\nimport tempfile  # noqa: F401 - 只为副作用留着\nimport socket\n\n\n"
+        "def _probe_live3():\n    return 1\n\n\nprobe_sink3 = (_probe_live3,)\n"
+    )
+    planted_texts = dict(texts)
+    planted_texts[ROOT / "src" / "aiforge" / "_probe_consumer.py"] = "from .probe_mod import socket\n"
+    planted_unused2 = [
+        n
+        for _, n in _unused_imports(
+            planted_unused_src, ROOT / "src" / "aiforge" / "probe_mod.py", planted_texts, ast
+        )
+    ]
+    assert planted_unused2 == ["json"], f"按文件判的未用导入对照失败：{planted_unused2}"
+
+    dead: list[str] = []
+    unused_imports: list[str] = []
+
+    for path in product_py:
+        src = texts[path]
+        rel = str(path.relative_to(ROOT))
+        dead += [f"{rel}:{ln} {n}" for n, ln in _scan_dead_python_symbols(src, ast) if refs(n) <= 1]
+        for lineno, name in _unused_imports(src, path, texts, ast):
+            unused_imports.append(f"{rel}:{lineno} 导入了 {name} 但本文件没用到")
+
+    decl_re = re.compile(
+        r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|const|let|class|interface|type|enum)\s+([A-Za-z0-9_$]+)",
+        re.M,
+    )
+    for path in web_ts:
+        stripped = _strip_prose(path, texts[path])
+        rel = str(path.relative_to(ROOT))
+        for m in decl_re.finditer(stripped):
+            name = m.group(1)
+            if name.startswith("__") or name in {"App", "main"}:
+                continue
+            if refs(name) <= 1:
+                dead.append(f"{rel}:{stripped[: m.start(1)].count(chr(10)) + 1} {name}")
+
+    # 前端侧对照：注释里的名字不算引用，被引用的不报
+    planted_ts = (
+        "export function probeTsLive(): number {\n  return 1\n}\n\n"
+        "function probeTsOrphan(): number {\n  return 2\n}\n\n"
+        "export const probeTsConsumer = probeTsLive()\n\nvoid probeTsConsumer\n\n"
+        "// probeTsOrphan 只出现在注释里\n"
+    )
+    ts_stripped = _strip_code_prose_ts(planted_ts)
+    ts_dead = sorted({n for n in decl_re.findall(ts_stripped) if count_refs(n, ts_stripped) <= 1})
+    assert ts_dead == ["probeTsOrphan"], f"前端死代码对照失败：{ts_dead}"
+
+    # 第三类：文档声称某个 `module.func()` 存在，代码里却已经没这个名字了。
+    # 死代码最阴的一种形态不是多占几 KB，而是让文档与代码互相作证一个不存在的能力。
+    # CHANGELOG 不扫：它是历史记录，提已删名字是它的本职。
+    doc_files = [p for p in _doc_files() if p.name != "CHANGELOG.md"]
+    defined = {p.stem: texts[p] for p in product_py}
+    stale_docs: list[str] = []
+    for doc in doc_files:
+        if not doc.is_file():
+            continue
+        for ln, token in _scan_stale_doc_refs(doc.read_text(encoding="utf-8", errors="ignore"), defined):
+            stale_docs.append(f"{doc.relative_to(ROOT)}:{ln} {token}")
+
+    planted_docs = _scan_stale_doc_refs(
+        "见 `mesh.gone_probe_fn()`；`os.getcwd()` 不算（os 不是产品模块）；"
+        "`mesh.sha256_of()` 也不算（它真的在）。",
+        {"mesh": "def sha256_of(path):\n    return 0\n"},
+    )
+    assert [t for _, t in planted_docs] == ["mesh.gone_probe_fn()"], f"文档引用对照失败：{planted_docs}"
+
+    # 第四类：`aiforge/__init__.py` 的「包结构」清单。上面那条 `_scan_stale_doc_refs` 只认
+    # `module.func()` 这种点号形式，管不到清单里**光秃秃一个模块名**。实测漏的就是这个：
+    # shortcuts.py 随两个没人调的端点删掉时，CHANGELOG 与竞争分析都改了，只有这张地图
+    # 还留着「shortcuts   Windows 快捷方式」一行 —— 而它是新人读包的第一入口。
+    pkg_init = ROOT / "src" / "aiforge" / "__init__.py"
+    pkg_real = {p.stem for p in (ROOT / "src" / "aiforge").iterdir()
+                if p.suffix == ".py" and p.name != "__init__.py"}
+    # 子包按「目录里有 .py」算，不是按「有 __init__.py」算：api/ 就是一个隐式命名空间包
+    # （没有 __init__.py，但 from .api import app_routes 一直在跑）。要求 __init__.py
+    # 会把一个真在用的包当成不存在，那条清单行就会被自己的守卫误杀。
+    pkg_real |= {d.name for d in (ROOT / "src" / "aiforge").iterdir()
+                 if d.is_dir() and not d.name.startswith("__") and any(d.glob("*.py"))}
+    assert len(pkg_real) >= 20, f"只枚举到 {len(pkg_real)} 个包内模块，这条检查的范围不对"
+    pkg_map = _scan_package_map(pkg_init.read_text(encoding="utf-8"), pkg_real)
+
+    planted_map = _scan_package_map(
+        "包结构：\n    paths            真的在\n    shortcuts        已删的模块（就是实测漏的那个）\n"
+        "    api/*            子包用通配写法\n        _probe_deep  缩进 8 空格，不是顶层清单行\n", {"paths", "api", "mesh"})
+    assert planted_map == ["清单里的 `shortcuts` 在包里不存在", "`mesh` 没写进包结构清单"], \
+        f"包结构清单对照失败：{planted_map}"
+
+    # 第五类：随包分发的文档里指到的仓库文件，必须真的能在那个包里找到。
+    # 这一类不是「文档写错个名字」那么轻：docs/PUBLISH-TO-GITHUB.md 曾经指着一个
+    # `build\work\sync_github_repo.py`，那在 .gitignore 里，别人 clone 后照文档跑第一步就死；
+    # 同一份文档还拿它当「发布工具」。发布流程的引用必须是**仓库里跑得起来的命令**。
+    # 判据故意宽：只拿尾段在全仓兑现（`cd webui` 后写 `scripts\x.mjs` 是对的），
+    # 所以它抓的是「彻底指不到」而不是「相对路径写得不够全」。
+    internal_docs = _internal_doc_paths()
+    ship_docs = [p for p in _doc_files() if p.relative_to(ROOT).as_posix() not in internal_docs]
+    assert len(ship_docs) >= 12, f"只扫到 {len(ship_docs)} 篇随包文档，这条检查的范围不对"
+    repo_paths = _repo_relpaths()
+    # 文档里提**生成物**路径是正常的（`webui/dist/index.html`、`installer/Output/*.exe`），
+    # 它们本来就是「跑一下构建才会有」，不入库也不进包。豁免只看目录前缀，
+    # 且**只豁免非脚本**（否则 `build/work/*.py` 这种「发布工具自己不在包里」就漏掉了）。
+    generated_prefixes = ("webui/dist/", "installer/Output/", "build/")
+    assert len(internal_docs) >= 3, f"只读到 {len(internal_docs)} 个不随包分发的文档：{sorted(internal_docs)}"
+    dangling: list[str] = []
+    points_internal: list[str] = []
+    for doc in ship_docs:
+        # CHANGELOG 提已删名字是它的本职（和第三类同一个理由），但指内部文档不是。
+        msgs = _scan_ship_pointers(
+            doc.read_text(encoding="utf-8", errors="ignore"),
+            internal_docs,
+            repo_paths,
+            exempt_missing=(doc.name == "CHANGELOG.md"),
+            generated=generated_prefixes,
+        )
+        rel_doc = doc.relative_to(ROOT).as_posix()
+        for m in msgs:
+            # 两类分开报：「指到仓库里没有的文件」与「指到不入库的内部记录 / 它的代号」
+            # 是两种病，后者是隐私与文档诚实问题，不是「路径写错了」。
+            internalish = m.startswith("指向不随包分发") or m.startswith("提到内部记录的代号")
+            (points_internal if internalish else dangling).append(f"{rel_doc} {m}")
+    dangling = sorted(set(dangling))
+    points_internal = sorted(set(points_internal))
+
+    planted_ship = _scan_ship_pointers(
+        "\n".join([
+            r"跑 `scripts/gone_probe.py`；`scripts\live.py` 在包里；"
+            r"`scripts\verify-flow.mjs` 在 cd webui 后跑，尾段能兑现；`webui\dist\index.html` 是生成物。",
+            r"参照 `docs\INTERNAL-NOTE.md` §9.2。",
+            r"详情见 `docs\INTERNAL-NOTE.md`（不随仓库分发）。",
+            r"发布流程写的是跑 `build\work\sync_probe.py`。",
+            r"取证见 `内部取证明细` §9.5。",
+        ]),
+        {"docs/INTERNAL-NOTE.md"},
+        {"scripts/live.py", "webui/scripts/verify-flow.mjs", "docs/KEEP.md"},
+        generated=("webui/dist/",),
+    )
+    assert planted_ship == [
+        "指向仓里根本没有的 scripts/gone_probe.py（第 1 行）",
+        "指向不随包分发的 docs/INTERNAL-NOTE.md（第 2 行）",
+        # 带了「不随仓库分发」声明的那一行现在也报：诚实的括号挡不住读者打不开文件
+        "指向不随包分发的 docs/INTERNAL-NOTE.md（第 3 行）",
+        "指向仓里根本没有的 build/work/sync_probe.py（第 4 行）",
+        "提到内部记录的代号「内部取证明细」（第 5 行）",
+    ], f"文档路径对照失败：{planted_ship}"
+
+    # 阴性对照：提一句「本地日志不入库」但不拿它当出处，不得被误报
+    # （否则下一轮所有人都会为了避开这条守卫而把取证句子删干净）。
+    clean_ship = _scan_ship_pointers(
+        "跑 `scripts/live.py`；契约见 `docs/KEEP.md`；原始跑动日志不入库，所以不作出处。",
+        {"docs/INTERNAL-NOTE.md"},
+        {"scripts/live.py", "webui/scripts/verify-flow.mjs", "docs/KEEP.md"},
+    )
+    assert not clean_ship, f"合法写法被误报：{clean_ship}"
+
+    # 两类问题一次全报：分两条断言时，死代码会遮蔽废导入（实测投毒时只看到
+    # 前者，后者要等前者修干净才露出来），一轮约等于只查了一半。
+    problems = []
+    if dead:
+        problems.append("这些顶层名字除了定义那一行再没有任何代码引用（要么接上、要么删掉）：" + "；".join(dead))
+    if unused_imports:
+        problems.append("产品代码里有导入却不用的名字（白增启动开销与体积）：" + "；".join(unused_imports))
+    if stale_docs:
+        problems.append("文档写着 `module.xxx()` 但产品里已经没这个名字：" + "；".join(stale_docs))
+    if pkg_map:
+        problems.append("包结构清单与真实模块不符：" + "；".join(pkg_map))
+    if dangling:
+        problems.append("随包分发的文档指向仓里找不到的文件（别人照文档跑就会死）：" + "；".join(dangling))
+    if points_internal:
+        problems.append("公开文档指着不随包分发的内部记录：" + "；".join(points_internal))
+    assert not problems, "\n".join(problems)
+    return (
+        f"{len(product_py)} 个产品模块 + {len(web_ts)} 个前端文件的顶层名字全部有人引用，"
+        f"{len(doc_files)} 篇文档里的 `module.func()` 引用全部对得上代码，"
+        f"包结构清单与真实 {len(pkg_real)} 个模块逐条一致，"
+        f"{len(ship_docs)} 篇随包文档里指到仓库的路径全部落得在地上（全仓可指 {len(repo_paths)} 个文件），"
+        "且不拿不入库的内部记录当出处"
+        "（含阳性对照与按文件判的未用导入检查）"
+    )
+
+
+_DOC_PATH_TOKEN = re.compile(
+    r"(?<![\w./\\-])((?:src|webui|scripts|docs|installer|\.github|build)[\\/][\w.\-]+(?:[\\/][\w.\-]+)*"
+    r"\.(?:py|ps1|mjs|md|json|iss|txt|tsx|ts|yml|html|spec|scad))"
+)
+# `build` 为什么要在前缀里：这条守卫要抓的头条缺陷就是「文档指着 `build\work\*.py`」，
+# 不列 build 它连 token 都扫不到（实测投毒方向报 0 条 —— 一条什么都没抓到的守卫）。
+# 下面 `_scan_ship_pointers` 里的生成物豁免只放非脚本，所以 `build\...\python.exe` 不会被误杀。
+
+# 内部记录的**代号**（不是文件名，是文档里用来指它的那个名字）。为什么要一起禁：
+# 「见 `内部取证明细` §9.5」连 `.md` 都没有，路径对照根本扫不到；上一轮就是把 §号 的
+# 判据收紧才发现随包文档里有 32 处这种指针 —— 读者拿到的是一条永远打不开的出处。
+_INTERNAL_ALIASES = ("内部取证明细",)
+
+
+def _internal_doc_paths() -> set[str]:
+    """不随包分发的内部记录清单（posix 相对路径）—— 只从 export_source.ps1 读。
+
+    为什么不在这里再写一份：「什么是公开的」只能有一个定义。两边各写一份的话，
+    漂移不会报错，只会一直漂到某人把内部记录推上公开仓库那天。
+    """
+    ps1 = (ROOT / "scripts" / "export_source.ps1").read_text(encoding="utf-8", errors="ignore")
+    m = re.search(r"\$internalDocs\s*=\s*@\(([^)]*)\)", ps1)
+    assert m, "export_source.ps1 里没读到 $internalDocs 清单，这条检查等于没跑"
+    names = set(re.findall(r"'([^']+?)'", m.group(1)))
+    assert names, f"$internalDocs 里解出 0 个名字，这条检查等于没跑：{m.group(1)[:120]!r}"
+    return {n.replace("\\", "/") for n in names}
+
+
+def _repo_relpaths() -> set[str]:
+    """仓库里真的存在的文件（剪掉 build/ node_modules/ .git/ dist/ 这些不入库的）。"""
+    import os
+
+    pruned = {"build", "node_modules", ".git", "__pycache__", ".pytest_cache", ".venv", "venv"}
+    out: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in pruned]
+        for fn in filenames:
+            rel = (Path(dirpath) / fn).relative_to(ROOT).as_posix()
+            if rel.startswith("webui/dist/"):
+                continue
+            out.add(rel)
+    return out
+
+
+def _scan_ship_pointers(
+    text: str, internal: set[str], repo_paths: set[str], exempt_missing: bool = False,
+    generated: tuple[str, ...] = (),
+) -> list[str]:
+    r"""一篇文档里的仓库路径引用与内部记录代号，哪些指不到东西。
+
+    真检查与阳性对照共用这一份实现 —— 判据写成两份的话，对照验的是另一套规则，
+    「对照通过」就不能证明真检查会报什么。
+
+    只用尾段在全仓兑现（`p.endswith("/" + rel)`），不去推 `cd` 后的 cwd：文档里
+    `cd webui` + `node scripts\x.mjs` 是对的，要求它写全路径只会逼人把文档改得更冗长。
+    这条守卫抓的是「彻底指不到」与「指到不进包的内部记录」，不是「写得不够全」。
+    """
+    out: list[str] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        for alias in _INTERNAL_ALIASES:
+            if alias in line:
+                out.append(f"提到内部记录的代号「{alias}」（第 {lineno} 行）")
+        for tok in dict.fromkeys(_DOC_PATH_TOKEN.findall(line)):
+            rel = tok.replace("\\", "/")
+            if rel.startswith(generated) and not rel.endswith((".py", ".ps1", ".mjs")):
+                # 生成物目录里的「非脚本」可以提（`build\venv\...\python.exe` 是解释器、
+                # `webui\dist\index.html` / `installer\Output\*.exe` 是产物）；但**脚本不算**：
+                # 指 `build\work\something.py` 就是指一个 clone 下来根本不会存在的代码。
+                continue
+            if rel in internal:
+                # 「同行写了不随仓库分发」不再豁免：说明它不在包里仍然是一条别人打不开的
+                # 出处。随包文档只能指随包分发的东西，改了这一条才不会出现
+                # 「文档里每个指针都指向仓库外的东西」（1.0.3 那轮清掉 32 处内部指针时定下的口径）。
+                out.append(f"指向不随包分发的 {rel}（第 {lineno} 行）")
+            elif exempt_missing:
+                continue
+            elif not any(p == rel or p.endswith("/" + rel) for p in repo_paths):
+                out.append(f"指向仓里根本没有的 {rel}（第 {lineno} 行）")
+    return out
+
+
+def _scan_package_map(init_text: str, real_names: set[str]) -> list[str]:
+    """比对包 `__init__.py` 里「包结构」清单与真实模块名，双向都要对上。
+
+    清单行的形状是「四个空格 + 名字 + （可选的 `/*` 子包写法）+ 至少两个空格 + 说明」。
+    之所以不做「只查已列出的名字存不存在」的单向检查：
+    少列一个新模块同样是这张地图骗人（实测这一轮就漏了 11 个新模块）。
+    """
+    import re
+
+    out: list[str] = []
+    listed_keys: set[str] = set()
+    for m in re.finditer(r"^[ \t]{4}([a-z_][a-z0-9_]*)(?:/\*)?[ \t]{2,}\S", init_text, re.M):
+        name = m.group(1)
+        listed_keys.add(name)
+        if name not in real_names:
+            out.append(f"清单里的 `{name}` 在包里不存在")
+    for name in sorted(real_names - listed_keys):
+        out.append(f"`{name}` 没写进包结构清单")
+    return out
+
+
+def _scan_dead_python_symbols(src: str, ast_mod) -> list[tuple[str, int]]:
+    """返回模块级「函数/类/大写常量」的名字与行号（带装饰器的跳过）。"""
+    try:
+        tree = ast_mod.parse(src)
+    except SyntaxError:
+        return []
+    out: list[tuple[str, int]] = []
+    for node in tree.body:
+        names: list[str] = []
+        if isinstance(node, (ast_mod.FunctionDef, ast_mod.AsyncFunctionDef, ast_mod.ClassDef)):
+            if node.decorator_list:  # 框架按装饰器注册，名字不会出现在调用处
+                continue
+            names.append(node.name)
+        elif isinstance(node, ast_mod.Assign):
+            names += [t.id for t in node.targets if isinstance(t, ast_mod.Name) and t.id.isupper()]
+        elif isinstance(node, ast_mod.AnnAssign) and isinstance(node.target, ast_mod.Name):
+            if node.target.id.isupper():
+                names.append(node.target.id)
+        out += [(n, node.lineno) for n in names if not n.startswith("__")]
+    return out
+
+
+def _scan_unused_imports(src: str, ast_mod) -> list[tuple[str, int]]:
+    """返回「导入了但整个文件再也没出现」的名字（不含 __future__）。"""
+    import re
+
+    try:
+        tree = ast_mod.parse(src)
+    except SyntaxError:
+        return []
+    stripped = "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+    out: list[tuple[str, int]] = []
+    for node in ast_mod.walk(tree):
+        if not isinstance(node, (ast_mod.Import, ast_mod.ImportFrom)):
+            continue
+        if isinstance(node, ast_mod.ImportFrom) and node.module == "__future__":
+            continue
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            binding = alias.asname or alias.name.split(".")[0]
+            if binding == "annotations":
+                continue
+            if len(re.findall(r"(?<![\w$])" + re.escape(binding) + r"(?![\w$])", stripped)) <= 1:
+                out.append((binding, node.lineno))
+    return out
+
+
+def _unused_imports(src: str, path, texts: dict, ast_mod) -> list[tuple[int, str]]:
+    """本文件确实没用到、且不是「故意留着」的导入。返回 (行号, 名字)。
+
+    为什么不能拿全仓引用次数当过滤器（上一版的坑）：一个导入只会在**它自己的文件**
+    里被用；`import tempfile` 在别的文件出现一百次，也不能替本文件那一次没用到辩护。
+    叠上全仓过滤器后，实测产品里 9 处废导入（tempfile/json/socket/time/field/
+    Callable/extract_numbers/read_triangles/winforms）全部静默过关。
+
+    豁免只有三种，每一种都要有**写在代码里的凭据**，不接受「名字在别处也出现过」：
+      1. 那一行标了 `# noqa: F401`（只为副作用 / 只为探测存在而导入）；
+      2. 名字在本模块 `__all__` 里（显式再导出）；
+      3. 别的模块真的写着 `from .本模块 import … 名字`（隐式再导出有人依赖）。
+    """
+    import re
+
+    try:
+        tree = ast_mod.parse(src)
+    except SyntaxError:
+        return []
+
+    exported: set[str] = set()
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, (ast_mod.Assign, ast_mod.AnnAssign)):
+            continue
+        value = node.value
+        if not isinstance(value, (ast_mod.List, ast_mod.Tuple)):
+            continue
+        targets = node.targets if isinstance(node, ast_mod.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast_mod.Name) and target.id == "__all__":
+                exported |= {
+                    e.value for e in value.elts if isinstance(e, ast_mod.Constant) and isinstance(e.value, str)
+                }
+
+    consumed: set[tuple[str, str]] = set()
+    stmt_re = re.compile(r"from\s+[\w.]*\b(\w+)\s+import\s+(\((?:[^()]|\n)*\)|[^\n#]*)")
+    for other_path, other in texts.items():
+        if other_path == path:
+            continue
+        for m in stmt_re.finditer(other):
+            for member in re.findall(r"[A-Za-z_]\w*", m.group(2)):
+                consumed.add((m.group(1), member))
+
+    lines = src.splitlines()
+    stem = path.stem
+    out: list[tuple[int, str]] = []
+    for name, lineno in _scan_unused_imports(src, ast_mod):
+        stmt_line = lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+        if re.search(r"#\s*noqa:\s*F401\b", stmt_line):
+            continue
+        if name in exported or (stem, name) in consumed:
+            continue
+        out.append((lineno, name))
+    return out
+
+
+def _scan_stale_doc_refs(doc_text: str, defined: dict[str, str]) -> list[tuple[int, str]]:
+    """文档里的 `module.member()`：module 是产品模块时，member 必须真在那个模块里。
+
+    只认这种「点号加括号」的确定形式，所以第三方 API（`os.getcwd()`、`subprocess.run()`）
+    因为 module 不在产品模块表里而天然跳过 —— 不需要维护白名单，也不会误杀外部文档。
+    实测全仓 39 处这类引用，噪音 0（唯一一处就是本轮删掉的 openscad 签名函数）。
+    """
+    import re
+
+    out: list[tuple[int, str]] = []
+    for m in re.finditer(r"(?<![\w.])([a-z_][a-z0-9_]{2,})\.([A-Za-z_]\w*)\(\)", doc_text):
+        stem, member = m.group(1), m.group(2)
+        body = defined.get(stem)
+        if body is None:
+            continue
+        if not re.search(r"(?<![\w$])" + re.escape(member) + r"(?![\w$])", body):
+            out.append((doc_text[: m.start()].count("\n") + 1, f"{stem}.{member}()"))
+    return out
+
+
+def _doc_files() -> "list[Path]":
+    """会被扫描的文档集（`module.func()` 引用与 `§号` 引用共用一份清单）。
+
+    两处各写一份清单，早晚会一份多一份少 —— 那等于守卫在盯着一张没人维护的列表。
+    这里**含** CHANGELOG：章节引用对历史记录同样成立（它只豁免「提到已删函数」这一类）。
+    """
+    wanted = [
+        *sorted((ROOT / "docs").glob("*.md")),
+        ROOT / "README.md",
+        ROOT / "README.en.md",
+        ROOT / "README-开发者.md",
+        ROOT / "README-用户.md",
+        ROOT / "SECURITY.md",
+        ROOT / "CONTRIBUTING.md",
+        ROOT / "CODE_OF_CONDUCT.md",
+        ROOT / "CHANGELOG.md",
+        ROOT / "scripts" / "probes" / "README.md",
+    ]
+    return [p for p in wanted if p.is_file()]
+
+
+_DOC_HEADING = re.compile(r"(?m)^#{1,4}\s*(\d+(?:\.\d+)?)\.?\s")
+_DOC_REF = re.compile(r"§\s*(\d+(?:\.\d+)?)")
+_DOC_NAME_BEFORE = re.compile(r"[\w\-./]*\.md")
+# 按名字指自己人写的章节：见下面「XXX」段。写错名字时它比 §号更阴 —— 没人会去搜。
+_DOC_NAMED_REF = re.compile(r"「([^」\n]{2,30})」(?:段|小节)")
+_DOC_HEADING_TEXT = re.compile(r"(?m)^#{1,6}\s+(.+?)\s*$")
+
+
+def _heading_titles(text: str) -> set[str]:
+    """标题正文，去掉 markdown 记号与空白 —— 只用来做包含判断，宁可宽不要误伤。"""
+    out: set[str] = set()
+    for m in _DOC_HEADING_TEXT.finditer(text):
+        title = m.group(1).replace("`", "").replace("*", "").strip()
+        out.add(title)
+        out.add(title.replace(" ", ""))
+    return out
+
+
+def _named_title_exists(name: str, titles: set[str]) -> bool:
+    want = name.replace(" ", "").strip()
+    return any(want and (want in t or want in t.replace(" ", "")) for t in titles)
+
+
+def _scan_named_section_refs(
+    text: str, own_name: str, titles_of: dict[str, set[str]]
+) -> list[tuple[int, str]]:
+    """每一条「X」段 / 「X」小节：X 必须是本文件（或引用处前 60 字写明的那份 .md）的真标题。"""
+    out: list[tuple[int, str]] = []
+    own = titles_of.get(own_name, set())
+    for m in _DOC_NAMED_REF.finditer(text):
+        name = m.group(1).strip()
+        if _named_title_exists(name, own):
+            continue
+        ln = text[: m.start()].count("\n") + 1
+        named = _DOC_NAME_BEFORE.findall(text[max(0, m.start() - 60): m.start()])
+        if not named:
+            out.append((ln, f"「{name}」段 在本文件里找不到这个标题，引用处前 60 字内也没写是哪份 .md"))
+            continue
+        key = Path(named[-1]).name
+        titles = titles_of.get(key)
+        if titles is not None and _named_title_exists(name, titles):
+            continue
+        where = "那里没有这个标题" if titles is not None else "但它不在扫描集里（文件名写错了？）"
+        out.append((ln, f"「{name}」段 指向 {key}，{where}"))
+    return out
+
+
+def _scan_section_refs(text: str, own_name: str, heads_of: dict[str, set[str]]) -> list[tuple[int, str]]:
+    """每一条 `§N` / `§N.M`：或者就是**本文件**的编号标题，或者引用处前面写了是哪份 `.md`。"""
+    out: list[tuple[int, str]] = []
+    own = heads_of.get(own_name, set())
+    for m in _DOC_REF.finditer(text):
+        ref = m.group(1)
+        if ref in own:
+            continue
+        ln = text[: m.start()].count("\n") + 1
+        named = _DOC_NAME_BEFORE.findall(text[max(0, m.start() - 60): m.start()])
+        if not named:
+            out.append((ln, f"§{ref} 在本文件里没有这个编号标题，引用处前 60 字内也没写是哪份 .md"))
+            continue
+        key = Path(named[-1]).name
+        heads = heads_of.get(key)
+        if heads is not None and ref in heads:
+            continue
+        where = "那里没有这个编号标题" if heads is not None else "但它不在扫描集里（文件名写错了？）"
+        out.append((ln, f"§{ref} 指向 {key}，{where}"))
+    return out
+
+
+def _scan_heading_order(text: str) -> list[tuple[int, str]]:
+    """编号标题必须按升序出现，子节的父号必须就是当前那节 —— 顺序倒了读者会先撞见后一节。
+
+    「节」是文里**最浅**的那一层编号标题：有人写 `## 1.`（COMPETITIVE-GAPS），
+    有人写 `# 1.` + `## 1.1`（USER_GUIDE）。写死成 `##` 会把后者整篇误报成孤儿子节
+    —— 这个误伤在首跑就撞上了（33 条），所以它现在也是一条阴性对照。
+    """
+    found = list(re.finditer(r"(?m)^(#{1,4})\s*(\d+)(?:\.(\d+))?\.?\s", text))
+    if not found:
+        return []
+    top_level = min(len(m.group(1)) for m in found)
+    out: list[tuple[int, str]] = []
+    top = 0
+    for m in found:
+        level, first, second = len(m.group(1)), int(m.group(2)), m.group(3)
+        ln = text[: m.start()].count("\n") + 1
+        if level == top_level:
+            if first < top:
+                out.append((ln, f"{m.group(0).strip()} 排到了上一节（#{top_level} {top}.）后面，章节顺序倒了"))
+            top = max(top, first)
+        elif second is not None and first != top:
+            out.append((ln, f"{m.group(0).strip()} 的父号不是当前那节（#{top_level} {top}.）"))
+    return out
+
+
+def t_doc_section_refs() -> str:
+    """文档章节引用（`§号` 与「按名字指的段」）必须指得到真标题，编号章节不得倒着排。
+
+    为什么补这一条：本轮写文档时先写下了 `§9.1`/`§9.3` 的前向引用，章节本身却还没落地；
+    同一篇文档的 `## 8` 又物理排在 `## 6` 前面 —— 都是「文档骗人」，和已删函数的引用同一类。
+    已有的守卫只盯 `module.func()` 这种点号形式，管不到 `§号`。靠人记得查不如写成守卫。
+
+    名字引用是同一轮里拓出来的第二种句式：CHANGELOG 写了「见下面『守卫与验收的实测数据』段」
+    而那个标题根本不存在 —— `§号` 的正管不到它，因为它是按中文标题指人的。
+    """
+    docs = _doc_files()
+    bodies = {p: p.read_text(encoding="utf-8", errors="ignore") for p in docs}
+    heads_of = {p.name: set(_DOC_HEADING.findall(t)) for p, t in bodies.items()}
+    titles_of = {p.name: _heading_titles(t) for p, t in bodies.items()}
+
+    findings: list[str] = []
+    scanned = 0
+    scanned_named = 0
+    for p in docs:
+        text = bodies[p]
+        scanned += len(_DOC_REF.findall(text))
+        scanned_named += len(_DOC_NAMED_REF.findall(text))
+        for ln, why in _scan_section_refs(text, p.name, heads_of):
+            findings.append(f"{p.relative_to(ROOT)}:{ln} {why}")
+        for ln, why in _scan_named_section_refs(text, p.name, titles_of):
+            findings.append(f"{p.relative_to(ROOT)}:{ln} {why}")
+        for ln, why in _scan_heading_order(text):
+            findings.append(f"{p.relative_to(ROOT)}:{ln} {why}")
+
+    # 双向对照（阴性在前）：合法写法不得报，否则这条守卫每轮都在制造假工作。
+    fake_heads = {"probe.md": {"1", "2", "2.1"}, "USER_GUIDE.md": {"2.2"}}
+    clean = _scan_section_refs(
+        "本节见 §2.1；另见 §1。跨文件要写全：docs/USER_GUIDE.md §2.2。",
+        "probe.md",
+        fake_heads,
+    )
+    assert not clean, f"合法引用被误报：{clean}"
+    dirty = _scan_section_refs(
+        "悬空的前向引用 §9.1；指向别的文档但那里没有：docs/USER_GUIDE.md §7.7；"
+        "没写文件名：§40.4；写对了的：§2。",
+        "probe.md",
+        fake_heads,
+    )
+    assert [ln for ln, _ in dirty] == [1, 1, 1], f"投毒没被全抓到（应 3 条）：{dirty}"
+    order_bad = _scan_heading_order("## 1. a\n## 3. b\n## 2. c\n")
+    assert len(order_bad) == 1 and "顺序倒了" in order_bad[0][1], f"章节倒序没抓到：{order_bad}"
+    assert not _scan_heading_order("## 1. a\n### 1.1 x\n## 2. b\n### 2.3 y\n"), "正常编号被判成倒序"
+    assert _scan_heading_order("## 1. a\n### 2.1 x\n"), "孤儿子节没抓到"
+    # H1 当节、H2 当子节（USER_GUIDE 的写法）：不得误报，但真挂错了要报
+    assert not _scan_heading_order("# 1. a\n## 1.1 x\n# 2. b\n## 2.9 y\n"), "一级标题当节时被误伤"
+    assert len(_scan_heading_order("# 1. a\n## 2.1 x\n")) == 1, "一级标题下的孤儿子节没抓到"
+
+    # 按名字指章节：只抽了一种句式，不抽就等于没守（本轮真写过一条悬空的）
+    fake_titles = {"probe.md": _heading_titles("## 9. 守卫\n### 9.2 单实例锁的实测\n")}
+    clean_named = _scan_named_section_refs(
+        "机制见下面「守卫」段；子节写「单实例锁的实测」小节；跨文件：docs/USER_GUIDE.md 的「安装」段。",
+        "probe.md",
+        {**fake_titles, "USER_GUIDE.md": _heading_titles("## 安装\n")},
+    )
+    assert not clean_named, f"合法的名字引用被误报：{clean_named}"
+    dirty_named = _scan_named_section_refs(
+        "见下面「守卫与验收的实测数据」段；跨文件指错：docs/USER_GUIDE.md 的「没写过」段。",
+        "probe.md",
+        fake_titles,
+    )
+    assert len(dirty_named) == 2, f"悬空的名字引用没全抓到（应 2 条）：{dirty_named}"
+
+    assert scanned >= 40, f"只扫到 {scanned} 处 §引用，多半是正则或文档集坏了（空跑的守卫最危险）"
+    assert scanned_named >= 1, (
+        f"扫到 {scanned_named} 处「X」段引用，正则或文档集坏了 —— 从没跑过样本的守卫比没守卫更危险"
+    )
+    assert not findings, "文档里有指不到标题的引用：\n" + "\n".join(findings)
+    return (
+        f"{len(docs)} 篇文档 / {scanned} 处 §引用 + {scanned_named} 处按名字指的「X」段全部指得到真标题，"
+        "编号章节无倒序（含 §号悬空、§号跨文件指错、名字指错、孤儿子节四类投毒与两类阴性对照）"
+    )
+
+
 def t_design_mechanism() -> str:
     """运行「设计规格与改动校验」的专项自检（确定性，不调用 AI）。
 
     这套机制单独放在 selfcheck_design.py 里便于针对性运行；
     这里把它纳入构建流程，确保「只改该改的」在每次构建时都被验证过 ——
     它直接决定「改完会不会变差」，是产品体验的核心。
-    """
-    import subprocess
-    import sys as _sys
 
-    script = ROOT / "scripts" / "selfcheck_design.py"
-    assert script.is_file(), f"缺少专项自检脚本：{script}"
-    proc = subprocess.run(
-        [_sys.executable, "-u", str(script)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=300,
-    )
-    output = (proc.stdout or "") + (proc.stderr or "")
-    if proc.returncode != 0:
+    跑法接在 `_design_run()` 上（结果缓存）：「文档里的自检项数与真源一致」要用
+    它**真跑出来的** `[OK]` 条数当尺子，两处各跑一遍就是白白多等 3 秒。
+    """
+    rc, output = _design_run()
+    if rc != 0:
         tail = "\n".join(output.strip().splitlines()[-12:])
         raise AssertionError("设计规格与改动校验自检未通过：\n" + tail)
     return f"{output.count('[OK]')} 项设计机制检查全部通过"
 
 
 def t_installer_metadata() -> str:
-    """安装器必须带上品牌图标与版本元数据（否则在系统里就是"无名软件"）。"""
+    """安装器必须带上品牌图标与版本元数据（否则在系统里就是"无名软件"）。
+
+    版本号这里额外钉一件事：**只能有一个来源**。实测漂移过 —— version.py 已经是
+    1.0.1、.iss 还写着 1.0.0，于是「程序和功能」里、exe 属性里都是错版本，
+    而用户报障时报的也是这个号（1.0.1 的修复因此被多对了一个版本）。
+    现在 version.py 是唯一事实来源，.iss 里那个只在手编时生效的兜底值必须「一眼假」：
+    填一个看着像发布版的数字，手编就会带着错号出厂且没人发现。
+    """
     iss = (ROOT / "installer" / "AI-3D-Forge.iss").read_text(encoding="utf-8")
     for directive in (
         "SetupIconFile=",
@@ -3478,7 +9255,32 @@ def t_installer_metadata() -> str:
     # 图标文件必须真实存在，否则编译会失败
     icon = ROOT / "build" / "AI-3D-Forge.ico"
     assert icon.is_file(), f"安装器引用的图标不存在：{icon}"
-    return "图标/发布者/卸载项/许可证/默认目录 均已声明"
+
+    # ---- 版本单一来源 ----
+    import re
+
+    ps1 = (ROOT / "scripts" / "build_installer.ps1").read_text(encoding="utf-8")
+    assert "src\\aiforge\\version.py" in ps1, "build_installer.ps1 不再从 version.py 读版本"
+    assert "/DAppVersion=$AppVersion" in ps1, "build_installer.ps1 没把版本传给 ISCC（手编会拿到兜底值）"
+
+    from aiforge.version import APP_VERSION
+
+    fallback = re.search(r'#ifndef\s+AppVersion\s*\n\s*#define\s+AppVersion\s+"([^"]*)"', iss)
+    assert fallback, (
+        "`.iss` 里 `#ifndef AppVersion` 的结构变了：没有这层保护，"
+        "命令行传进来的版本会被文件里的 #define 静默顶掉（就是当初漂移的成因）"
+    )
+    sentinel = fallback.group(1)
+    assert sentinel != APP_VERSION, (
+        f".iss 的兜底版本又变成了真实版本号 {sentinel}：下次升版就会漂"
+    )
+    assert re.fullmatch(r"0\.0\.0-[^\"\s]+", sentinel), (
+        f".iss 的兜底版本是 {sentinel!r}，不是一眼假的占位号（应为 0.0.0-hand-compile）"
+    )
+    return (
+        f"图标/发布者/卸载项/许可证/默认目录均已声明；版本单一来源 version.py={APP_VERSION}，"
+        f".iss 兜底为 {sentinel}"
+    )
 
 
 def t_paths() -> str:
@@ -3521,15 +9323,17 @@ def _shipped_text_files() -> "list[Path]":
 
 
 def t_source_encoding() -> str:
-    """提交集里的文本文件不能有 BOM、替换字符或 GBK 乱码。
+    """提交集里的文本文件不能有 BOM、替换字符、GBK 乱码，行尾还得统一。
 
     为什么必须自动化：编码损坏是**静默**的 —— 代码照样能跑、测试照样能过，
-    只有用户看到乱码报错时才暴露。实测踩到两次：
+    只有用户看到乱码报错时才暴露。实测踩过三轮：
       * 用 PowerShell 的 `Get-Content | Set-Content` 往返一个 .py 文件，
         PS 5.1 按 ANSI 代码页读 UTF-8，中文全变乱码，而且行尾的中文字节被吃掉、
         把 16 行**合并**了 7 处（306 行变 290 行）—— 代码语义已经错了；
-      * 文档里一行示例路径被写成了 U+FFFD（原字节不可恢复）。
-    两次都是「看着像成功、实际已损坏」，只有扫描才能挡住。
+      * 文档里一行示例路径被写成了 U+FFFD（原字节不可恢复）；
+      * 一次工具写入把 27 个提交文件写成了 CRLF 行尾（仓库约定是 LF），
+        代码照跑、测试照过，只有 diff 满屏空白变动时才被人看见。
+    三次都是「看着像成功、实际已损坏」，只有扫描才能挡住。
     """
     # 这些字符只在「GBK 误读 UTF-8 中文」的产物里成堆出现，正常中文里几乎见不到。
     # 刻意用码点构造而不是字面量：否则本文件自己就带着一堆疑似乱码字符，
@@ -3551,6 +9355,15 @@ def t_source_encoding() -> str:
         scanned += 1
         if raw[:3] == b"\xef\xbb\xbf":
             problems.append(f"{rel}: 文件带 UTF-8 BOM（本项目一律无 BOM）")
+        # 行尾：.gitattributes 写的是 `* text=auto eol=lf`，所以提交集必须是 LF；
+        # .bat/.cmd 反过来必须 CRLF（cmd.exe 对 LF 批处理有历史毛病）。
+        # 注意只能查字节：`read_text()` 默认会把行尾归一化，CRLF 就这么溜过去了。
+        has_crlf = b"\r\n" in raw
+        if path.suffix.lower() in (".bat", ".cmd"):
+            if not has_crlf:
+                problems.append(f"{rel}: .bat/.cmd 应当用 CRLF（cmd.exe 的历史毛病），实际是 LF")
+        elif has_crlf:
+            problems.append(f"{rel}: 含 CRLF 行尾，仓库约定（.gitattributes eol=lf）是 LF")
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -3587,7 +9400,7 @@ def t_source_encoding() -> str:
         f"只扫到 {scanned} 个提交文本文件，明显不对"
         "（仓库是不是被放在 build/ 之类的被跳过目录下了？）"
     )
-    return f"{scanned} 个提交文本文件：无 BOM、无 U+FFFD、无乱码字符"
+    return f"{scanned} 个提交文本文件：无 BOM、无 U+FFFD、无乱码字符、行尾统一"
 
 
 def t_no_personal_paths() -> str:
@@ -3673,6 +9486,192 @@ def t_no_secrets() -> str:
     return f"未发现密钥/令牌/口令/本机路径（{scanned or '已扫描提交集'}）"
 
 
+def t_secret_scanner_not_blind() -> str:
+    """密钥扫描器本身不许"瞎"：中文名文件必须真的进了扫描集合。
+
+    为什么单独一条：`check_no_secrets.py` 是开源前最后一道密钥闸门，而它曾经
+    对两份中文名文档（`README-开发者.md` 188KB、`README-用户.md`）**完全失明** ——
+    `git ls-files` 默认 `core.quotepath=true` 会把非 ASCII 路径转义成
+    `"\\346\\226\\207..."`，还原出的 Path 在磁盘上不存在，`is_file()` 为假，
+    于是被当作"不是文件"静静跳过。扫描照样打印"已扫描 180 个文本文件"、
+    结论照样是 NO_SECRET_FOUND —— 写在那两份文件里的真 Key 能一路绿灯发出去。
+
+    这类缺陷的特征就是**静默**，所以只能靠断言把它钉住，不能靠"跑一遍没报错"。
+    这里做双向验证（阴性在前，防止把合法写法判成错）：
+      * 阳性 —— 磁盘上真实存在的中文名文件，出现在 `shipped_files()` 里；
+      * 阴性 —— 八进制转义形式的路径**不该**被当成已存在的文件。
+    """
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:
+        import check_no_secrets as cns
+    finally:
+        sys.path.pop(0)
+
+    # 阴性对照先跑：转义路径在磁盘上不存在，不该混进扫描集合。
+    escaped = '"2\\346\\234\\21020\\346\\227\\245(1)/x.mp4"'
+    assert not (ROOT / escaped).is_file(), (
+        f"转义路径竟然存在于磁盘上，_git() 的解码假设已变：{escaped}"
+    )
+
+    scanned_names = {p.name for p in cns.shipped_files()}
+    chinese_docs = [
+        p for p in sorted(ROOT.glob("*.md")) if not p.name.isascii()
+    ]
+    # 阴性对照：仓库里确实有中文名文档（本项目有），否则这条断言是空跑的。
+    assert chinese_docs, "根目录一份中文名 .md 都没有 —— 仓库结构变了，这条守卫失去意义"
+    missing = [p.name for p in chinese_docs if p.name not in scanned_names]
+    assert not missing, (
+        "这些中文名文件没进密钥扫描集合（core.quotepath 又变回 true 了？）："
+        + "、".join(missing)
+    )
+    # 投毒对照：把一条八进制转义路径塞进去，必须认不出来（否则守卫是常亮的）。
+    assert not (ROOT / escaped).exists(), "投毒样本竟真实存在"
+
+    return (
+        f"{len(chinese_docs)} 份中文名文档（{'、'.join(p.name for p in chinese_docs)}）"
+        f"都在扫描集合内；转义路径不会被误当成文件"
+    )
+
+
+# 一次都不许进仓库的扩展名：视频 / 压缩包 / 可执行 / 光盘镜像。
+# 产品截图（.png/.jpg）不在此列 —— 它们是该发布的资产，只放 docs/images/。
+HEAVY_EXTS = (
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv",
+    ".zip", ".7z", ".rar", ".gz", ".xz", ".iso",
+    ".exe", ".dll", ".msi",
+)
+
+
+def t_add_a_wont_grab_heavy_files() -> str:
+    """`git add -A` 会收进来的那个集合，不许出现大文件与视频/压缩包/可执行。
+
+    为什么单独一条：`docs/PUBLISH-TO-GITHUB.md` 规定的提交步骤就是 `git add -A`。
+    本仓库根目录出现过一份与项目无关的 `2月20日(1)/`（43MB 的 mp4 加一张封面 jpg），
+    一次 `git add -A` 就能把它永久写进 git 历史 —— 之后 clone 的人得连这份视频一起
+    下载，而 git 历史里的东西删不干净（要 filter-repo + 强推）。上一轮把规则补进了
+    `.gitignore`，注释里自称「三道一起上：这里忽略、路径守卫拦、导出白名单拦」，
+    可 `grep selfcheck.py` 找不到任何一项量过 git 这道：**规则有没有真生效没人验证**。
+    少一个前导斜杠、目录名打错、被后面某条 `!` 反选覆盖、或者干脆把这一段挪到
+    `build/` 之类规则前面 —— 它都会静默失效，而失效的表现是「什么都没发生」，
+    直到某次提交才炸。
+
+    两种量法互相补位：
+      * 实测集 —— 直接量 `check_no_secrets.shipped_files()`。它就是「git add -A 会
+        收进来的集合」（`--cached --others --exclude-standard`，自动尊重 .gitignore，
+        且带 `core.quotepath=false`），所以不用真去动索引；判体积与扩展名。
+      * 假想路径 —— 用 `git check-ignore --stdin` 问**规则本身**。工作区里现在
+        可能没有那份视频（用户会删），但规则还得对着未来的落盘生效，所以拿不存在的
+        路径去问；这一支不依赖任何文件真的存在。
+
+    阈值全部按实测写，不拍脑袋：当前提交集 189 个文件 / 约 3.6 MB，最大单项
+    就是 `scripts/selfcheck.py` 自己（约 0.5 MB），其中媒体只有 `docs/images/` 三张
+    产品截图。所以单项上限 2 MB（约 4 倍余量）、总量上限 12 MB（约 3 倍余量）——
+    既拦得住 43MB 的视频，也不会把一次正常的大型重构判成失效。
+    """
+    import subprocess as _sp
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:
+        import check_no_secrets as cns
+    finally:
+        sys.path.pop(0)
+
+    max_file = 2 * 1024 * 1024
+    max_total = 12 * 1024 * 1024
+
+    files = cns.shipped_files()
+    # 防空转：集合本身不对（git 没跑起来、退回了目录遍历）时，下面的「0 处违规」毫无意义。
+    assert len(files) >= 120, (
+        f"提交集只有 {len(files)} 个文件（实测 189）—— 尺子不对，"
+        "先查 shipped_files() 是不是又对中文名/未跟踪文件失明了"
+    )
+
+    sizes = {p: (p.stat().st_size if p.is_file() else 0) for p in files}
+    oversized = sorted(
+        (f"{p.relative_to(ROOT).as_posix()} {sizes[p] / 1024 / 1024:.1f}MB"
+         for p in files if sizes[p] > max_file)
+    )
+    assert not oversized, (
+        "这些文件会随 `git add -A` 进仓库且超过 2 MB（实测最大约 0.5 MB，超限的基本都是"
+        "物料/生成物）：\n  " + "\n  ".join(oversized)
+        + "\n要么加进 .gitignore，要么改成产物目录；别靠 export 白名单兜 —— 那挡不住 git。"
+    )
+    total = sum(sizes.values())
+    assert total <= max_total, (
+        f"提交集总量 {total / 1024 / 1024:.2f} MB 超过 12 MB（实测约 3.6 MB）"
+        "—— 仓库正在被当成网盘用，clone 的人会感觉到"
+    )
+    heavy = sorted(
+        p.relative_to(ROOT).as_posix() for p in files
+        if p.suffix.lower() in HEAVY_EXTS
+    )
+    assert not heavy, (
+        "这些视频/压缩包/可执行文件会进仓库（实测提交集里一个都没有）："
+        + "、".join(heavy)
+    )
+
+    def ignored(paths: list[str]) -> set[str]:
+        """问 git：这些路径里哪些会被 .gitignore 挡掉（不碰工作区、不碰索引）。"""
+        proc = _sp.run(
+            # 这里不能用 -v：-v 会把**被 ! 反选救回来**的路径也打成一行
+            # （第三列是 `!/*.mp4`），照“有输出就是被忽略”去解就会把
+            # 反选失效当成规则生效。实测：加一行 `!/*.mp4` 后，-v 仍返
+            # `probe-selfcheck.mp4`，不带 -v 就不返 —— 守卫第一版就是在这上面漏了。
+            ["git", "-c", "core.quotepath=false", "check-ignore", "--stdin"],
+            cwd=str(ROOT),
+            # 必须是 bytes：text=True 会把 \n 翻译成 \r\n，git 收到的路径就带着 \r，
+            # 于是 `/*.mp4` 匹配不上 `probe.mp4\r` —— 实测第一版就是这么假阴的。
+            input="\n".join(paths).encode("utf-8"),
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        hit: set[str] = set()
+        for line in (proc.stdout or b"").decode("utf-8", "replace").splitlines():
+            # 不带 -v 时每行就是一个被忽略的路径（可能带引号，例如含制表符/非 ASCII）
+            name = line.strip().strip('"')
+            if name:
+                hit.add(name)
+        return hit
+
+    # 阳性对照：这些假想路径**必须**被忽略。名字一律取 probe- 前缀，绝不落到磁盘。
+    must_ignore = [
+        "probe-selfcheck.mp4",
+        "probe-selfcheck.webm",
+        "2月20日(1)/probe-inside.mkv",
+        "build/probe-selfcheck.zip",
+        "installer/Output/probe-selfcheck.exe",
+    ]
+    # 阴性对照：这些**必须不**被忽略 —— 忽略规则不许宽到吞掉正常资产
+    # （产品截图就是最容易误伤的一类）。
+    must_keep = [
+        "docs/images/probe-selfcheck.png",
+        "src/aiforge/probe_selfcheck.py",
+        "scripts/probe-selfcheck.mjs",
+        "README-用户.md",
+    ]
+    assert len(must_ignore) >= 4 and len(must_keep) >= 3, "对照集被改小了，这道闸门会被掏空"
+    got = ignored(must_ignore + must_keep)
+    leak = [p for p in must_ignore if p not in got]
+    assert not leak, (
+        ".gitignore 挡不住这些路径，`git add -A` 会真把它们收进去：" + "、".join(leak)
+        + " —— 上一轮补的那几条媒体/私人目录规则已经失效（改坏了或压根没生效）"
+    )
+    over = [p for p in must_keep if p in got]
+    assert not over, (
+        "忽略规则误伤了正常资产，这些该提交的文件不会被 `git add -A` 收进去："
+        + "、".join(over)
+    )
+
+    biggest = max(sizes, key=lambda p: sizes[p])
+    return (
+        f"提交集 {len(files)} 个文件 / {total / 1024 / 1024:.2f} MB，"
+        f"最大单项 {sizes[biggest] / 1024:.0f} KB（{biggest.relative_to(ROOT).as_posix()}），"
+        f"0 个视频/压缩包/可执行；{len(must_ignore)} 条假想媒体路径必被忽略、"
+        f"{len(must_keep)} 条正常资产必不被忽略"
+    )
+
+
 def main() -> int:
     # 默认降低日志噪音：自检脚本会故意触发"AI 返回的不是合法 JSON"这类降级路径，
     # 那些是预期行为，不该在构建输出里看起来像错误。加 --verbose 可看完整日志。
@@ -3695,16 +9694,29 @@ def main() -> int:
 
     section("模块与基础")
     check("模块导入", t_imports)
+    check("无遮蔽的局部导入", t_no_shadowed_imports)
+    check("模块内未定义名字", t_no_undefined_names)
+    check("赋值了却没人读（算了不用）", t_no_dead_assignments)
+    check("代码不养闲人（无死代码/无废导入）", t_no_dead_symbols)
+    check("派生进程必走守护", t_no_unguarded_subprocess)
+    check("subprocess 参数不重名", t_no_kwargs_collision)
+    check("子进程输出不会被解码吃掉", t_subprocess_decoding)
+    check("编译不报警告", t_no_syntax_warnings)
+    check("文档章节引用指得到真标题", t_doc_section_refs)
+    check("文档里的自检项数与真源一致", t_selfcheck_count_documented)
     check("路径与目录", t_paths)
     check("配置与密钥", t_config_and_secrets)
+    check("外观材质与玻璃透明度", t_appearance_settings)
 
     section("安装与运行环境")
     check("WebView2 运行时检测", t_webview_runtime)
     check("应用图标资源", t_icon_assets)
     check("首个启动准备流程", t_first_run_setup)
+    check("单实例锁（真两进程）", t_single_instance)
     check("打包依赖完整性", t_frozen_webview_deps)
     check("浏览器回退体验", t_browser_fallback_notice)
     check("构建脚本纯 ASCII", t_ps1_are_ascii)
+    check("构建脚本不踩 stderr 终止坑", t_ps1_native_stderr)
     check("安装器元数据", t_installer_metadata)
 
     section("SCAD 处理")
@@ -3723,9 +9735,11 @@ def main() -> int:
     check("STL 网格分析", t_mesh_analysis)
     check("STL 读取健壮性", t_stl_robustness)
     check("长分析心跳", t_analysis_heartbeat)
+    check("声明间隙实测与判定降级", t_declared_gap_verdict)
     check("助手调用作用域", t_helper_job_scope)
     check("子进程不变量守护", t_child_process_guard)
     check("守护接线（启动即生效）", t_child_guard_wiring)
+    check("守护存活双向保证", t_child_guard_survival)
     check("安装失败不破坏已有环境", t_install_no_destroy)
     check("换安装目录可回滚", t_install_swap_rollback)
     check("验收脚本不覆盖用户配置", t_install_test_keeps_config)
@@ -3733,12 +9747,39 @@ def main() -> int:
 
     section("业务层")
     check("设计规格与改动机制", t_design_mechanism)
+    check("配合尺寸不冒充整件外形", t_fit_scope_dimension)
+    check("需求复述公布具体取值", t_announce_spec_values)
+    check("规格名↔参数名改名桥", t_name_bridge)
+    check("改动契约语义（只授权该改的）", t_contract_intent)
+    check("整体缩放真的生效", t_user_scale)
+    check("编译报错给出可执行改法", t_compile_advice)
+    check("无控制台时诊断不崩", t_console_streams)
+    check("GBK 控制台不会打断输出", t_console_encoding)
+    check("高 DPI 工作区与窗口尺寸", t_dpi_workarea)
+    check("网格质量采纳判据", t_mesh_quality_adoption)
     check("几何完整性自动修复", t_geometry_repair)
+    check("回退历史版本", t_restore_revision)
+    check("几何修复链路接线", t_repair_wiring)
     check("固定零件库可编译", t_parts_library)
+    check("标准零件确定性直出", t_deterministic_part)
+    check("GLM 提供商支持", t_glm_provider)
+    check("孔径射线实测", t_hole_measure)
+    check("孔径改动判据", t_hole_criterion)
+    check("逐轴尺寸校正兜底", t_axis_dimension_fix)
+    check("零厚度薄膜检测", t_sliver_detection)
+    check("修改提示词携带补充说明", t_modify_prompt_clarifications)
+    check("提供商分槽 Key 与经济档", t_provider_keys_and_economy)
+    check("3MF 导出", t_3mf_export)
+    check("切片软件检测规则", t_slicer_detect)
+    check("底部入口链接可达", t_social_footer_links)
+    check("需求可执行测试（PR/RS/IR）", t_requirement_tests)
+    check("实心底与开口方向判定", t_solid_bottom_verdict)
+    check("质量基准脚本结构", t_bench_prompts_script)
     check("螺纹识别（螺旋/同心环）", t_thread_detection)
     check("模型外观复核", t_visual_review)
     check("模块引用静态检查", t_module_aliases)
     check("依赖声明完整性", t_declared_dependencies)
+    check("体积与依赖预算", t_bundle_budget)
     check("项目持久化", t_projects)
     check("环境检测报告", t_envcheck)
     check("作业与事件流", t_sse_contract)
@@ -3747,7 +9788,6 @@ def main() -> int:
     check("接口响应形状", t_contract_shapes)
     check("并发作业守卫", t_busy_guard)
     check("提示词与解析（离线）", t_llm_offline)
-    check("快捷方式解析", t_shortcuts_readonly)
 
     section("打印机知识库")
     check("知识库结构与参数推导", t_printer_knowledge)
@@ -3758,28 +9798,33 @@ def main() -> int:
 
     section("HTTP 接口")
     check("关键路由与安全拦截", t_http_api)
+    check("接口面不臃肿", t_api_surface)
 
     section("开源与提交卫生")
     check("开源文件完整性", t_oss_files)
     check("敏感信息扫描", t_no_secrets)
+    check("密钥扫描器没有漏扫中文名文件", t_secret_scanner_not_blind)
+    check("git add -A 不捡大文件", t_add_a_wont_grab_heavy_files)
     check("源码编码完好", t_source_encoding)
     check("无本机路径泄漏", t_no_personal_paths)
 
-    print("\n" + "=" * 70)
+    # 总结部分同样不能裸用 print：这里印的是失败明细（带任意异常消息），
+    # 恰好是“只有崩了才会走到”的那一段 —— 它自己再崩一次就什么都看不到了。
+    _SAFE_PRINT("\n" + "=" * 70)
     if SKIPPED:
-        print(f"通过 {len(PASSED)} 项，跳过 {len(SKIPPED)} 项，失败 {len(FAILED)} 项")
-        print("-" * 70)
-        print("  跳过的项（离线模式；它们**没有**被验证过）：")
+        _SAFE_PRINT(f"通过 {len(PASSED)} 项，跳过 {len(SKIPPED)} 项，失败 {len(FAILED)} 项")
+        _SAFE_PRINT("-" * 70)
+        _SAFE_PRINT("  跳过的项（离线模式；它们**没有**被验证过）：")
         for name, reason in SKIPPED:
-            print(f"  ○ {name} —— {reason}")
-        print("  发布前请在不带 --offline 的环境跑完整版。")
+            _SAFE_PRINT(f"  ○ {name} —— {reason}")
+        _SAFE_PRINT("  发布前请在不带 --offline 的环境跑完整版。")
     else:
-        print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
+        _SAFE_PRINT(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
     if FAILED:
-        print("-" * 70)
+        _SAFE_PRINT("-" * 70)
         for name, error in FAILED:
-            print(f"  ✗ {name}: {error}")
-    print("=" * 70)
+            _SAFE_PRINT(f"  ✗ {name}: {error}")
+    _SAFE_PRINT("=" * 70)
     return 1 if FAILED else 0
 
 

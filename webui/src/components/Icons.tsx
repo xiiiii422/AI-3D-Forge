@@ -117,23 +117,6 @@ export function IconChevronRight(props: IconProps) {
   );
 }
 
-export function IconChevronDown(props: IconProps) {
-  return (
-    <Svg {...props}>
-      <path d="m5.5 9.5 6.5 6.5 6.5-6.5" />
-    </Svg>
-  );
-}
-
-export function IconArrowLeft(props: IconProps) {
-  return (
-    <Svg {...props}>
-      <path d="M20 12H4.5" />
-      <path d="m10.5 6-6 6 6 6" />
-    </Svg>
-  );
-}
-
 export function IconArrowRight(props: IconProps) {
   return (
     <Svg {...props}>
@@ -217,10 +200,14 @@ export function IconCube(props: IconProps) {
   );
 }
 
-export function IconPlay(props: IconProps) {
+/** 工程图里的「尺寸线」：两端界线 + 带双向箭头的标注线 */
+export function IconRuler(props: IconProps) {
   return (
     <Svg {...props}>
-      <path d="M8 5.5v13l10-6.5z" />
+      <path d="M4 8.5v7M20 8.5v7" />
+      <path d="M4 12h16" />
+      <path d="M7.2 9.4 4 12l3.2 2.6" />
+      <path d="M16.8 9.4 20 12l-3.2 2.6" />
     </Svg>
   );
 }
@@ -401,39 +388,13 @@ export function IconSliders(props: IconProps) {
   );
 }
 
-export function IconPower(props: IconProps) {
+/** 历史版本（回退用）：一个带回溯箭头的表盘 */
+export function IconHistory(props: IconProps) {
   return (
     <Svg {...props}>
-      <path d="M12 4v8" />
-      <path d="M7.5 7a7 7 0 1 0 9 0" />
-    </Svg>
-  );
-}
-
-export function IconGlobe(props: IconProps) {
-  return (
-    <Svg {...props}>
-      <circle cx="12" cy="12" r="8.5" />
-      <path d="M3.5 12h17" />
-      <path d="M12 3.5c2.2 2.4 3.3 5.3 3.3 8.5S14.2 18.1 12 20.5c-2.2-2.4-3.3-5.3-3.3-8.5S9.8 5.9 12 3.5z" />
-    </Svg>
-  );
-}
-
-export function IconCpu(props: IconProps) {
-  return (
-    <Svg {...props}>
-      <rect x="7" y="7" width="10" height="10" rx="2" />
-      <path d="M10 3.5v3M14 3.5v3M10 17.5v3M14 17.5v3M3.5 10h3M3.5 14h3M17.5 10h3M17.5 14h3" />
-    </Svg>
-  );
-}
-
-export function IconMonitor(props: IconProps) {
-  return (
-    <Svg {...props}>
-      <rect x="3" y="4.5" width="18" height="12" rx="2" />
-      <path d="M9 19.5h6M12 16.5v3" />
+      <path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1" />
+      <path d="M3.2 4.6v4.2h4.2" />
+      <path d="M12 7.8V12l3 1.8" />
     </Svg>
   );
 }

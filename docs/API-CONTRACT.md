@@ -218,6 +218,11 @@ interface JobRef {
 用户去接杯水回来还要点确认，不该把他的作业取消掉。
 
 ### 3.2 作业状态（轮询兜底）
+### `GET /api/jobs` → `{ "jobs": Job[] }`
+最近 20 个作业快照（新的在前），可选 `?project_id=` 只看一个项目。
+界面刷新 / 切走再回来时用它找回还在跑的作业 —— 没有这个列表，进度条会凭空消失，
+用户以为软件把任务丢了（所以它不是“没人调的后台接口”，`webui/src/api/client.ts` 真的在调）。
+
 ### `GET /api/jobs/{job_id}`
 ```ts
 type JobStage =
@@ -263,8 +268,15 @@ interface JobResult {
   name: string;
   /** 生成得到的参数化 SCAD 源码 */
   scad: string;
-  /** AI 归纳的参数表，用于「参数微调」UI */
-  params: { name: string; label: string; value: number; unit: string; min: number | null; max: number | null }[];
+  /**
+   * AI 归纳的参数表，用于「参数微调」UI。
+   * `group` 是**可选**的类别标签：后端目前不产出，缺省时由前端按变量名/说明归类
+   * （唯一一份规则：`webui/src/lib/paramGroups.ts`）。
+   */
+  params: {
+    name: string; label: string; value: number; unit: string;
+    min: number | null; max: number | null; group?: string | null;
+  }[];
   /** 一句话设计说明 */
   summary: string;
   stl: {
@@ -496,6 +508,11 @@ interface ChangeVerdict {
 后端把值注入 SCAD 顶部 `PARAMS` 变量区并重新编译（不调用 AI，秒级返回）。
 返回 `202` + `JobRef`（复用同一套进度流）。
 
+> 参数表在 UI 里分栏展示：整体尺寸 / 孔与螺纹 / 壁厚与强度 / 圆角与配合 / 数量与阵列 / 其它参数
+> （参数 ≥5 个且确实跨类才分栏，少的时候保持平铺）。**归类是纯展示逻辑，只在前端一份**
+> （`webui/src/lib/paramGroups.ts`），后端不给类别，因此历史项目立刻受益。
+> 如果哪天要让后端直接给，填 `group`（取上面那几个 id）即可覆盖关键词判断。
+
 ### 3.5 直接编译 SCAD（高级 / 调试）
 ### `POST /api/compile`
 请求：`{ "scad": "<源码>", "project_id": "<可选>", "name": "<可选>" }` → `202` + `JobRef`。
@@ -653,11 +670,94 @@ interface ProjectDetail extends ProjectSummary {
 ### `PATCH /api/projects/{id}` → `{ "name": string }` → `ProjectSummary`
 ### `DELETE /api/projects/{id}` → `{ "ok": true }`（移入回收站而非彻底删除）
 
+### `POST /api/projects/{id}/save` → 请求 `{ "kind"?: "stl" | "scad" | "3mf" }`（默认 `stl`）
+弹系统「另存为」框，把当前文件写到用户选的位置。返回三态，**不靠“没报错”当“已保存”**：
+- `{ "status": "saved", "path": string }`；
+- `{ "status": "canceled" }`（用户点了取消，界面不提示成功也不报错）；
+- `{ "status": "no-dialog" }`（无桌面会话，前端自己退回浏览器下载）。
+还没有对应文件时返回 `409`。
+
+### `POST /api/projects/{id}/restore` → 请求 `{ "revision": number }`
+回退到历史版本。**回退本身产生新的一版**（`revision+1`），历史只追加不重写；
+回退前先把当前版归档。归档里必须**同时**有 `.scad` 与 `.stl`：
+只有源码没 STL → `409` + `NOT_FOUND`（hint 指向「保留历史 STL」开关）；整个归档不存在 → `404`。
+返回 `{ "project_id", "restored_from", "revision", "metrics" }`（metrics 是回退后重新实测的，不沿用旧数字）。
+
 ### 下载
 - `GET /api/projects/{id}/stl` → `application/sla`，`Content-Disposition: attachment; filename="<name>.stl"`
 - `GET /api/projects/{id}/scad` → `text/plain; charset=utf-8`，附件下载
 - `GET /api/projects/{id}/stl/raw` → 同样的 STL 但 `inline`（供 Three.js `STLLoader` 直接 fetch）
 - `GET /api/projects/{id}/thumbnail` → `image/png`
+
+---
+
+## 4A. 送到切片软件
+
+对标同类产品的“一键送切片器”。刻意只有两个接口：
+默认目标与手动路径表都写进 `PUT /api/settings`，不另开入口 —— 少一个接口就少一处会坏的地方。
+真机往返（进程表里确有 pid、命令行里带着我们的 3MF、`detached` 问得出来）不靠文档口头保证，
+由 `scripts/probes/probe_slicer_roundtrip.py` 跑（这个目录的 README 列了它需要的外部条件）。
+
+### `GET /api/slicers`
+已检测到的切片软件。`?rescan=1` 强制重扫（用户刚装完切片软件时要用）。
+```ts
+interface SlicerEntry {
+  id: string;               // "bambu_studio" | "orcaslicer" | …（识别表里的稳定 id）
+  name: string;             // "Bambu Studio"
+  exe: string;              // 主程序绝对路径
+  version: string | null;   // "02.08.02.61"，取不到为 null
+  source_label: string;     // 人话来源：“已安装程序” / “常见安装目录” / “手动指定”
+  running: boolean;         // 进程表里已经开着
+}
+interface SlicersResponse {
+  slicers: SlicerEntry[];      // 排序 = 识别表顺序（实测跑过的排前面）
+  default_id: string | null;   // 默认目标；软件被卸载后回到 null，不会留下幽灵 id
+  count: number;
+  recognized_names: string[];  // 我们认得哪些：没检测到时界面要能告诉用户“装这些里任意一个就行”
+}
+```
+
+**只存 id、不存路径**：路径每次从注册表 / 安装目录实扫 —— 切片软件升级换了目录也不会指着旧路启动。
+
+### `POST /api/slicers/pick`
+自动检测漏网时让用户自己指出主程序（弹原生选择框，只收 `.exe`），存好后立即重扫。
+返回 `{ "status": "added" | "canceled" | "nodialog", "path"?: string, ...SlicersResponse }`。
+
+### `GET /api/projects/{id}/3mf` → `model/3mf` 附件
+3MF 里声明毫米单位并带上机型 / 材料 / 尺寸 / 版本元数据，切片软件不必再猜尺寸。
+旧项目只有 STL 时现场从 STL 转一份（几何完全一致）并留下来，下次直接取。
+
+### `POST /api/projects/{id}/send-to-slicer` → 请求 `{ "slicer"?: string }`
+把当前模型交给切片软件打开。不传 `slicer` 就用设置里的默认，没有默认就用检测到的第一个。
+**只认 id 不认路径**：能启动的程序必须是本机检测出来的那几个 exe，请求里塞任何路径都无效
+（否则这个接口就变成了“本机任意程序执行器”）。
+```ts
+interface SendToSlicerResult {
+  status: "started" | "forwarded" | "failed";
+  detail: string;            // 一句话给人看的结果
+  pid: number;
+  exit_code: number | null;  // started 时为 null
+  detached: boolean;         // true = 不在本软件“一死就杀光”的作业里，关软件不会连带杀掉它
+  slicer: string;
+  slicer_name: string;
+  file: string;              // 交出去的那份快照路径
+  exe: string;
+  kind: "3mf" | "stl";       // 一律优先 3MF，只有 3MF 确实写不出来才退回 STL
+  source_label: string;
+  note?: string;             // 只在 detached=false 时出现：退出本软件可能连带关掉它
+}
+```
+- `detached` **不是“设了个标志就算”**：由 `procguard` 问内核（该 pid 还在不在我们那个作业里）得出，
+  问不出来按 `false` 处理并附 `note`。曾经的事故：代码里句句“我们设了 `CREATE_BREAKAWAY_FROM_JOB`”，
+  接口也报 `detached: true`，但用户关掉本软件时 Bambu Studio 跟着没了（祖先作业会让该标志失效）。
+- `forwarded`：切片软件本来就开着，新进程把文件交给它的现有窗口后自己退掉（退出码 0）；
+  这条无法再确认导入，界面按“已交给现有窗口”如实说。
+- 快照文件名 `<项目名>-r<版本>.3mf`，落在数据目录的 `slicer/` 下，每个项目只留最近 5 份。
+  **刚交出去那一份绝不能被清理删掉**（真的发生过：`shutil.copy2` 把源文件的旧 mtime 带给每个快照，
+  快照时间全同 → “留最新 5 份”退化成“按目录序留前 5 份” → 第 6 次之后切片软件报“文件不存在”）。
+  现在写出后立刻 `os.utime` 打上当下时间，并由 `_prune(keep=…)` 显式保护那一份。
+- 错误：`404` 项目不存在；`409 OPENSCAD_FAILED` 还没生成模型；`409 SLICER_NOT_FOUND`
+  点名或默认的目标当前没检测到（hint 指向「设置 → 切片软件」里的手动指定）。
 
 ---
 
@@ -675,10 +775,18 @@ interface Settings {
   openscad_path: string | null;
   data_dir: string;          // %APPDATA%\AI-3D-Forge
   projects_dir: string;      // %USERPROFILE%\Documents\AI-3D-Forge\Projects
+  /** 日志目录（默认 %LOCALAPPDATA%\AI-3D-Forge\logs，可被 AIFORGE_LOCAL_DIR 改）。
+   *  它**不在** data_dir 里：设置页要告诉用户日志在哪，就只能发真实路径。 */
+  log_dir: string;
   keep_stl_history: boolean;
   auto_install_openscad: boolean;
   first_run_done: boolean;
   theme: "light" | "dark" | "system";
+  /** 界面材质：实底（普通）/ 液态玻璃。默认 "solid" */
+  appearance: "solid" | "glass";
+  /** 玻璃透明度百分比，0 = 完全不透明。默认 25，硬上限 60（见下）。
+   *  只作用于「页面内」的面板；弹窗/菜单/提示条这类浮层始终是厚玻璃，不随它变透 */
+  glass_transparency: number;
   /** 契约 §3A：当前目标机型 */
   printer_id?: string;
   printer_name?: string;
@@ -687,12 +795,36 @@ interface Settings {
   announce_in_chat: boolean;
   /** 生成前是否先让用户确认「我对需求的理解」（规格卡片） */
   confirm_spec: boolean;
+  /** 送到切片软件的默认目标 id（只存 id，见 §4A）；没设过为 null */
+  default_slicer: string | null;
+  /** 用户手动指出的切片软件主程序路径（自动检测漏网时的逃生口） */
+  slicer_custom_paths: string[];
 }
 ```
 
 ### `PUT /api/settings`（部分更新，字段均可选）
 - 传 `api_key` 时写入凭据管理器；传 `api_key: ""` 表示清除。
 - `confirm_spec` / `announce_in_chat` 对应界面「设置 → 行为」里的两个开关。
+- `default_slicer`：**必须是当下真能检测到的 id**，否则 `409` + `SLICER_NOT_FOUND`。
+  存一个“将来才会出现的 id”没意义，而且软件被卸载后它会变成幽灵默认值（点“送到切片软件”永远失败）。
+  传 `""` 表示取消默认（回到“用检测到的第一个”）。
+- `slicer_custom_paths` 是**整表替换**（不是追加），后端去掉空串与重复项后写入，并立即作废检测缓存。
+- `appearance` 只接受 `solid` / `glass`，**其它值一律忽略**（保持原值，不报错也不写坏配置）。
+- `glass_transparency` 由后端**硬夹取到 0–60**，非数字输入回到默认 25；界面滑块的上限就是这两个数，
+  前后端各存一份（`src/aiforge/config.py` 与 `webui/src/hooks/useAppearance.ts`），改一处必须同步
+  （`scripts/selfcheck.py` 的「外观材质与玻璃透明度」用例会把两边常量、夹取语义、非法值行为全部对一遍）。
+- 上限的实测依据（口径：`webui/scripts/verify-glass-contrast.mjs`，逐像素量「字 vs 字底下的底」，
+  底只取**字形外圈 3–11px**（剔 2px 抗锯齿晕圈），而不是整个裁切框；数据在它跑出的
+  `webui/scripts/shots/contrast-report.json` 里 —— 那是生成物、不入库，要拿数字得自己跑一遍）。
+  注意这三句话彼此不同，不要混用：
+  1. **不是**「超过 60% 文字就不达标」：普通面板（卡片/侧栏/工作台）上的文字到 90% 仍 ≥ 4.5:1（最低 5.07:1）。
+  2. 随透明度单调恶化的是**底纹泄漏**（面板底亮度散布）：0（实底）→ 0.072（60%）→ 0.094（90%）。
+     再往右面板不再是一块干净的底 —— 这是观感判断，不是无障碍判断。
+  3. 会真的掉到 4.5:1 以下的是**浮层**：背后压着整页文字时，拿掉下限复测（`NO_FLOAT_FLOOR=1`）
+     透明度 25% → 4.14:1，60% → 1.84:1（并且分界度塌到 1.03，与背后页面基本糊在一起）。
+     所以浮层在 CSS 里另有一层不透明度下限（`tokens.css` 的 `--glass-solid-float: max(94%, var(--glass-solid))`），
+     加下限后实测 4.78~4.86:1（浅）/ 7.16~7.23:1（深）且**不随滑块变化**；这条下限由 `scripts/selfcheck.py` 做源码守卫，
+     由 `verify-glass-contrast.mjs` 做像素验收（弹窗浅色/深色、菜单、预览浮层）。
 - 返回更新后的 `Settings`。
 
 ### `POST /api/settings/api-key/test`
@@ -707,12 +839,64 @@ interface Settings {
 
 ---
 
+## 5A. 需求核对表（requirement_tests）
+
+生成/修改作业完成后，后端把设计契约编译成**逐条可执行判定**（`src/aiforge/reqtests.py`），
+随结果与项目指标一起返回；口径对齐 CADTests（arXiv 2605.07807）：
+
+```jsonc
+"requirement_tests": {
+  "pass_rate": 1.0,          // PR：整份需求是否全部达成（有未达成/没测出来即 0）
+  "requirement_score": 1.0,  // RS：达成需求组 / 全部需求组
+  "invalid_ratio": 0.0,      // IR：没能判定的组占比（invalid 计失败，不算通过）
+  "counts": { "pass": 10, "fail": 0, "invalid": 0, "manual": 3 },
+  "groups": 10, "manual": 3,
+  "tests": [{
+    "group": "dim:height",           // 需求组：同组内任一断言不过，该条需求算未达成
+    "requirement": "总高（Z 方向/高度）",
+    "kind": "dimension",             // dimension|hole|thread|integrity|print|semantic
+    "status": "pass",                // pass|fail|invalid|manual
+    "expected": "100mm", "actual": "99.8mm",
+    "deviation_pct": -0.2, "tolerance_mm": 2.0,   // 公差 = max(规格公差, 机型配合公差, 2%)
+    "fix_hint": "…", "advisory": false            // advisory=工艺建议：进清单但不参与 PR/RS
+  }]
+}
+```
+
+- 出现位置：`GET /api/jobs/{id}` 的 `result.requirement_tests`、
+  `GET /api/projects/{id}/metrics` 的 `requirement_tests`（项目重开时从缓存带回）。
+- `manual` 是**语义需求**（外观/结构是否合理），程序不打分，界面标成「需确认」。
+- 未达成项会连同实测数字回喂给几何修复链路（`【需求核对表】` 段）。
+
 ## 6. 应用控制
 
 - `POST /api/app/open-folder` 请求 `{ "kind": "data" | "projects" | "exports" | "project", "project_id"?: string }` → `{ "ok": true }`（在资源管理器中打开）
-- `POST /api/app/open-external` 请求 `{ "url": string }` → `{ "ok": true }`（仅允许 https 白名单域名）
+- `POST /api/app/open-external` 请求 `{ "url": string }` → `{ "ok": true }`（仅允许 https + 域名白名单：
+  DeepSeek/OpenSCAD 官网、GitHub，以及底部作者入口的 douyin.com / bilibili.com；
+  原生窗口会拦截新窗口，所以界面里的外链一律走本接口，失败时前端才退到 `window.open`）
 - `GET /api/app/health` → `{ "ok": true, "version": "1.0.0", "uptime_s": 12.3 }`
 - `POST /api/app/shutdown` → `{ "ok": true }`（退出程序，前端「退出」按钮使用）
+- `GET /api/app/window-runtime` → 原生窗口组件（WebView2）状态：
+  ```ts
+  interface WindowRuntimeStatus {
+    installed: boolean;
+    version: string | null;      // "153.0.4234.48"
+    source: string | null;       // registry | filesystem | none
+    detail: string;
+    install_hint: string;
+    download_url: string;        // 微软官方下载页
+    bootstrapper_url: string;    // 常青版一键安装包直达链接
+  }
+  ```
+- `POST /api/app/window-runtime/install` → `{ "ok": boolean, "message": string }`
+  一键安装（winget 优先，失败回退官方 Bootstrapper）。
+  上面两个接口只在「被浏览器打开」时用：后端缺 WebView2 时会改开系统浏览器，并在地址上带
+  `?browser_fallback=1`（`src/aiforge/server.py`），前端据此在页面顶部说明原因并给一键安装入口
+  （用户手册 docs/USER_GUIDE.md §2.2 承诺的行为；原生窗口里这条横幅一行也不渲染、一次请求也不多发）。
+
+> 另外 `GET /api/docs` 与 `GET /api/openapi.json` 是 FastAPI 自带的自省页，只给开发排查用，
+> 界面不调、也不属于本契约；除了这两个，本文件必须覆盖每一条 `/api` 路由
+> （`scripts/selfcheck.py` 的「接口面不臃肿」守卫会三向核对：路由 ↔ 本文件 ↔ 前端调用）。
 
 ---
 
@@ -755,5 +939,8 @@ interface Settings {
 | `SCAD_INVALID` | AI 生成的 SCAD 未通过安全校验 | 自动重试一次，仍失败则展示原因 |
 | `NEED_ADMIN` | 需要管理员权限 | 说明原因 + [重试（将以管理员身份运行）] |
 | `DISK_FULL` | 磁盘空间不足 | 提示清理位置与所需空间 |
+| `NOT_FOUND` | 要改的东西已经不在了（项目 / 打印机 / 历史版本） | 提示已失效并刷新列表 |
+| `BUSY` | 同一个项目上已有一次生成在跑 | 不报错刷屏，引导到进行中的作业或[停止] |
+| `SLICER_NOT_FOUND` | 指定的切片软件当前没检测到 | 引导「设置 → 切片软件」[重新检测]或[手动指定主程序] |
 | `CANCELLED` | 用户取消 | 安静结束，不报错 |
 | `INTERNAL` | 未预期错误 | 「出了点问题」+ 可展开技术详情 |

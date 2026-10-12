@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api } from '../api/client';
+import { api, projectMetrics, stlDownloadUrl } from '../api/client';
 import type {
   DesignSpec,
+  ProjectDetail,
   Job,
   JobParam,
   JobResult,
   PrinterContext,
   ProjectSummary,
+  ReqSuite,
+  StlInfo,
   UsageInfo,
 } from '../api/types';
 import { Button } from '../components/Button';
@@ -19,11 +22,13 @@ import { useToast } from '../components/Toast';
 import {
   IconCube,
   IconFolder,
+  IconHistory,
   IconMaximize,
   IconMinimize,
   IconNozzle,
   IconRotate,
   IconRotate3D,
+  IconRuler,
   IconSliders,
   IconSparkle,
   IconWireframe,
@@ -56,6 +61,14 @@ const STAGE_LABEL: Record<Job['stage'], string> = {
 
 function newId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** 历史版本下拉里的一行说明：优先显示当时做了什么，其次显示需求/时间 */
+function versionLabel(entry: { instruction?: string | null; prompt?: string | null; created_at?: string; summary?: string }): string {
+  const action = (entry.instruction || entry.prompt || entry.summary || '').replace(/\s+/g, ' ').trim();
+  const stamp = entry.created_at ? entry.created_at.slice(5, 16).replace('T', ' ') : '';
+  const short = action.length > 26 ? `${action.slice(0, 26)}…` : action;
+  return [short, stamp].filter(Boolean).join(' · ');
 }
 
 function nowIso(): string {
@@ -119,11 +132,17 @@ export default function Studio() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [viewerRevision, setViewerRevision] = useState<number | undefined>(undefined);
   const [modelStats, setModelStats] = useState<ModelStats | null>(null);
+  /** 历史版本（回退入口用）：来自 GET /projects/{id} */
+  const [history, setHistory] = useState<ProjectDetail['history']>([]);
+  const [restoreRevision, setRestoreRevision] = useState<number>(0);
+  const [restoring, setRestoring] = useState(false);
   /** 从项目实测数据里读到的耗材估算（重开项目时用） */
   const [projectUsage, setProjectUsage] = useState<UsageInfo | null>(null);
   const [viewerLoading, setViewerLoading] = useState(false);
   const [viewerError, setViewerError] = useState<string | null>(null);
   const [wireframe, setWireframe] = useState(false);
+  /** 实时尺寸标注（默认开）：未选中时标整体宽/深/高，点中棱线只标该边 */
+  const [showDims, setShowDims] = useState(true);
   const [autoRotate, setAutoRotate] = useState(false);
   const [resetSignal, setResetSignal] = useState(0);
   const [fullscreen, setFullscreen] = useState(false);
@@ -139,6 +158,24 @@ export default function Studio() {
   const lastInputRef = useRef<{ text: string; mode: 'create' | 'modify' } | null>(null);
   const activeIdRef = useRef<string | null>(activeId);
   activeIdRef.current = activeId;
+  /**
+   * 当前 entries 属于哪个项目。
+   * 为什么需要：镜像 effect 依赖 [activeId, entries]，切项目时 activeId 先变、
+   * entries 还是旧项目的内容 —— 不拦住就会把旧对话写进新项目的缓存，
+   * 用户看到「对话栏显示别的项目/模型的内容」。只有 entries 确实属于
+   * activeId 时才允许写缓存。
+   */
+  const entriesOwnerRef = useRef<string | null>(null);
+  /**
+   * 当前作业属于哪个项目。
+   *
+   * 为什么需要：作业跑完之前用户可以切到别的项目，而事件流跟着 jobId 继续跑。
+   * `cancelled` / `error` 两个分支没有 `result.project_id` 可比对，没法判断
+   * 「用户是不是已经切走了」—— 原来它们无条件往当前 entries 里追加收尾卡片，
+   * 于是「项目 A 的作业失败」这条消息会出现在项目 B 的对话里，
+   * 并被镜像 effect 写进 conversationCache[B]。这个 ref 就是那个比对基准。
+   */
+  const jobProjectRef = useRef<string | null>(null);
 
   const activeProject = useMemo(
     () => projects.find((p) => p.id === activeId) ?? null,
@@ -151,58 +188,106 @@ export default function Studio() {
   // （打开已有项目、新建项目时后端分配 id、参数微调…），散在各处写必然漏。
   useEffect(() => {
     if (!activeId) return;
+    if (entriesOwnerRef.current !== activeId) return; // entries 还不属于这个项目，别写脏缓存
     conversationCache.set(activeId, entries);
     rememberProject(activeId);
   }, [activeId, entries]);
 
-  /** 把结果卡片推进对话，并同步参数表与预览版本 */
+  /**
+   * 把结果卡片推进对话，并同步参数表与预览版本。
+   *
+   * 关键：结果属于 `result.project_id`，**不一定**是用户当前正在看的那个。
+   * 作业跑完之前用户完全可以切到别的项目（侧栏点一下就走），而作业流是
+   * 跟着 jobId 继续跑的 —— 于是 done 事件会在"当前显示的是 B"的时候到达。
+   * 原来的写法无条件 `setEntries(prev => [...prev, card])` + `setActiveId(result.project_id)`，
+   * 后果有两个：
+   *   1. 卡片被追加进 **B** 的对话里（prev 是 B 的 entries）；
+   *   2. 界面被强行拽回 A。
+   * 紧接着镜像 effect 又把这批被污染的 entries 写进 conversationCache[A] ——
+   * 于是 A 的历史里混进了 B 的对话，之后重开 A 一直是错的。
+   *
+   * 现在按"用户是否还在这个项目"分流：还在就照旧推进；已经切走就只把结果
+   * 写进**该项目自己的**缓存，绝不碰当前画面（用户正在看 B，不该被 A 拽走）。
+   */
   const commitResult = useCallback((result: JobResult) => {
-    setEntries((prev) => [
-      ...prev,
-      { id: newId(), role: 'assistant', text: '', at: nowIso(), result },
+    const card: ChatEntry = {
+      id: newId(),
+      role: 'assistant',
+      text: '',
+      at: nowIso(),
+      result,
+    };
+    const stillHere = activeIdRef.current === result.project_id;
+
+    if (stillHere) {
+      entriesOwnerRef.current = result.project_id;
+      setEntries((prev) => [...prev, card]);
+      setParams(result.params ?? []);
+      setViewerRevision(result.revision);
+      setActiveId(result.project_id);
+      return;
+    }
+
+    // 用户已经切到别的项目了：结果仍然要归档，但不许动当前界面。
+    // 直接写缓存，切回该项目时就能看到这条结果卡片。
+    conversationCache.set(result.project_id, [
+      ...(conversationCache.get(result.project_id) ?? []),
+      card,
     ]);
-    setParams(result.params ?? []);
-    setViewerRevision(result.revision);
-    setActiveId(result.project_id);
   }, []);
+
+  /**
+   * 往对话里追加一条助手消息 —— 按「用户是否还在这个项目」分流。
+   *
+   * 作业跑完/失败之前用户完全可以切到别的项目。若无条件追加，卡片会落进
+   * 当前显示的另一个项目的对话里，并被镜像 effect 写进它的缓存（串台）。
+   * 已经切走时只写进**该作业自己项目**的缓存，不动当前画面。
+   */
+  const appendAssistantEntry = useCallback(
+    (ownerId: string | null, make: () => ChatEntry) => {
+      const entry = make();
+      if (!ownerId || activeIdRef.current === ownerId) {
+        setEntries((prev) => [...prev, entry]);
+        return;
+      }
+      conversationCache.set(ownerId, [...(conversationCache.get(ownerId) ?? []), entry]);
+    },
+    [],
+  );
 
   const job = useJobStream({
     jobId,
     onDone: (finished) => {
       setJobId(null);
       setApplyingParams(false);
+      const owner = jobProjectRef.current;
+      jobProjectRef.current = null;
       if (finished.status === 'done' && finished.result) {
         commitResult(finished.result);
         void reload();
       } else if (finished.status === 'cancelled') {
         // 用户主动停止：不推错误卡片，但必须让对话框留下一条明确的收尾记录，
         // 否则用户会以为「是不是还在跑」。
-        setEntries((prev) => [
-          ...prev,
-          {
-            id: newId(),
-            role: 'assistant',
-            text: '已停止生成。可以继续描述你的需求。',
-            at: nowIso(),
-          },
-        ]);
+        appendAssistantEntry(owner, () => ({
+          id: newId(),
+          role: 'assistant',
+          text: '已停止生成。可以继续描述你的需求。',
+          at: nowIso(),
+        }));
         void reload();
       } else if (finished.status === 'error') {
         const err = finished.error;
-        setEntries((prev) => [
-          ...prev,
-          {
-            id: newId(),
-            role: 'assistant',
-            text: '',
-            at: nowIso(),
-            error: {
-              message: err?.message ?? '生成失败，请重试。',
-              hint: err?.hint ?? null,
-              code: err?.code ?? 'INTERNAL',
-            },
+        appendAssistantEntry(owner, () => ({
+          id: newId(),
+          role: 'assistant',
+          text: '',
+          at: nowIso(),
+          error: {
+            message: err?.message ?? '生成失败，请重试。',
+            hint: err?.hint ?? null,
+            code: err?.code ?? 'INTERNAL',
           },
-        ]);
+        }));
         void reload();
       }
     },
@@ -339,10 +424,21 @@ export default function Studio() {
   /** 打开项目：载入详情 → 重建对话与参数 */
   const openProject = useCallback(
     async (id: string) => {
+      // 先把 entries 同步成目标项目的缓存（可能为空），再切 activeId：
+      // 否则镜像 effect 会把旧项目的对话写进新项目缓存（串台 bug）。
+      entriesOwnerRef.current = id;
+      setEntries(conversationCache.get(id) ?? []);
       setActiveId(id);
       navigate(`/studio/${id}`, { replace: false });
       setParams([]);
       setModelStats(null);
+      // 必须同时清掉 viewerRevision，否则 hasModel 仍为 true：
+      // 切到项目 B 之后、在 getProject(B) 返回之前，预览拿到的是
+      // 「projectId=B + revision=A 的版本号」，于是去请求 B 的某个 rev ——
+      // 轻则闪一下空的/错的模型，重则直接报「预览加载失败（404）」。
+      // 清掉之后 hasModel 为 false，预览进入空状态，等详情到了再由下面
+      // 的 setViewerRevision(detail.revision) 正常加载。
+      setViewerRevision(undefined);
       setDetailLoading(true);
       try {
         const detail = await api.getProject(id);
@@ -353,17 +449,60 @@ export default function Studio() {
         const remembered = conversationCache.get(id);
         if (remembered && remembered.length) {
           setEntries(remembered);
-        } else if (last || detail.summary) {
+        } else if (last || detail.summary || detail.files?.stl_path) {
           const parts: string[] = [];
           if (last?.prompt) parts.push(`需求：${last.prompt}`);
           if (last?.instruction) parts.push(`修改：${last.instruction}`);
           const early = parts.join('\n');
+          // 历史项目也要有下载按钮：用持久化的实测数据合成一张结果卡，
+          // 否则重开软件后「之前生成好的模型」没法下载（用户实测反馈）。
+          let synth: JobResult | undefined;
+          if (detail.files?.stl_path) {
+            let m: Record<string, unknown> = {};
+            try {
+              m = await projectMetrics(id);
+            } catch {
+              m = {};
+            }
+            const bbox = (m.bbox as { x?: number; y?: number; z?: number } | undefined) ?? {};
+            const stl: StlInfo = {
+              url: stlDownloadUrl(id),
+              filename: `${detail.name}.stl`,
+              size_bytes: (m.size_bytes as number | undefined) ?? 0,
+              triangles: (m.triangles as number | undefined) ?? 0,
+              volume_mm3: (m.volume_mm3 as number | undefined) ?? 0,
+              bbox_mm: { x: bbox.x ?? 0, y: bbox.y ?? 0, z: bbox.z ?? 0 },
+              watertight: (m.watertight as boolean | undefined) ?? false,
+              watertight_ratio: (m.watertight_ratio as number | undefined) ?? 0,
+              material: (m.material as string | undefined) ?? '',
+              material_density: (m.material_density as number | undefined) ?? 0,
+              within_build_volume: (m.within_build_volume as boolean | undefined) ?? true,
+              min_dimension_mm: (m.min_dimension_mm as number | undefined) ?? 0,
+              meets_min_wall: (m.meets_min_wall as boolean | undefined) ?? true,
+            };
+            synth = {
+              project_id: id,
+              revision: detail.revision,
+              name: detail.name,
+              scad: detail.scad,
+              params: detail.params ?? [],
+              summary: detail.summary ?? '这个项目已经生成过模型。',
+              stl,
+              printability: null,
+              diagnostics: null,
+              printer: null,
+              // 重开项目也要看到上一次的核对表：后端 /metrics 会把清单从缓存一起带回来，
+              // 少接这一行，历史项目就只有数字、没有「哪条要求没做到」。
+              requirement_tests: (m.requirement_tests as ReqSuite | undefined) ?? null,
+            };
+          }
           setEntries([
             {
               id: newId(),
               role: 'assistant',
               text: `${early ? `${early}\n\n` : ''}${detail.summary ?? '这个项目已经生成过模型。'}`,
               at: last?.created_at ?? detail.updated_at,
+              result: synth,
             },
           ]);
         } else {
@@ -371,6 +510,8 @@ export default function Studio() {
         }
         setParams(detail.params ?? []);
         setViewerRevision(detail.revision);
+        setHistory(detail.history ?? []);
+        setRestoreRevision(detail.revision);
         // 耗材估算挂在项目实测数据上（metrics.usage），重开项目也要能看到 ——
         // 它不能只存在于「本次会话刚跑完的那个作业结果」里，
         // 否则每次重新打开软件，用户就看不到这个数字了。
@@ -429,6 +570,9 @@ export default function Studio() {
             : { prompt: text, project_id: null, mode: 'create' },
         );
         setActiveId(ref.project_id);
+        entriesOwnerRef.current = ref.project_id;
+        // 记下作业归属，供 onDone 的 cancelled / error 分支判断用户是否已切走。
+        jobProjectRef.current = ref.project_id;
         if (ref.project_id !== activeId) {
           bootstrappedRef.current = ref.project_id;
           navigate(`/studio/${ref.project_id}`, { replace: true });
@@ -580,6 +724,32 @@ export default function Studio() {
     }
   }, [jobId, toast]);
 
+  /** 恢复到历史版本：后端会把它作为**新的一版**写入，当前模型仍留在历史里 */
+  const handleRestore = useCallback(
+    async (revision: number) => {
+      const id = activeIdRef.current;
+      if (!id || revision <= 0) return;
+      setRestoring(true);
+      try {
+        const result = await api.restoreRevision(id, revision);
+        toast.show(`已恢复到第 ${revision} 版（现在是第 ${result.revision} 版）。`);
+        // 重新读项目：参数、实测数据、历史列表、预览都必须跟着变 ——
+        // 只改状态里的 revision 而不重新取数据，界面会继续显示旧模型的尺寸。
+        const detail = await api.getProject(id);
+        setParams(detail.params ?? []);
+        setHistory(detail.history ?? []);
+        setRestoreRevision(detail.revision);
+        setViewerRevision(detail.revision);
+        setProjectUsage(detail.metrics?.usage ?? null);
+      } catch (err) {
+        toast.error(toFriendlyError(err).message);
+      } finally {
+        setRestoring(false);
+      }
+    },
+    [toast],
+  );
+
   /* -------------------- 项目操作 -------------------- */
   const handleCreate = useCallback(async () => {
     setCreating(true);
@@ -726,6 +896,17 @@ export default function Studio() {
             <Button
               iconOnly
               variant="ghost"
+              className={showDims ? 'is-active' : undefined}
+              aria-label="尺寸标注切换"
+              aria-pressed={showDims}
+              title="尺寸标注（点模型上的棱线可看该边长度）"
+              onClick={() => setShowDims((v) => !v)}
+            >
+              <IconRuler size={17} />
+            </Button>
+            <Button
+              iconOnly
+              variant="ghost"
               className={autoRotate ? 'is-active' : undefined}
               aria-label="自动旋转"
               aria-pressed={autoRotate}
@@ -752,6 +933,7 @@ export default function Studio() {
             revision={viewerRevision}
             wireframe={wireframe}
             autoRotate={autoRotate}
+            showDimensions={showDims}
             resetSignal={resetSignal}
             onStats={setModelStats}
             onLoadingChange={setViewerLoading}
@@ -762,10 +944,10 @@ export default function Studio() {
           {modelStats ? (
             <div className="viewer-overlay viewer-overlay-stats">
               <div className="stat">
-                <div className="stat-label">尺寸（毫米）</div>
+                <div className="stat-label">尺寸（毫米）宽 × 深 × 高</div>
                 <div className="stat-value">
-                  {modelStats.size.x.toFixed(1)} × {modelStats.size.y.toFixed(1)} ×{' '}
-                  {modelStats.size.z.toFixed(1)}
+                  {modelStats.size.width.toFixed(1)} × {modelStats.size.depth.toFixed(1)} ×{' '}
+                  {modelStats.size.height.toFixed(1)}
                 </div>
               </div>
               <div className="stat">
@@ -827,6 +1009,45 @@ export default function Studio() {
             </div>
           ) : null}
         </div>
+
+        {/* 历史版本：用户说明书承诺过「随时可以回到之前的版本」，
+            以前只有归档、没有恢复入口 —— 这里补上入口（后端 /restore）。 */}
+        {history.length > 1 ? (
+          <section className="params-sheet" aria-label="历史版本">
+            <div className="params-head" style={{ marginBottom: 8 }}>
+              <div className="params-title">
+                <IconHistory size={14} style={{ verticalAlign: -2, marginRight: 6 }} />
+                历史版本
+                <span>共 {history.length} 版；恢复会生成新的一版，当前模型仍留在历史里</span>
+              </div>
+              <div className="row" style={{ gap: 8 }}>
+                <select
+                  className="input"
+                  style={{ width: 210 }}
+                  value={String(restoreRevision)}
+                  onChange={(event) => setRestoreRevision(Number(event.target.value))}
+                  disabled={running || sending || restoring}
+                  aria-label="选择要恢复的版本"
+                >
+                  {[...history].reverse().map((entry) => (
+                    <option key={entry.revision} value={entry.revision}>
+                      {`第 ${entry.revision} 版 · ${versionLabel(entry)}`}
+                    </option>
+                  ))}
+                </select>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  icon={<IconHistory size={14} />}
+                  disabled={running || sending || restoring || restoreRevision === viewerRevision}
+                  onClick={() => void handleRestore(restoreRevision)}
+                >
+                  {restoring ? '正在恢复…' : '恢复到这一版'}
+                </Button>
+              </div>
+            </div>
+          </section>
+        ) : null}
 
         {/* 参数微调 */}
         {params.length > 0 ? (
@@ -916,7 +1137,9 @@ export default function Studio() {
         busy={busy}
         message={
           <>
-            将把「{deleteTarget?.name}」移入回收站，之后可以从回收站恢复。确定要删除吗？
+            将把「{deleteTarget?.name}」从项目列表里移除，文件会移到项目文件夹的{' '}
+            <code>.deleted</code> 目录里（程序内暂不支持恢复，需要时可以在资源管理器里
+            把它移回来）。确定要删除吗？
           </>
         }
         confirmText="删除"

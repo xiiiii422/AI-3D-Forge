@@ -11,14 +11,16 @@
 硬性验收（对应用户实际踩到的两个坑）：
   * 零件数必须为 1 —— 「一个成品」不能是「几个各自独立的零件」
   * 容器类零件腔内不能有孤岛 —— 加强筋不能穿进腔体内部
+  * 源码声明了的间隙/夹口必须在网格上量得到 —— 减法特征假绿的正面检验
 
 用法：
   $env:DEEPSEEK_API_KEY='...'
-  & build\\venv\\Scripts\\python.exe scripts\\complex_e2e.py [--keep]
+  & build\\venv\\Scripts\\python.exe scripts\\complex_e2e.py [--keep] [--only 1,4]
 """
 
 from __future__ import annotations
 
+import console_utf8  # noqa: F401,E402 —— 必须最先导入：GBK 控制台下 print 中文/符号会弄崩脚本（见 src/aiforge/stdio.py）
 import asyncio
 import os
 import re
@@ -33,8 +35,16 @@ os.environ["AIFORGE_DATA_DIR"] = str(WORK / "data")
 os.environ["AIFORGE_LOCAL_DIR"] = str(ROOT / "build" / "work" / "testlocal")
 os.environ["AIFORGE_PROJECTS_DIR"] = str(WORK / "projects")
 
-from aiforge import compiler, llm, mesh, render, scad as scad_src  # noqa: E402
-from aiforge.jobs import _geometry_integrity_problems, _integrity_rank  # noqa: E402
+from aiforge import compiler, llm, mesh, render, reqtests, scad as scad_src  # noqa: E402
+# 直接引用应用里的判据函数，不在测试脚本里另写一套（另写一套就会漂）。
+from aiforge.jobs import (  # noqa: E402
+    _declared_gaps_from_source,
+    _downgrade_printability,
+    _geometry_integrity_problems,
+    _hard_failures,
+    _integrity_rank,
+    _mesh_quality_not_worse,
+)
 
 # 真实复杂需求：每个都要求「多个功能特征协同」，而不是一个简单形状。
 # 选例标准照用户给的对标物（D:\模型\Desk_Bin_15mm_Tabletop.3mf）：
@@ -147,6 +157,15 @@ def complexity(scad: str) -> dict[str, object]:
     }
 
 
+def analyze(stl_path, source: str):
+    """与生产同口径的网格分析：源码里声明了间隙就顺带实测空隙。"""
+    declared = _declared_gaps_from_source(source)
+    return (
+        compiler.analyze_stl(stl_path, None, declared or None),
+        declared,
+    )
+
+
 async def run_case(client: llm.DeepSeekClient, case: dict, index: int) -> dict:
     name = str(case["name"])
     prompt = str(case["prompt"])
@@ -174,7 +193,7 @@ async def run_case(client: llm.DeepSeekClient, case: dict, index: int) -> dict:
         print(f"编译失败：{compiled.message[:120]}")
         return {"name": name, "ok": False, "reason": compiled.message[:200], "stats": stats}
 
-    metrics = await asyncio.to_thread(compiler.analyze_stl, compiled.stl_path)
+    metrics, declared_gaps = await asyncio.to_thread(analyze, compiled.stl_path, scad)
     bbox = metrics.bbox
     first_pass_parts = metrics.solid_parts
     first_pass_islands = sum(n for _, n in metrics.cavity_islands)
@@ -183,6 +202,13 @@ async def run_case(client: llm.DeepSeekClient, case: dict, index: int) -> dict:
         f"{metrics.triangles} 面  体积 {metrics.volume_mm3/1000:.1f}cm³  "
         f"封闭={metrics.watertight}  零件数={metrics.solid_parts}"
     )
+    if declared_gaps:
+        gaps = metrics.interior_gaps
+        print(
+            f"      声明间隙 {[f'{n}={v:g}mm' for _l, v, n in declared_gaps]}  "
+            f"实测被夹空档 "
+            f"{[round(x, 2) for x in gaps.per_axis] if gaps else '未测到（模型过大/过小）'}"
+        )
 
     # ---- 复现应用里的「实测 → 定点修复 → 采纳更好的一版」闭环 ----
     # 逻辑与 GenerationRunner._repair_geometry_integrity 保持一致：
@@ -206,11 +232,15 @@ async def run_case(client: llm.DeepSeekClient, case: dict, index: int) -> dict:
             if not retry.ok:
                 repaired_note = "修复版编译失败，保留原版"
                 break
-            retry_metrics = await asyncio.to_thread(compiler.analyze_stl, retry.stl_path)
-            if retry_metrics.watertight and _integrity_rank(retry_metrics, spec) < best_rank:
+            retry_metrics, _ = await asyncio.to_thread(analyze, retry.stl_path, candidate)
+            # 采纳条件与生产一致：网格质量不比原版差 + 完整性严格更好（以前只看
+            # watertight 布尔值，两边都不水密时它恒真，能把 28 条非流形边换成 287 条）
+            if _mesh_quality_not_worse(best_metrics, retry_metrics) and (
+                _integrity_rank(retry_metrics, spec) < best_rank
+            ):
                 best_source, best_compiled, best_metrics = candidate, retry, retry_metrics
                 best_rank = _integrity_rank(retry_metrics, spec)
-            if best_rank == (0, 0, 0):
+            if best_rank == (0, 0, 0, 0, 0, 0, 0):
                 break
 
         if best_source is not scad:
@@ -266,8 +296,31 @@ async def run_case(client: llm.DeepSeekClient, case: dict, index: int) -> dict:
     if case.get("container") and metrics.cavity_islands:
         worst = max(n for _, n in metrics.cavity_islands)
         problems.append(f"腔内孤岛 {worst} 处（特征穿进了腔体）")
+
+    # ---- 声明的间隙/夹口是否真的切出来了（减法特征假绿的正面检验）----
+    # 拿过去的交付版本跑这一段会得到：零件 1、封闭、无穿腔，而夹口沿 Y 实测 0mm；
+    # 只看上面三条验收是看不出来的。
+    suite = reqtests.evaluate(metrics=metrics, requirement=prompt)
+    gap_tests = [t for t in suite.tests if t.kind == "feature-gap"]
+    hard = _hard_failures(suite)
+    # 拿一份「AI 全说没问题」的判定跑降级：这一步验的就是判定诚实化本身
+    sim: dict[str, object] = {"verdict": "pass", "score": 85, "issues": []}
+    downgraded = _downgrade_printability(sim, suite, visual, [])
+    if gap_tests:
+        for t in gap_tests:
+            print(f"   间隙实测 {t.status}：{t.requirement} → {t.actual[:90]}")
+    else:
+        print("   间隙实测：源码里没有可核对的间隙/夹口参数（本判据不适用）")
     print(
-        "   验收：" + ("✓ 通过（一整件、封闭、无穿腔）" if not problems else "✗ " + "；".join(problems))
+        f"   判定诚实化：假设 AI 给 pass/85 → 按实测证据 {sim['verdict']}/{sim['score']}"
+        + (f"（{downgraded}）" if downgraded else "（无需降级）")
+    )
+    if hard:
+        problems.append(
+            f"实测硬失败 {len(hard)} 项：" + "；".join(str(t.requirement) for t in hard[:3])
+        )
+    print(
+        "   验收：" + ("✓ 通过（一整件、封闭、无穿腔、声明间隙量得到）" if not problems else "✗ " + "；".join(problems))
     )
 
     return {
@@ -286,6 +339,9 @@ async def run_case(client: llm.DeepSeekClient, case: dict, index: int) -> dict:
         "repaired": repaired_note,
         "visual_review": visual,
         "problems": problems,
+        "gap_tests": [(t.status, str(t.requirement)) for t in gap_tests],
+        "hard_failures": [str(t.requirement) for t in hard],
+        "honest_verdict": f"{sim['verdict']}/{sim['score']}",
         "spec_features": spec.features,
         "must_have_hits": hits,
     }
@@ -335,6 +391,11 @@ async def main() -> int:
         if r["problems"]:
             print(f"      验收不通过：{'；'.join(r['problems'])}")
             failed += 1
+        if r.get("hard_failures"):
+            print(
+                f"      间隙/特征实测：{r['gap_tests']}；判定诚实化后为 "
+                f"{r['honest_verdict']}（原本 AI 会给 pass/85）"
+            )
         if r["first_pass_parts"] != 1 or r["first_pass_islands"]:
             first_pass_bad += 1
             print(

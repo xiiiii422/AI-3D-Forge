@@ -22,9 +22,8 @@ import importlib
 import logging
 import os
 import shutil
-import socket
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -305,13 +304,26 @@ def check_webview2() -> CheckItem:
     status = cached_status(refresh=True)
     ready, detail = check_native_window_ready()
 
+    # 高分辨率适配排障靠这条：用户说「界面模糊 / 窗口比屏幕还大」时，
+    # 需要看到真实的缩放比、DPI 感知模式与工作区尺寸，而不是让用户自己查。
+    dpi_info: dict[str, object] = {}
+    try:
+        from .dpi import ensure_dpi_awareness
+
+        dpi = ensure_dpi_awareness()
+        dpi_info = {"dpi": dpi.to_dict()}
+        if dpi.dpi != 96:
+            detail = f"{detail}（显示缩放 {dpi.scale:.0%}，DPI 感知：{dpi.mode}）"
+    except Exception:  # noqa: BLE001 - 诊断信息不得影响诊断本身
+        pass
+
     if ready:
         return CheckItem(
             id="webview2",
             title="原生窗口组件",
             status="ok",
             detail=detail,
-            meta={**status.to_dict(), "native_window_ready": True},
+            meta={**status.to_dict(), "native_window_ready": True, **dpi_info},
         )
 
     # 运行时缺失 → 可以一键安装；组件不完整 → 需要重新安装（自动修复帮不上）
@@ -328,7 +340,7 @@ def check_webview2() -> CheckItem:
         detail=detail,
         action=action,
         fixable=fixable,
-        meta={**status.to_dict(), "native_window_ready": False},
+        meta={**status.to_dict(), "native_window_ready": False, **dpi_info},
     )
 
 
@@ -556,8 +568,20 @@ def check_api() -> CheckItem:
     )
 
 
-async def check_api_live(timeout: float = 25.0) -> CheckItem:
-    """真实调用一次 DeepSeek，确认 Key 真的能用（而不是只填了字符串）。"""
+async def check_api_live(timeout: float = 95.0) -> CheckItem:
+    """真实调用一次 DeepSeek，确认 Key 真的能用（而不是只填了字符串）。
+
+    `timeout` 是**整次探测的墙钟上限**，之前它只是形参没接上（实测：函数体里
+    完全没用过这个数）：底层 `DeepSeekClient` 的 90 秒是**每次读**的超时，一个
+    「一直有字节 trickle、但正文永远出不来」的连接会不断重置它，于是这一项能
+    把整份环境报告挂住不放 —— 而 `GET /api/env/report` 是串行 await 它的，
+    前端对这条请求又没有任何超时（`request()` 只在组件卸载时才 abort），
+    用户看到的就是「系统诊断/首次准备」转圈转到天荒地老。
+
+    默认值必须**大于** llm 里那个 90：那里是刻意放宽的（思考模型首字慢、
+    免费档高峰排队，45 秒会误报超时）。在这里卡一个更小的数，就等于把
+    那次修复反向撤销 —— 好好的 Key 会被判成超时。
+    """
     cfg = store()
     key = cfg.api_key
     if not key:
@@ -571,7 +595,19 @@ async def check_api_live(timeout: float = 25.0) -> CheckItem:
     from .llm import test_api_key
 
     api = cfg.config.api
-    result = await test_api_key(key, api.base_url, api.model)
+    try:
+        result = await asyncio.wait_for(
+            test_api_key(key, api.base_url, api.model), timeout=timeout
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        return CheckItem(
+            id="api_live",
+            title="AI 服务连通性",
+            status="fail",
+            detail=f"测试超时：{timeout:g} 秒内 AI 服务没有给出响应。",
+            action="可能是网络拥堵或服务端排队；稍后重试，或先检查 Key 与 Base URL。",
+            fixable=False,
+        )
     if result["ok"]:
         return CheckItem(
             id="api_live",
@@ -705,52 +741,6 @@ def check_mesh_engine() -> CheckItem:
         ),
         meta=metrics.to_dict(),
     )
-
-
-def check_user_data() -> CheckItem:
-    files = paths()
-    writable, message = files.is_writable(files.data_dir)
-    if not writable:
-        return CheckItem(
-            id="project_dir",
-            title="用户配置目录",
-            status="fail",
-            detail=f"配置目录不可写：{files.data_dir}（{message}）",
-            action="请检查当前用户是否对该目录有写入权限。",
-            fixable=True,
-            meta={"path": str(files.data_dir)},
-        )
-    return CheckItem(
-        id="project_dir",
-        title="用户配置目录",
-        status="ok",
-        detail=f"可正常读写（{files.data_dir}）",
-        meta={"path": str(files.data_dir)},
-    )
-
-
-def check_port_available() -> CheckItem:
-    """本机回环端口是否可用（服务无法启动时的头号原因）。"""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-        return CheckItem(
-            id="deps",
-            title="本机服务端口",
-            status="ok",
-            detail=f"本机回环网络正常（示例端口 {port} 可用）。",
-            meta={"sample_port": port},
-        )
-    except OSError as exc:
-        return CheckItem(
-            id="deps",
-            title="本机服务端口",
-            status="fail",
-            detail=f"无法在本机建立网络服务：{exc.strerror or exc}",
-            action="通常是安全软件拦截所致，请允许本软件访问本地网络。",
-            fixable=False,
-        )
 
 
 # --------------------------------------------------------------------------

@@ -2,7 +2,8 @@
 
 这些图用于 README 与文档，来自**假后端（`webui/mock-server.mjs`）的固定样例数据**，
 不是任何真实用户的机器。生成脚本：`webui/scripts/interface-shots.mjs` 与
-`webui/scripts/screenshot.ps1`。
+`scripts/screenshot.ps1`。本目录里的图是入库的（只有这里），但 `webui/scripts/shots/`
+下的报告与截图不入库 —— 不要把结论写到那里去。
 
 | 文件 | 内容 |
 |---|---|

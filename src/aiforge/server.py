@@ -172,6 +172,14 @@ def _prepare_webview_runtime() -> None:
 
 def open_window(url: str) -> bool:
     """尝试用 WebView2 打开原生窗口。返回是否成功（失败则调用方退回浏览器）。"""
+    # 必须在创建任何窗口之前声明 DPI 感知，否则高缩放屏上整窗口被系统位图拉伸（发虚）；
+    # 同时按真实工作区夹紧窗口尺寸（200% 缩放的 1080p 屏只有 960×540 DIP，
+    # 写死 1080×700 的最小尺寸会让窗口比屏幕还大）。
+    from .dpi import ensure_dpi_awareness, window_geometry
+
+    ensure_dpi_awareness()
+    size, min_size = window_geometry((1360, 880), (1080, 700))
+
     _prepare_webview_runtime()
     try:
         import webview
@@ -183,9 +191,9 @@ def open_window(url: str) -> bool:
         window = webview.create_window(
             WINDOW_TITLE,
             url,
-            width=1360,
-            height=880,
-            min_size=(1080, 700),
+            width=size[0],
+            height=size[1],
+            min_size=min_size,
             background_color="#FFFFFF",
             text_select=True,
         )
@@ -274,15 +282,14 @@ def run(port: int | None = None, *, browser_only: bool = False, open_browser: bo
         if not used_window:
             browser_reason = (
                 "原生窗口启动失败，已改用系统浏览器。"
-                "可以点击界面上的「安装组件」按钮修复，或查看「系统诊断」了解详情。"
+                "可以点击界面上的「一键安装」按钮修复，或查看「系统诊断」了解详情。"
             )
 
     if not used_window:
-        target = url
-        if browser_reason:
-            from urllib.parse import quote
-
-            target = f"{url}?browser_fallback=1&reason={quote(browser_reason)}"
+        # URL 上只带一个标记：原因文字由界面自己拉 /api/app/window-runtime 取（那里
+        # 能给出真实版本与安装途径），而不是把一句话拼进地址栏 —— 后者既没人读，
+        # 又会让用户看到一个长长的、可能被截断的网址。
+        target = f"{url}?browser_fallback=1" if browser_reason else url
         opened = open_in_browser(target)
         if not opened:
             print("无法自动打开界面，请手动在浏览器中访问上面的地址。")

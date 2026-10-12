@@ -296,6 +296,11 @@ export interface JobParam {
   unit: string;
   min: number | null;
   max: number | null;
+  /**
+   * 参数分类（用于「参数微调」分栏）。后端目前不产出这个字段，
+   * 缺省时前端按变量名/说明归类，见 lib/paramGroups.classifyParam。
+   */
+  group?: string | null;
 }
 
 export interface StlInfo {
@@ -378,6 +383,33 @@ export interface Printability {
   printer?: PrinterContext | null;
 }
 
+/** 一条可执行需求测试的结果（后端 aiforge/reqtests.py，口径对齐 CADTests） */
+export interface ReqTest {
+  group: string;
+  requirement: string;
+  kind: 'dimension' | 'hole' | 'thread' | 'integrity' | 'print' | 'semantic' | string;
+  /** pass 达成 / fail 没达成 / invalid 该测却没测出来 / manual 得靠人或外观复核确认 */
+  status: 'pass' | 'fail' | 'invalid' | 'manual';
+  expected: string;
+  actual: string;
+  deviation_pct: number | null;
+  tolerance_mm: number | null;
+  fix_hint: string;
+  /** 咨询类（工艺建议）：只进清单，不算需求未达成 */
+  advisory: boolean;
+}
+
+/** 一次生成/修改的需求核对表 */
+export interface ReqSuite {
+  pass_rate: number;
+  requirement_score: number;
+  invalid_ratio: number;
+  counts: { pass: number; fail: number; invalid: number; manual: number };
+  groups: number;
+  manual: number;
+  tests: ReqTest[];
+}
+
 export interface JobResult {
   project_id: string;
   revision: number;
@@ -397,6 +429,8 @@ export interface JobResult {
   printer: PrinterContext | null;
   /** 本次生成依据的设计契约 */
   spec?: DesignSpec | null;
+  /** 逐条需求判定与 PR/RS/IR（对标成熟产品的“可验证交付”） */
+  requirement_tests?: ReqSuite | null;
   /** 修改类作业的改动核对结论；新建时为 null */
   change_verdict?: ChangeVerdict | null;
   /** 改动核对结论的人话版本 */
@@ -409,15 +443,6 @@ export interface ConfirmSpecRequest {
   spec?: DesignSpec | null;
   /** 补充说明，会并入契约的澄清记录 */
   note?: string | null;
-}
-
-/** SSE `message` 事件（= JobMessage） */
-export type JobStreamMessageEvent = JobMessage;
-
-/** SSE `stage` 事件 */
-export interface JobStreamStageEvent {
-  stage: JobStage;
-  percent: number;
 }
 
 /** POST /api/jobs/{job_id}/cancel → { ok: true } */
@@ -694,13 +719,23 @@ export interface Settings {
   api_key_store: 'credential_manager' | 'config_file' | 'env';
   base_url: string; // 默认 "https://api.deepseek.com"
   model: string; // 默认 "deepseek-chat"
+  /** 混合模式：规格解析/评审/复核用的免费档模型；空串 = 不启用 */
+  economy_model: string;
+  /** 经济档服务商地址；空串 = 与主提供商同地址 */
+  economy_base_url: string;
   openscad_path: string | null;
   data_dir: string; // %APPDATA%\AI-3D-Forge
   projects_dir: string; // %USERPROFILE%\Documents\AI-3D-Forge\Projects
+  /** 日志目录（%LOCALAPPDATA%\AI-3D-Forge\logs）：不在 data_dir 里，界面不能猜 */
+  log_dir: string;
   keep_stl_history: boolean;
   auto_install_openscad: boolean;
   first_run_done: boolean;
   theme: 'light' | 'dark' | 'system';
+  /** 界面材质：solid = 实面（默认），glass = 液态玻璃 */
+  appearance: 'solid' | 'glass';
+  /** 玻璃透明度百分比 0–60；后端会夹到合法区间（上限受对比度约束） */
+  glass_transparency: number;
   /** 契约 §3A：POST /api/printers/select 会同步写入这三个字段 */
   printer_id?: string;
   printer_name?: string;
@@ -709,6 +744,10 @@ export interface Settings {
   announce_in_chat: boolean;
   /** 生成前是否先让用户确认「我对需求的理解」（规格卡片） */
   confirm_spec: boolean;
+  /** 送到切片软件的默认目标 id（只存 id，路径每次实扫） */
+  default_slicer?: string | null;
+  /** 自动检测漏网时用户手动指定的主程序 */
+  slicer_custom_paths?: string[];
 }
 
 /** PUT /api/settings —— 部分更新，字段均可选 */
@@ -716,12 +755,65 @@ export interface SettingsUpdate {
   api_key?: string;
   base_url?: string;
   model?: string;
+  economy_model?: string;
+  economy_base_url?: string;
   openscad_path?: string | null;
   keep_stl_history?: boolean;
   auto_install_openscad?: boolean;
   theme?: 'light' | 'dark' | 'system';
+  appearance?: 'solid' | 'glass';
+  glass_transparency?: number;
   announce_in_chat?: boolean;
   confirm_spec?: boolean;
+  /** 送到切片软件的默认目标；空串 = 取消（回到"用检测到的第一个"） */
+  default_slicer?: string | null;
+  /** 整表替换手动指定的主程序列表 */
+  slicer_custom_paths?: string[];
+}
+
+/* ---------------- 切片软件（送到切片软件）---------------- */
+
+/** 检测到的一个切片软件。字段是刻意少的：界面只需要知道哪个软件、版本、从哪找到的、开没开。 */
+export interface Slicer {
+  id: string;
+  name: string;
+  exe: string;
+  version: string | null;
+  /** 发现途径：文件关联 / 已安装程序 / 系统注册 / 常见安装目录 / 手动指定 */
+  source_label: string;
+  running: boolean;
+}
+
+/** GET /api/slicers */
+export interface SlicersResponse {
+  slicers: Slicer[];
+  default_id: string | null;
+  count: number;
+  /** 我们认得哪些切片软件：没检测到时提示用户装其中任意一个 */
+  recognized_names: string[];
+}
+
+/**
+ * POST /api/projects/{id}/send-to-slicer
+ *
+ * 三种结果都是"看到了什么就说什么"，不拿"没报错"当成功：
+ *  started = 进程还活着；forwarded = 它立刻退出了（单实例把文件交给了已开着的窗口）；
+ *  failed = 带着退出码退出。
+ */
+export interface SendToSlicerResult {
+  status: 'started' | 'forwarded' | 'failed';
+  detail: string;
+  pid: number;
+  exit_code: number | null;
+  /** 是否成功脱离本软件的进程守护（false 时退出本软件会连带关掉切片器） */
+  detached: boolean;
+  slicer: string;
+  slicer_name: string;
+  file: string;
+  exe: string;
+  kind: '3mf' | 'stl';
+  source_label: string;
+  note?: string;
 }
 
 export interface ApiKeyTestResponse {
@@ -750,6 +842,25 @@ export interface HealthResponse {
   uptime_s: number;
 }
 
+/** GET /api/app/window-runtime —— 原生窗口组件（WebView2）状态。
+ *  缺它时软件会在浏览器里打开，用户手册 §2.2 承诺「页面顶部说明原因 + 一键安装」，
+ *  那条横幅用的就是这份形状。 */
+export interface WindowRuntimeStatus {
+  installed: boolean;
+  version: string | null;
+  source: string | null;
+  detail: string;
+  install_hint: string;
+  download_url: string;
+  bootstrapper_url: string;
+}
+
+/** POST /api/app/window-runtime/install —— 一键装（winget 优先，失败回退官方 Bootstrapper 说明） */
+export interface WindowRuntimeInstallResponse {
+  ok: boolean;
+  message: string;
+}
+
 /* ------------------------------------------------------------------ *
  * 8. 错误码表
  * ------------------------------------------------------------------ */
@@ -764,6 +875,9 @@ export type ApiErrorCode =
   | 'NEED_ADMIN'
   | 'DISK_FULL'
   | 'CANCELLED'
+  | 'NOT_FOUND'
+  | 'BUSY'
+  | 'SLICER_NOT_FOUND'
   | 'INTERNAL';
 
 /** 非 2xx 一律返回 {"detail": "...", "code": "...", "hint": "..."} */

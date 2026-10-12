@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import re
-import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -520,9 +519,10 @@ def resolve_process(profile: PrinterProfile, material: str | None = None) -> Pro
       * 最小凸起 ≈ 1.5 × 喷嘴 —— 低于这个尺寸的凸字/凸点往往被下一层压塌。
       * 活动件间隙 ≈ 0.6 × 喷嘴，且不小于 0.2mm。
       * 桥接上限直接采用机型经验值（受冷却与材料影响远大于受几何影响）。
-      * $fn：OpenSCAD 的圆柱由内接多边形逼近。要让多边形的「边到弧的最大误差」
-        小于半个喷嘴，可推出 fn ≥ π / sqrt(8 × 误差 / 直径)。取误差 = 喷嘴 ÷ 2.2
-        并夹在 [24, 160] 之间 —— 既保证圆弧面不会出现明显棱面，又不至于生成海量面片。
+      * $fn：OpenSCAD 的圆柱由内接多边形逼近，允许偏差与夹范围都由 `resolve_fn` 一处决定。
+        这里不重复那套数字（公式写在 `resolve_fn` 的 docstring 里）——
+        旧文本在这里抄了一份 ÷2.2 / [24,160] / sqrt(8·…) 的说法，与代码里的
+        ÷16 / [48,160] / sqrt(4·…) 互相矛盾，拿文档去复算 $fn 的人会得出与产品不同的数。
     """
     is_resin = profile.extruder == "resin" or profile.nozzle_mm <= 0
     material_key = (material or (profile.materials[0] if profile.materials else "PLA")).upper()
@@ -760,10 +760,6 @@ class PrinterRegistry:
         if printer_id in self._custom:
             return self._custom[printer_id]
         return _BUILTIN_BY_ID.get(printer_id)
-
-    def require(self, printer_id: str | None) -> PrinterProfile:
-        profile = self.get(printer_id) or self.selected()
-        return profile
 
     def selected_id(self) -> str:
         return self._selected_id

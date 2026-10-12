@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import console_utf8  # noqa: F401,E402 —— 必须最先导入：GBK 控制台下 print 中文/符号会弄崩脚本（见 src/aiforge/stdio.py）
 import hashlib
 import os
 import sys
@@ -79,8 +80,8 @@ DELIVERABLES: list[tuple[str, str, str]] = [
     ("installer/AI-3D-Forge.iss", "安装器脚本", "§42 安装包制作"),
     ("scripts/build.ps1", "一键完整构建", "§49 完整构建"),
     ("scripts/build_installer.ps1", "生成安装包", "§42"),
-    ("scripts/selfcheck.py", "后端自检（50 项，含设计机制 131 项子检查）", "§49 完整构建 / 测试"),
-    ("scripts/selfcheck_design.py", "设计规格与改动机制自检（131 项，不调用 AI）", "§46 生成贴合意图"),
+    ("scripts/selfcheck.py", "后端自检（完整 72 项，含设计机制 142 项子检查）", "§49 完整构建 / 测试"),
+    ("scripts/selfcheck_design.py", "设计规格与改动机制自检（142 项，不调用 AI）", "§46 生成贴合意图"),
     ("scripts/e2e_test.py", "端到端验收（真实 AI）", "§46 最终验收标准"),
     ("scripts/verify_e2e_evidence.py", "端到端机制证据核对（确认机制真被触发）", "§46 最终验收标准"),
     ("scripts/check_no_secrets.py", "密钥/隐私扫描（当前文件 + Git 历史）", "开源发布：禁止提交敏感信息"),

@@ -66,17 +66,18 @@ API Key 只存在你自己的电脑上（Windows 凭据管理器），不会上�
 
 ## 4. 打
 
-点 **[下载 STL]** → 拖进切片软件（Cura / PrusaSlicer / Bambu Studio / OrcaSlicer）
-→ 切片 → 拷到打印机。
+装过切片软件的话，结果卡片上会有一个 **[送到切片软件]** —— 点一下直接打开，不用自己找文件。
+否则点 **[下载 3MF]**（带毫米单位，不会出现“导入后大 10 倍”）
+→ 拖进切片软件（Cura / PrusaSlicer / Bambu Studio / OrcaSlicer）→ 切片 → 拷到打印机。
 
-项目文件都在 `文档\AI-3D-Forge\Projects\` 下（`.scad` 源码 + `.stl` 模型）。
+项目文件都在 `文档\AI-3D-Forge\Projects\` 下（`.scad` 源码 + `.stl` 模型 + `.3mf`）。
 **卸载或升级都不会删除你的项目和 API Key。**
 
 ---
 
 ## 遇到问题
 
-- 软件内 **设置 → 系统诊断**：逐项体检 + 一键自动修复
+- 软件内 **顶栏 → 系统诊断**：逐项体检 + 一键自动修复
 - 常见问题清单：[docs/USER_GUIDE.md 第七节](docs/USER_GUIDE.md#七常见问题)
 - 软件缺陷 / 安全漏洞：见 [CONTRIBUTING.md](CONTRIBUTING.md) 与 [SECURITY.md](SECURITY.md)
 

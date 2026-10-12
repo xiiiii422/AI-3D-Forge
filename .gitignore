@@ -57,6 +57,28 @@ webui/scripts/*-report.json
 installer/Output/
 installer/*.exe
 
+# --- 仓库根目录的私人物料 / 媒体文件 ---
+# 实测：本仓库根目录出现过一个与项目无关的文件夹（`2月20日(1)/`），
+# 里面是 43MB 的 mp4 与一张封面 jpg。它不属于本项目，却能被 `git add -A`
+# 捡进仓库 —— 而 docs\PUBLISH-TO-GITHUB.md 规定的提交步骤正是 `git add -A`。
+# 一次就把 43MB 写进 git 历史，clone 的人得连这份视频一起下载。
+# export_source.ps1 的白名单本来就会挡住它（不进源码包），但**挡不住 git**。
+# 三道一起上：这里忽略、路径守卫拦、导出白名单拦。
+/2月20日(1)/
+# 根目录散落的媒体文件一律不进仓库（产品截图只放 docs/images/）
+/*.mp4
+/*.mov
+/*.avi
+/*.mkv
+/*.webm
+
+# --- 工作记忆 / 工具状态（编程助手 skill 的过账目录）---
+# 这是工具状态而不是产品资产：daily.md / session_memory_*.jsonl 里写的是本机路径、
+# 未验证结论与过程流水。而发布流程规定用 `git add -A` 提交，不忽略就会
+# 把这些工作区状态写进公开仓库的历史（历史一旦推上去，删也删不掉）。
+# 上一轮已经因为同一形状翻过车（根目录那个 43MB 文件夹）。
+.ai-memory/
+
 # --- 编辑器 / 系统 ---
 .vscode/
 .idea/

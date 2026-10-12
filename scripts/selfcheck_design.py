@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import console_utf8  # noqa: F401,E402 —— 必须最先导入：GBK 控制台下 print 中文/符号会弄崩脚本（见 src/aiforge/stdio.py）
 import os
 import re
 import sys
@@ -21,17 +22,21 @@ from aiforge import changes, design, llm  # noqa: E402
 
 FAILURES: list[str] = []
 
+# 本文件里有一行明细带「−」（U+2212，数学减号）：GBK 控制台下直接 print 会抛
+# UnicodeEncodeError，把整个自检带倒。打印结果不该决定被测代码的成败。
+_SAFE_PRINT = getattr(console_utf8, "safe_print", print)
+
 
 def check(name: str, condition: bool, detail: str = "") -> None:
     if condition:
-        print(f"  [OK]   {name}" + (f" —— {detail}" if detail else ""))
+        _SAFE_PRINT(f"  [OK]   {name}" + (f" —— {detail}" if detail else ""))
     else:
         FAILURES.append(f"{name}: {detail}")
-        print(f"  [FAIL] {name} —— {detail}")
+        _SAFE_PRINT(f"  [FAIL] {name} —— {detail}")
 
 
 def section(title: str) -> None:
-    print(f"\n=== {title} ===")
+    _SAFE_PRINT(f"\n=== {title} ===")
 
 
 # --------------------------------------------------------------------------
@@ -657,7 +662,24 @@ def t_ai_review_merge() -> None:
     jobs._merge_ai_review(v, {"requested_change_applied": None, "functional_ok": None, "summary": "无法判定", "concerns": []})  # noqa: SLF001
     check("三态未知时不误判", v.ok, v.describe())
 
-    # 5) AI 疑点会抬高代价，但没有程序化证据重
+    # 5) AI 疑点会抬高代价，但没有程序化证据时权重必须更低（AI 会误报）。
+    #    拿 clean 当**基准下界**：一次干净改动必须正好 0 分 —— 只要它不是 0，
+    #    「都不达标」的版本之间就是在拿一个带常数的尺子比高下。
+    check(
+        "干净改动的代价正好是 0（取舍的基准下界）",
+        clean.penalty() == 0.0,
+        f"{clean.penalty():.1f}",
+    )
+    # 单项对单项：同一个结论下，一条 AI 疑点必须比一次程序化越权便宜。
+    # （下面那组是两条对两条，两边同时改权重它依旧能过 —— 而源码里那句
+    #  「权重略低于程序化证据」说的就是**每一项**的权重，不是总数。）
+    ai_only = changes.ChangeVerdict(ok=True, ai_concerns=["底座可能偏窄"])
+    one_bad = changes.ChangeVerdict(ok=True, unauthorized=["pad_dia"])
+    check(
+        "单项权重：AI 疑点低于一次程序化越权",
+        ai_only.penalty() < one_bad.penalty(),
+        f"{ai_only.penalty():.1f} vs {one_bad.penalty():.1f}",
+    )
     with_concerns = changes.ChangeVerdict(ok=False, ai_concerns=["a", "b"])
     programmatic = changes.ChangeVerdict(ok=False, unauthorized=["x", "y"])
     check(
@@ -995,15 +1017,15 @@ def main() -> int:
     t_confirmation_gate()
     t_ai_review_merge()
 
-    print("\n" + "=" * 70)
+    _SAFE_PRINT("\n" + "=" * 70)
     if FAILURES:
-        print(f"失败 {len(FAILURES)} 项：")
+        _SAFE_PRINT(f"失败 {len(FAILURES)} 项：")
         for item in FAILURES:
-            print(f"  ✗ {item}")
-        print("=" * 70)
+            _SAFE_PRINT(f"  ✗ {item}")
+        _SAFE_PRINT("=" * 70)
         return 1
-    print("全部通过")
-    print("=" * 70)
+    _SAFE_PRINT("全部通过")
+    _SAFE_PRINT("=" * 70)
     return 0
 
 

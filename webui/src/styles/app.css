@@ -354,6 +354,8 @@ textarea {
   font-size: var(--fs-xs);
   color: var(--text-2);
   line-height: 1.5;
+  /* 提示里会出现完整的本机路径（里面没有空格），不能让它撑破卡片 */
+  overflow-wrap: anywhere;
 }
 
 .input,
@@ -1122,10 +1124,60 @@ button.pill:hover {
   overflow: auto;
 }
 
+/* 底部作者账号栏：全局可见，但不与正文抢视觉权重 */
+.app-footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-2) var(--sp-5);
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow-x: auto;
+}
+
+.app-footer-title {
+  color: var(--text-2);
+  opacity: 0.85;
+}
+
+.app-footer-link {
+  color: var(--text-2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.app-footer-link:hover,
+.app-footer-link:focus-visible {
+  color: var(--brand);
+}
+
 .page {
   max-width: 940px;
   margin: 0 auto;
   padding: var(--sp-6) var(--sp-5) var(--sp-8);
+}
+
+/* 页面切换：进入时淡入 + 轻微上推（iOS 那种“内容推进来”的手感）。
+   时长跟着 --dur：prefers-reduced-motion 下 --dur 已是 1ms，动画自动降级为无感。 */
+@keyframes page-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 用结构选择器而不是逐个页面加 class：路由正文只有一个根节点，
+   以后新增页面不用回来补一份动画声明。 */
+.app-main > div > * {
+  animation: page-in calc(var(--dur) * 1.5) var(--ease) both;
 }
 
 .page-head {
@@ -1581,6 +1633,9 @@ button.pill:hover {
   display: flex;
   gap: 6px;
   padding: 6px;
+  /* 窄窗口下统计浮层实测宽 495px 而 viewer 列只 315px，直接溢出到对话列上
+     并吞掉「打开文件夹」按钮的点击 —— 浮层必须锁在 viewer 宽度内 */
+  max-width: calc(100% - var(--sp-4) * 2);
   border: 1px solid var(--line);
   border-radius: var(--r-btn);
   background: color-mix(in srgb, var(--surface) 88%, transparent);
@@ -1591,6 +1646,99 @@ button.pill:hover {
 .viewer-overlay-stats {
   left: var(--sp-4);
   bottom: var(--sp-4);
+  flex-wrap: wrap;
+  /* 纯展示浮层：不应参与点击，否则会盖住下方内容的按钮 */
+  pointer-events: none;
+}
+
+/* ---------------- 实时尺寸标注 ---------------- */
+
+.viewer-root {
+  position: absolute;
+  inset: 0;
+}
+
+.viewer-dims {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  /* 标签只是读数，不能挡住旋转与点选 */
+  pointer-events: none;
+}
+
+.dim-tag {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 1px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-pill);
+  /* 实底而不是半透：尺寸线会落在模型任意位置上，半透底在深色件上就读不出了 */
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  color: var(--text);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  will-change: transform;
+}
+
+/* 选中的那条边：与 3D 里的高亮柱同一语义（品牌色只做描边/选中）。
+   底必须还是实底：--brand-soft 只有 10% 不透明度，直接拿来用会让标签
+   压在橙色高亮柱上两边糊成一片（实测「该边 80.0 mm」读不出来）。 */
+.dim-tag.is-edge {
+  border-color: var(--brand-line);
+  background: color-mix(in srgb, var(--brand) 12%, var(--surface));
+  color: var(--brand-text);
+  font-weight: 570;
+}
+
+.viewer-dim-hint {
+  position: absolute;
+  z-index: 2;
+  /* 左上：左下已被「模型数据」浮层占了（窄窗口下它宽到接近整列，再放一个
+     提示会叠在一起），右上是预览报错浮层的位置。尺寸标签会主动避开它。 */
+  left: var(--sp-4);
+  top: var(--sp-4);
+  max-width: calc(100% - var(--sp-4) * 2);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-btn);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(8px);
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+}
+
+.dim-hint-value {
+  color: var(--text);
+  font-weight: 570;
+  font-variant-numeric: tabular-nums;
+}
+
+.dim-hint-clear {
+  padding: 2px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text-2);
+  font: inherit;
+  cursor: pointer;
+  transition: color var(--t), border-color var(--t);
+}
+
+.dim-hint-clear:hover {
+  color: var(--text);
+  border-color: var(--text-3);
+}
+
+.dim-hint-clear:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
 }
 
 .viewer-overlay-top {
@@ -1602,7 +1750,7 @@ button.pill:hover {
 
 .stat {
   padding: 2px 8px;
-  min-width: 96px;
+  min-width: 88px;
 }
 
 .stat + .stat {
@@ -1693,6 +1841,12 @@ button.pill:hover {
   padding: var(--sp-3) var(--sp-4) var(--sp-4);
 }
 
+/* 分栏后参数区比平铺时高出一截（每类一个标题），不给点空间就得一直滚；
+   3D 视图仍占 60% 以上，而且这一段只在有结果卡时才会出现。 */
+.params-sheet:has(.params-groups) {
+  max-height: 40%;
+}
+
 .params-head {
   display: flex;
   align-items: center;
@@ -1714,8 +1868,57 @@ button.pill:hover {
 
 .params-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+  /* min(158px, 100%)：窄容器（分栏后每栏可用宽度更小）下不能硬撑 158px，
+     否则格子会探出卡片、撑出横向滚动条 */
+  grid-template-columns: repeat(auto-fill, minmax(min(158px, 100%), 1fr));
   gap: var(--sp-3);
+}
+
+/* ---------- 参数分栏（规则见 src/lib/paramGroups.ts） ---------- */
+/* 一次生成常有 8~16 个参数，全平铺时改一个值要先逐个读完标签；
+   分栏只做视觉归组，芯片本身（.chip / .chip-label / .chip-input）不改。 */
+.params-groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.params-group {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg-sub);
+}
+
+/* 该组里有已改动未应用的参数：描边沿用 .chip-input.is-dirty 的橙色语义 */
+.params-group.is-changed {
+  border-color: var(--brand-line);
+}
+
+.params-group-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: var(--sp-1);
+  font-size: var(--fs-xs);
+  font-weight: 570;
+  color: var(--text-2);
+}
+
+.params-group-count {
+  padding: 0 5px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.params-group-flag {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--brand);
 }
 
 .chip {
@@ -2003,9 +2206,15 @@ kbd {
    better-accessibility：当页面在正文之前有重复的导航/外壳时，
    「跳到主内容」必须是第一个可聚焦元素。默认视觉隐藏，聚焦时才出现。 */
 .skip-link {
+  /* 为什么不用 left:-9999px：高 DPI / 浏览器放大时它会撑出横向滚动条，
+     也让布局体检报「元素越界」。
+     为什么不用 width:1px 强制收起：那会让里面的文字被裁（体检报
+     text-overflow-x / text-clipped-y），键盘目标还会小到不达标。
+     正确做法：保留自然尺寸（不裁文字、点击区合规），用 clip-path 裁掉，视觉不可见，
+     并 pointer-events:none 不拦上层点击；聚焦时完全恢复。 */
   position: absolute;
-  left: -9999px;
-  top: 0;
+  top: var(--sp-2);
+  left: var(--sp-4);
   z-index: 100;
   padding: var(--sp-2) var(--sp-4);
   border-radius: var(--r-sm);
@@ -2013,11 +2222,14 @@ kbd {
   color: var(--text-inverse);
   font-size: var(--fs-sm);
   text-decoration: none;
+  white-space: nowrap;
+  clip-path: inset(50%);
+  pointer-events: none;
 }
 
 .skip-link:focus-visible {
-  left: var(--sp-4);
-  top: var(--sp-2);
+  clip-path: none;
+  pointer-events: auto;
   outline: 2px solid var(--brand);
   outline-offset: 2px;
 }
@@ -2151,6 +2363,92 @@ kbd {
   display: flex;
   gap: var(--sp-2);
   flex-wrap: wrap;
+}
+
+/* 顶栏「使用模式」胶囊：与机型胶囊同层级；文字绝不换行（实测被挤成竖排） */
+.mode-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+}
+
+.mode-chip .select {
+  height: 28px;
+  padding: 0 8px;
+  max-width: 180px;
+}
+
+/* ---------- 需求核对表（结果卡） ----------
+   逐条「要求 / 实测 / 偏差 / 公差」。这是用户判断「这版能不能直接用」的依据，
+   所以必须比打印评分更显眼一点，但不能抢过下载按钮。 */
+.req-check {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.req-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.req-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.req-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+
+.req-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.req-name {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
+/* 数字用等宽：实测值会跳动，字宽不跳用户才看得出是在比对同一列 */
+.req-nums {
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.req-hint {
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+}
+
+/* 「工艺建议」角标：把"建议加厚"和"你的需求没做到"区分开，
+   否则一条黄色行会被读成需求失败。 */
+.req-tag {
+  margin-left: var(--sp-2);
+  padding: 0 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-sm);
+  font-style: normal;
+  font-weight: 400;
+  color: var(--text-2);
 }
 
 .issue {
@@ -3143,5 +3441,327 @@ kbd {
 
   .side-foot .btn {
     padding: 0;
+  }
+}
+
+/* ==================================================================
+   液态玻璃外观（设置 → 外观 → 液态玻璃）
+   ------------------------------------------------------------------
+   开关是 `<html data-appearance="glass">`，透明度是 `--glass-solid`，
+   两者都由 src/hooks/useAppearance.ts 写入。本段只引用令牌，不写颜色。
+
+   为什么不是「所有面都变半透」：
+   1. 嵌套的两层玻璃会互相屏蔽 —— backdrop-filter 会为其后代会建立
+      backdrop root，内层只能采到外层已画好的那一叠，两层 75% 叠起来
+      等于不透（而且白花一次模糊）。所以只给「顶层」上玻璃。
+   2. 读数层（.dim-tag 等）必须保持实底：它们压在 3D 场景任意位置上。
+   ================================================================== */
+
+/* 环境光斑：背板后面只有一片纯色页底时，半透面板只会「发灰」不像玻璃。
+   body 的背景会被传播到画布上，所以 z-index:-1 的伪元素正好落在
+   「页底之上、内容之下」，既能被 backdrop-filter 采到，又不受滚动影响。 */
+:root[data-appearance='glass'] body::before {
+  content: '';
+  position: fixed;
+  inset: -18%;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(38% 42% at 18% 20%, var(--glass-orb-1), transparent 70%),
+    radial-gradient(34% 40% at 84% 10%, var(--glass-orb-2), transparent 70%),
+    radial-gradient(46% 48% at 62% 92%, var(--glass-orb-3), transparent 72%);
+  animation: glass-drift 46s var(--ease) infinite alternate;
+}
+
+@keyframes glass-drift {
+  to {
+    transform: translate3d(2.5%, -2%, 0) scale(1.06);
+  }
+}
+
+/* 玻璃本体。只列顶层容器与浮层，不列嵌套在它们里面的小单元格。 */
+:root[data-appearance='glass'] .topbar,
+:root[data-appearance='glass'] .side,
+:root[data-appearance='glass'] .panel,
+:root[data-appearance='glass'] .params-sheet,
+:root[data-appearance='glass'] .viewer-toolbar,
+:root[data-appearance='glass'] .app-footer,
+:root[data-appearance='glass'] .card,
+:root[data-appearance='glass'] .modal,
+:root[data-appearance='glass'] .menu,
+:root[data-appearance='glass'] .toast,
+:root[data-appearance='glass'] .viewer-overlay,
+:root[data-appearance='glass'] .viewer-dim-hint {
+  position: relative;
+  isolation: isolate; /* 把下边的 z-index:-1 高光层留在本层背景之上、文字之下 */
+  background-color: var(--glass-fill);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+}
+
+/* 跟随指针的那一团「液态」高光。
+   JS 只负责写 --sheen-x / --sheen-y 两个变量（src/lib/liquidSheen.ts），
+   半径、混色、透明度渐变全在 CSS；用 z-index:-1 而不是背景图，
+   是为了能跟 opacity 一起过渡（背景图的位置不可动画）。 */
+:root[data-appearance='glass'] .topbar::before,
+:root[data-appearance='glass'] .side::before,
+:root[data-appearance='glass'] .panel::before,
+:root[data-appearance='glass'] .params-sheet::before,
+:root[data-appearance='glass'] .viewer-toolbar::before,
+:root[data-appearance='glass'] .app-footer::before,
+:root[data-appearance='glass'] .card::before,
+:root[data-appearance='glass'] .modal::before,
+:root[data-appearance='glass'] .menu::before,
+:root[data-appearance='glass'] .toast::before,
+:root[data-appearance='glass'] .viewer-overlay::before,
+:root[data-appearance='glass'] .viewer-dim-hint::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(
+    var(--glass-sheen-size) circle at var(--sheen-x, 50%) var(--sheen-y, 0%),
+    var(--glass-sheen),
+    transparent 62%
+  );
+  opacity: 0;
+  transition: opacity var(--t);
+}
+
+:root[data-appearance='glass'] .topbar:hover::before,
+:root[data-appearance='glass'] .side:hover::before,
+:root[data-appearance='glass'] .panel:hover::before,
+:root[data-appearance='glass'] .params-sheet:hover::before,
+:root[data-appearance='glass'] .viewer-toolbar:hover::before,
+:root[data-appearance='glass'] .app-footer:hover::before,
+:root[data-appearance='glass'] .card:hover::before,
+:root[data-appearance='glass'] .modal:hover::before,
+:root[data-appearance='glass'] .menu:hover::before,
+:root[data-appearance='glass'] .toast:hover::before,
+:root[data-appearance='glass'] .viewer-overlay:hover::before,
+:root[data-appearance='glass'] .viewer-dim-hint:hover::before,
+:root[data-appearance='glass'] .card:focus-within::before {
+  opacity: 1;
+}
+
+/* 这几块原来的底色是页底系（--bg / --bg-sub），换成同系的玻璃，
+   不然侧栏会突然比内容区亮一挡。 */
+:root[data-appearance='glass'] .topbar,
+:root[data-appearance='glass'] .panel,
+:root[data-appearance='glass'] .params-sheet,
+:root[data-appearance='glass'] .viewer-toolbar {
+  background-color: var(--glass-fill-chrome);
+}
+
+:root[data-appearance='glass'] .side {
+  background-color: var(--glass-fill-sub);
+}
+
+/* 浮层是「厚玻璃」：不跟着滑块一起变透。
+   弹窗/菜单/提示条/预览浮层背后压着整页文字或 3D 场景，实测（见 tokens.css 里
+   --glass-solid-float 的注释）普通页面 60% 透明度还达标，弹窗正文却已经掉到
+   1.84:1 —— 所以「太透看不清字」这个 iOS 26 被骂最狠的问题，必须在浮层上封死。
+   观感上仍然是玻璃：模糊更强、上缘高光、投影、跟随指针的高光都保留。 */
+:root[data-appearance='glass'] .modal,
+:root[data-appearance='glass'] .menu,
+:root[data-appearance='glass'] .toast,
+:root[data-appearance='glass'] .viewer-overlay,
+:root[data-appearance='glass'] .viewer-dim-hint {
+  background-color: var(--glass-fill-float);
+  backdrop-filter: blur(var(--glass-blur-float)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur-float)) saturate(var(--glass-saturate));
+}
+
+/* 上缘镜面高光：玻璃顶部那一条亮线。弹窗/菜单/胶囊本来就带投影，
+   要把原投影一并保留，否则一开玻璃浮层就“贴地”了。 */
+:root[data-appearance='glass'] .topbar,
+:root[data-appearance='glass'] .side,
+:root[data-appearance='glass'] .panel,
+:root[data-appearance='glass'] .params-sheet,
+:root[data-appearance='glass'] .viewer-toolbar,
+:root[data-appearance='glass'] .app-footer,
+:root[data-appearance='glass'] .card {
+  box-shadow: var(--glass-inset);
+}
+
+:root[data-appearance='glass'] .modal,
+:root[data-appearance='glass'] .menu,
+:root[data-appearance='glass'] .toast,
+:root[data-appearance='glass'] .viewer-overlay,
+:root[data-appearance='glass'] .viewer-dim-hint {
+  box-shadow: var(--shadow-pop), var(--glass-inset);
+}
+
+/* 玻璃上的分隔线：实面主题下用 --line，在玻璃上会重得像贴了胶带 */
+:root[data-appearance='glass'] .topbar,
+:root[data-appearance='glass'] .side,
+:root[data-appearance='glass'] .panel,
+:root[data-appearance='glass'] .params-sheet,
+:root[data-appearance='glass'] .viewer-toolbar,
+:root[data-appearance='glass'] .app-footer {
+  border-color: var(--glass-edge);
+}
+
+/* 光斑不动：和 reduced-motion 下的页面动画一个道理 */
+@media (prefers-reduced-motion: reduce) {
+  :root[data-appearance='glass'] body::before {
+    animation: none;
+  }
+}
+
+/* ---------- 设置页的透明度滑块 ---------- */
+
+/* 「界面材质」这一行右边是分段按钮而不是开关：按钮要垂直居中，
+   窗口窄的时候整块换行，不能被文字挤成一条。 */
+.switch-row-stack {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+
+/* 只有选了液态玻璃才会出现，所以自带一段进入动画；
+   时长跟 --dur，prefers-reduced-motion 下自动降到无感。 */
+.glass-tune {
+  margin-top: var(--sp-4);
+  padding: var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-btn);
+  background: var(--well-fill);
+  animation: glass-tune-in calc(var(--dur) * 1.5) var(--ease) both;
+}
+
+@keyframes glass-tune-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.glass-tune-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.glass-tune-label {
+  font-size: var(--fs-sm);
+  font-weight: 550;
+  color: var(--text);
+}
+
+/* 拖动时这个数字每帧都在变：不等宽的话整行宽度会跟着抖 */
+.glass-tune-value {
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+}
+
+/* 填充比例来自 --range-fill（useAppearance 按滑块写）：渐变的位置不可动画，
+   所以只能由 JS 给一个百分比，颜色仍然全部引用令牌。 */
+.glass-range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 28px; /* 命中区域：轨道只有 6px，靠元素高度把可点区域撑到 28 */
+  margin-top: var(--sp-2);
+  background: transparent;
+  cursor: pointer;
+}
+
+.glass-range::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background:
+    linear-gradient(
+      to right,
+      var(--brand-solid) 0 calc(var(--range-fill, 42) * 1%),
+      transparent calc(var(--range-fill, 42) * 1%) 100%
+    ),
+    var(--line-strong);
+}
+
+.glass-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -6px; /* (轨道 6px - 拇指 18px) / 2 */
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.glass-range::-moz-range-track {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--line-strong);
+}
+
+.glass-range::-moz-range-progress {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--brand-solid);
+}
+
+.glass-range::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--surface);
+}
+
+/* 焦点环画在拇指上：用户看得清自己在调哪一段 */
+.glass-range:focus-visible {
+  outline: none;
+}
+
+.glass-range:focus-visible::-webkit-slider-thumb {
+  box-shadow: var(--ring);
+}
+
+.glass-range:focus-visible::-moz-range-thumb {
+  box-shadow: var(--ring);
+}
+
+.glass-tune .field-hint {
+  display: block;
+  margin-top: var(--sp-2);
+}
+
+.glass-tune-foot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--sp-3);
+}
+
+/* 窄窗口下分段按钮整块占一行，两个选项平分宽度 */
+@media (max-width: 720px) {
+  .switch-row-stack > .seg {
+    width: 100%;
+  }
+
+  .switch-row-stack > .seg button {
+    flex: 1;
+  }
+}
+
+/* 内核不支持背景模糊时退成实底：半透但不模糊 = 背景文字直接透过来，
+   那是「读不了」而不是「玻璃」。--glass-solid: 100% 会让上面所有
+   color-mix 结果等于原令牌，界面布局与文案完全不变。 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  :root {
+    --glass-solid: 100%;
+    --glass-sheen: transparent;
+    --glass-orb-1: transparent;
+    --glass-orb-2: transparent;
+    --glass-orb-3: transparent;
   }
 }

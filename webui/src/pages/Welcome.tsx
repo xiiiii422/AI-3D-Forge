@@ -12,7 +12,7 @@ import { useEnvReport } from '../hooks/useEnvReport';
 import { useInstallStream } from '../hooks/useInstallStream';
 import { num, printerTitle, usePrinters } from '../hooks/usePrinters';
 import { useSettings } from '../hooks/useSettings';
-import { hintFor, toFriendlyError, type FriendlyError } from '../hooks/errors';
+import { toFriendlyError } from '../hooks/errors';
 
 const STEPS = ['欢迎', '环境检测', '3D 引擎', 'AI 服务'] as const;
 
@@ -679,21 +679,6 @@ export default function Welcome() {
           ) : null}
         </div>
       </div>
-    </div>
-  );
-}
-
-/** 供后续页面复用的错误提示（保持 hint 兜底逻辑集中在一处） */
-export function ErrorNotice({ error }: { error: FriendlyError }) {
-  const hint = hintFor(error);
-  return (
-    <div className="err">
-      <div className="err-title">
-        <StatusDot status="fail" />
-        出了点问题
-      </div>
-      <div>{error.message}</div>
-      {hint ? <div className="err-hint">{hint}</div> : null}
     </div>
   );
 }

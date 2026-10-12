@@ -87,6 +87,86 @@ VISION_MAX_TOKENS = 8192
 # 还不够就再放大一档重试一次（实测正常请求在 8192 内能说完，留个兜底）
 VISION_MAX_TOKENS_RETRY = 16384
 
+# --------------------------------------------------------------------------
+# 提供商识别与各自的视觉模型 / 输出预算
+#
+# 为什么必须分提供商：图片复核固定用一个视觉模型，但不同提供商的视觉模型名与
+# 输出上限完全不同 —— 智谱 GLM-4V-Flash 的 max_tokens 硬上限 1024（超出报 1210），
+# 把 DeepSeek 那套 8192 直接发过去必然报错；反之把 glm-4v-flash 发给 DeepSeek 也 404。
+# 实测（2026-09，对着 open.bigmodel.cn）：glm-4v-flash 读图正常；glm-4.7-flash 存在
+# 但高峰期返 429/1305「访问量过大」（瞬态，可重试）；glm-4.5-flash 为思考模型。
+# --------------------------------------------------------------------------
+GLM_BASE_HINTS = ("bigmodel.cn", "zhipu")
+GLM_VISION_MODEL = "glm-4v-flash"
+GLM_VISION_MAX_TOKENS = 1024
+
+
+def detect_provider(base_url: str) -> str:
+    """从 base_url 识别提供商：deepseek / glm / 通用 openai 兼容。"""
+    url = (base_url or "").lower()
+    if "deepseek" in url:
+        return "deepseek"
+    if any(hint in url for hint in GLM_BASE_HINTS):
+        return "glm"
+    return "openai"
+
+
+def vision_model_for(base_url: str) -> str:
+    """图片复核用哪个视觉模型（随提供商切换）。"""
+    return GLM_VISION_MODEL if detect_provider(base_url) == "glm" else VISION_MODEL
+
+
+def vision_max_tokens_for(base_url: str) -> tuple[int, int]:
+    """图片复核的输出预算 (默认, 重试)。智谱视觉硬上限 1024，不能发 8192。"""
+    if detect_provider(base_url) == "glm":
+        return GLM_VISION_MAX_TOKENS, GLM_VISION_MAX_TOKENS
+    return VISION_MAX_TOKENS, VISION_MAX_TOKENS_RETRY
+
+
+# 智谱业务错误码 → 人话。code 取自响应体 error.code（字符串）。
+_GLM_ERROR_HINTS = {
+    "1305": (
+        "GLM 模型当前访问量过大（临时限流）。",
+        "稍等十几秒再试；或在「设置 → AI 服务」改用 glm-4-flash / glm-4.5-flash。",
+        "API_UNREACHABLE",
+    ),
+    "1113": (
+        "智谱账户余额不足或无可用资源包。",
+        "请前往智谱开放平台（open.bigmodel.cn）充值后重试。",
+        "API_KEY_INVALID",
+    ),
+    "1220": (
+        "当前账号无权访问该 GLM 模型。",
+        "请在「设置 → AI 服务」改用该账号已开通的模型（如 glm-4-flash、glm-4.7-flash）。",
+        "API_UNREACHABLE",
+    ),
+    "1210": (
+        "请求的输出长度超出该 GLM 模型上限。",
+        "程序已自动改用该模型允许的输出上限；若仍失败请改用其它模型。",
+        "INTERNAL",
+    ),
+}
+
+
+def _glm_friendly_error(status: int, body: str) -> LlmError | None:
+    """把智谱 GLM 的错误码翻译成人话；识别不了返回 None 走通用分支。"""
+    code = ""
+    try:
+        code = str((json.loads(body or "{}").get("error") or {}).get("code") or "")
+    except (ValueError, TypeError, AttributeError):
+        code = ""
+    if status == 401 or code in ("1000", "1001", "1002", "1004"):
+        return LlmError(
+            "智谱 GLM API Key 无效或已失效。",
+            hint="请在「设置 → AI 服务」填入智谱 API Key（open.bigmodel.cn 创建）；"
+            "若刚切换服务商，注意已保存的 Key 可能仍是上一家的，需重新粘贴。",
+            code="API_KEY_INVALID",
+        )
+    if code in _GLM_ERROR_HINTS:
+        message, hint, err_code = _GLM_ERROR_HINTS[code]
+        return LlmError(message, hint=hint, code=err_code)
+    return None
+
 
 class LlmError(RuntimeError):
     """带用户可读信息与修复建议的 AI 调用错误。"""
@@ -172,6 +252,18 @@ SCAD_CONVENTIONS = """你是资深 3D 打印结构设计师，同时精通 OpenS
 摆加强筋时不要用「固定半径 + rotate 转一圈」：矩形/扇形壳体的外壁到中轴
 距离随角度变化，那样只有少数几根贴住壁、其余会飘进腔体。用上面的顺序，
 或者逐条边单独算出该处的壁面坐标。
+
+**布尔运算的三条硬约束（CGAL 失败 / 静默丢几何的最常见原因，必须遵守）**
+
+1. 相减/相加的两个实体**不得共面重合**：刀具或零件沿接触方向错开 ≥0.01mm
+   （例如挖孔圆柱的两端要各伸出本体 0.01mm，不要端面齐平）；
+2. **不得有零厚度/退化体**：linear_extrude 高度、cylinder 半径必须为正；
+   不要用两个完全相同的实体做 difference；
+3. 参与布尔的必须是 3D 实体；2D 图形要先 linear_extrude / rotate_extrude 成体。
+
+违反任一条，OpenSCAD 可能报 CGAL assertion violation，或只发一句 warning 就
+**静默丢掉整块几何**（编译成功但模型残缺）—— 后者比报错更危险，用户拿到的
+是一个缺了主体的废件而界面显示成功。
 
 **`linear_extrude` 的输入必须是平面 2D 图形 —— 旋转要放在它外面**
 
@@ -492,6 +584,13 @@ SNAPSHOT_REVIEW_SYSTEM_PROMPT = """你是 3D 打印结构复核员。你会看�
 # 只有明确写了「有问题」才算数，其余一律当成无结论。
 SNAPSHOT_VERDICT_FLAG = "结论：有问题"
 SNAPSHOT_VERDICT_CLEAR = "结论：无明显问题"
+# 二级判据用的强问题标记：有些模型（实测 glm-4v-flash）不遵守首行契约，
+# 只会用自然语言描述看到的东西。首行拿不到结论时，全文出现这些词才算报告了问题；
+# 纯复述指标/客套话不含这些词，仍算「无结论」（不会误报）。
+SNAPSHOT_PROBLEM_MARKERS = (
+    "悬空", "断裂", "穿进", "腔体内部", "互不相连", "散件",
+    "没有螺纹", "不封闭", "飘在", "缺失了",
+)
 
 
 def parse_snapshot_verdict(text: str) -> bool:
@@ -505,7 +604,11 @@ def parse_snapshot_verdict(text: str) -> bool:
     head = head.replace(" ", "").replace("**", "")
     if SNAPSHOT_VERDICT_CLEAR.replace(" ", "") in head:
         return False
-    return SNAPSHOT_VERDICT_FLAG.replace(" ", "") in head
+    if SNAPSHOT_VERDICT_FLAG.replace(" ", "") in head:
+        return True
+    # 首行没有结论（模型不守契约）→ 退而求其次：全文找强问题标记。
+    # 方向仍然保守：找不到就还是「无结论」，绝不把客套话当「没问题」。
+    return any(marker in (text or "") for marker in SNAPSHOT_PROBLEM_MARKERS)
 
 
 def snapshot_review_user_prompt(requirement: str, metrics_summary: str = "") -> str:
@@ -620,6 +723,12 @@ class ChatResult:
 
 def _friendly_http_error(status: int, body: str, base_url: str) -> LlmError:
     snippet = (body or "").strip()[:300]
+    # 智谱 GLM 有自己的业务错误码（1305 过载 / 1113 余额 / 1220 无权 / 1210 超长），
+    # 先按提供商翻译，翻译不了再走下面的通用 HTTP 分支。
+    if detect_provider(base_url) == "glm":
+        glm_err = _glm_friendly_error(status, body)
+        if glm_err is not None:
+            return glm_err
     if status == 401:
         return LlmError(
             "DeepSeek API Key 无效或已失效。",
@@ -633,18 +742,27 @@ def _friendly_http_error(status: int, body: str, base_url: str) -> LlmError:
             code="API_KEY_INVALID",
         )
     if status == 429:
+        provider_name = "智谱 GLM" if detect_provider(base_url) == "glm" else "DeepSeek"
         return LlmError(
-            "请求过于频繁，已被 DeepSeek 限流。",
+            f"请求过于频繁，已被 {provider_name} 限流。",
             hint="请稍等十几秒再试，或减少同时进行的任务。",
             code="API_UNREACHABLE",
         )
     if status >= 500:
+        provider_name = "智谱 GLM" if detect_provider(base_url) == "glm" else "DeepSeek"
         return LlmError(
-            "DeepSeek 服务暂时不可用。",
+            f"{provider_name} 服务暂时不可用。",
             hint="这是对方服务端的问题，请稍后重试。",
             code="API_UNREACHABLE",
         )
     if status == 404:
+        if detect_provider(base_url) == "glm":
+            return LlmError(
+                f"接口地址或模型名不正确（{base_url}）。",
+                hint="智谱的服务地址应为 https://open.bigmodel.cn/api/paas/v4，"
+                "并确认模型名拼写正确（如 glm-4.7-flash）。",
+                code="API_UNREACHABLE",
+            )
         return LlmError(
             f"接口地址不正确（{base_url}）。",
             hint="请在「设置 → AI 服务」中把接口地址恢复为 https://api.deepseek.com。",
@@ -664,11 +782,52 @@ class DeepSeekClient:
         base_url: str = DEFAULT_BASE_URL,
         model: str = DEFAULT_MODEL,
         timeout_s: int = 180,
+        fallback_model: str | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.model = model or DEFAULT_MODEL
-        self.timeout = httpx.Timeout(connect=20.0, read=float(timeout_s), write=60.0, pool=20.0)
+        self.fallback_model = fallback_model
+        read_s = float(timeout_s)
+        if detect_provider(self.base_url) == "glm":
+            # 思考模型（glm-4.7-flash 等）先输出 reasoning 再输出正文，同样的
+            # timeout 对它偏紧；放大 1.5 倍，避免把「慢」误报成「超时」。
+            read_s = min(read_s * 1.5, 600.0)
+        self.timeout = httpx.Timeout(connect=20.0, read=read_s, write=60.0, pool=20.0)
+
+    def _try_fallback(self, status: int, payload: dict) -> bool:
+        """同提供商内模型降级：glm-4.7-flash 免费档高峰连发 1305/5xx 时临时改用备用模型。
+
+        只在 429/5xx（过载/瞬态）且尚未降级过时触发；降级会改写 payload["model"]，
+        本次与后续重试都用备用模型，并留日志。实测免费档高峰连发 3+ 次 1305，
+        光靠重试等不到放行，降级到负载较低的 glm-4-flash 才能把作业跑完。
+        """
+        if not self.fallback_model or self.model == self.fallback_model:
+            return False
+        if status not in (429, 500, 502, 503, 504):
+            return False
+        log.warning(
+            "模型 %s 返回 %s（过载/不可用），临时降级到 %s",
+            self.model,
+            status,
+            self.fallback_model,
+        )
+        self.model = self.fallback_model
+        payload["model"] = self.model
+        return True
+
+    def _thinking_control(self, allow_thinking: bool = False) -> dict[str, object]:
+        """智谱思考模型的思维链开关（GLM-4.5 及以上官方支持 thinking.type）。
+
+        默认对 glm 关闭：本应用多数请求是强约束结构化任务（规格 JSON / 评审 JSON），
+        思维链对它们增益很小，却会**烧掉 max_tokens 总预算**并拖慢响应 —— 实测
+        glm-4.7-flash 在生成 SCAD 时思考吃满 8192 乃至 16384，正文为空（finish=length）。
+        但**空间推理类**调用（生成/修复几何）允许显式开启（allow_thinking=True），
+        并配合更大的 max_tokens —— 是否开启由对照实验决定，不拍脑袋。
+        """
+        if detect_provider(self.base_url) == "glm":
+            return {"thinking": {"type": "enabled" if allow_thinking else "disabled"}}
+        return {}
 
     # --- 基础请求 --------------------------------------------------------
     def _headers(self) -> dict[str, str]:
@@ -690,12 +849,27 @@ class DeepSeekClient:
         界面上只显示「网络请求失败：」，用户完全无从下手 —— 所以
         下面报错时必须把**异常类型**和**目标地址**都写出来。）
         """
-        attempts = 2
+        # 智谱免费档高峰常连发 1305（瞬态过载、不计费），实测连发 3 次时 2 次重试仍会失败；
+        # 给 4 次机会 + 递增退避。其余提供商保持 2 次（1 次连接重试）。
+        attempts = 4 if detect_provider(self.base_url) == "glm" else 2
         last: Exception | None = None
         for attempt in range(attempts):
             try:
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    return await client.post(url, headers=self._headers(), json=payload)
+                    response = await client.post(url, headers=self._headers(), json=payload)
+                    # 智谱 1305＝模型临时过载（HTTP 429），属「稍后再试就好」的瞬态错误；
+                    # 与连接失败一样重试一次，不会对失败请求重复计费。
+                    # 智谱免费档的 429（1305 过载 / 1130 频控等）与间歇性 5xx 都是
+                    # 瞬态且不计费，一律退避重试；其余提供商仅连接失败重试。
+                    if (
+                        detect_provider(self.base_url) == "glm"
+                        and (response.status_code == 429 or response.status_code >= 500)
+                        and attempt + 1 < attempts
+                    ):
+                        # 退避递增：免费档频控往往要等几秒才放行
+                        await asyncio.sleep(CONNECT_RETRY_DELAY_S * (attempt + 1))
+                        continue
+                    return response
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 last = exc
                 if attempt + 1 < attempts:
@@ -703,7 +877,7 @@ class DeepSeekClient:
                     continue
             except httpx.TimeoutException as exc:
                 raise LlmError(
-                    "等待 DeepSeek 响应超时。",
+                    "等待 AI 服务响应超时。",
                     hint="已生成的内容较多或网络较慢，请重试；也可以在设置中调大超时时间。",
                     code="API_UNREACHABLE",
                 ) from exc
@@ -727,6 +901,7 @@ class DeepSeekClient:
         temperature: float = TEMPERATURE_GENERATE,
         max_tokens: int = 8192,
         json_mode: bool = False,
+        allow_thinking: bool = False,
     ) -> ChatResult:
         payload: dict[str, object] = {
             "model": self.model,
@@ -737,34 +912,63 @@ class DeepSeekClient:
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        payload.update(self._thinking_control(allow_thinking))
 
         url = f"{self.base_url}/chat/completions"
-        response = await self._post_with_connect_retry(url, payload)
-        if response.status_code >= 400:
-            raise _friendly_http_error(response.status_code, response.text, self.base_url)
-
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise LlmError("DeepSeek 返回的内容无法解析。", hint="请稍后重试。") from exc
-
-        choices = data.get("choices") or []
-        if not choices:
+        budget = max_tokens
+        data: dict = {}
+        choices: list = []
+        message: dict = {}
+        content = ""
+        reasoning = ""
+        finish_reason = None
+        # 思考模型（glm-4.5/4.7-flash、deepseek-reasoner 等）会先把 max_tokens 额度喂给
+        # reasoning_content；额度给小了 content 直接为空、finish_reason=length。
+        # 实测 glm-4.7-flash 在 max_tokens=64 时 content='' 而 reasoning 满 —— 若把
+        # reasoning 当正文返回，等于把思考过程塞进 SCAD/规格，是垃圾输入。
+        # 正确做法：放大预算重试一次；仍空则如实报错，绝不拿思考充正文。
+        for attempt in range(2):
+            payload["max_tokens"] = budget
+            response = await self._post_with_connect_retry(url, payload)
+            if response.status_code >= 400 and self._try_fallback(response.status_code, payload):
+                response = await self._post_with_connect_retry(url, payload)
+            if response.status_code >= 400:
+                raise _friendly_http_error(response.status_code, response.text, self.base_url)
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise LlmError("模型返回的内容无法解析。", hint="请稍后重试。") from exc
+            choices = data.get("choices") or []
+            if not choices:
+                raise LlmError(
+                    "模型没有返回任何内容。",
+                    hint="请重试；若持续出现，请换一种更具体的描述。",
+                )
+            message = choices[0].get("message") or {}
+            content = message.get("content") or ""
+            reasoning = message.get("reasoning_content") or ""
+            finish_reason = choices[0].get("finish_reason")
+            starved = (not content) and bool(reasoning) and finish_reason == "length"
+            if not starved or attempt == 1:
+                break
+            budget = min(budget * 4, 16384)
+            log.info("思考模型输出额度被 reasoning 占满（finish=length），放大到 %d 重试", budget)
+        if not content and reasoning and finish_reason == "length":
             raise LlmError(
-                "DeepSeek 没有返回任何内容。",
-                hint="请重试；若持续出现，请换一种更具体的描述。",
+                "模型把全部输出额度用在了思考过程上，没有给出正文。",
+                hint="请重试；或在「设置 → AI 服务」改用非思考模型（如 glm-4-flash / deepseek-chat）。",
+                code="INTERNAL",
             )
-        message = choices[0].get("message") or {}
-        content = message.get("content") or ""
-        if not content and message.get("reasoning_content"):
-            content = message["reasoning_content"]
+        if not content and reasoning:
+            # 正常停止却正文为空（极少见）：保留旧兜底，至少不返回空串
+            content = reasoning
         usage = data.get("usage") or {}
         return ChatResult(
             content=content,
             model=str(data.get("model") or self.model),
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),
-            finish_reason=choices[0].get("finish_reason"),
+            finish_reason=finish_reason,
         )
 
     async def chat_stream(
@@ -782,6 +986,7 @@ class DeepSeekClient:
             "max_tokens": max_tokens,
             "stream": True,
         }
+        payload.update(self._thinking_control())
         url = f"{self.base_url}/chat/completions"
         # 连接阶段照样只重试一次「连都连不上」；一旦开始收流就不再重试 ——
         # 半截的流重放会让用户看到重复内容，且可能重复计费。
@@ -793,6 +998,8 @@ class DeepSeekClient:
                         started = True
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", errors="replace")
+                            if self._try_fallback(response.status_code, payload):
+                                continue
                             raise _friendly_http_error(response.status_code, body, self.base_url)
                         async for line in response.aiter_lines():
                             if not line or not line.startswith("data:"):
@@ -821,7 +1028,7 @@ class DeepSeekClient:
                 ) from exc
             except httpx.TimeoutException as exc:
                 raise LlmError(
-                    "等待 DeepSeek 响应超时。",
+                    "等待 AI 服务响应超时。",
                     hint="已生成的内容较多或网络较慢，请重试；也可以在设置中调大超时时间。",
                     code="API_UNREACHABLE",
                 ) from exc
@@ -844,8 +1051,9 @@ class DeepSeekClient:
         全都以这份规格为准。温度压到 0.1 —— 这是「提取」任务，
         需要的是忠实与稳定，不是创造力。
         """
-        from .design import parse_spec_response, spec_user_prompt
-
+        # 这两个名字模块顶部已经从 .design 导入；函数内**不得**再导一次：
+        # 内层 import 会让它们变成本函数的局部名字，任何"没执行到这行就先用到"
+        # 的路径都会撞 UnboundLocalError（自检 t_no_shadowed_imports 守住）。
         result = await self.chat(
             [
                 {"role": "system", "content": SPEC_SYSTEM_PROMPT},
@@ -1024,15 +1232,25 @@ class DeepSeekClient:
                     },
                 }
             )
+        vision_model = vision_model_for(self.base_url)
+        budget_default, budget_retry = vision_max_tokens_for(self.base_url)
         payload: dict[str, object] = {
-            "model": VISION_MODEL,
-            "messages": [{"role": "user", "content": content}],
+            "model": vision_model,
+            # 必须带上系统提示词：它写了「第一行只能是 结论：有问题 / 结论：无明显问题」这条契约，
+            # 而 `parse_snapshot_verdict` 就是按它判定的。曾经只发 user 消息（用户提示里
+            # 还写着「请按系统提示复核」），于是首行永远拿不到契约结论，只能退化到
+            # 全文关键词兜底 —— 看起来能跑，实际上把最可靠的一层判据去掉了。
+            "messages": [
+                {"role": "system", "content": SNAPSHOT_REVIEW_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
             "temperature": TEMPERATURE_REVIEW,
-            "max_tokens": VISION_MAX_TOKENS,
+            "max_tokens": budget_default,
             "stream": False,
         }
+        payload.update(self._thinking_control())
         url = f"{self.base_url}/chat/completions"
-        for budget in (VISION_MAX_TOKENS, VISION_MAX_TOKENS_RETRY):
+        for budget in (budget_default, budget_retry):
             payload["max_tokens"] = budget
             try:
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -1044,6 +1262,8 @@ class DeepSeekClient:
                     code="API_UNREACHABLE",
                 ) from exc
             if response.status_code >= 400:
+                if self._try_fallback(response.status_code, payload):
+                    continue
                 raise _friendly_http_error(response.status_code, response.text, self.base_url)
             try:
                 data = response.json()
@@ -1092,13 +1312,14 @@ class DeepSeekClient:
 # 连通性测试（设置页面的「测试连接」）
 # --------------------------------------------------------------------------
 async def test_api_key(api_key: str, base_url: str = DEFAULT_BASE_URL, model: str = DEFAULT_MODEL) -> dict[str, object]:
-    """真实调用一次 DeepSeek，验证 Key 是否可用。返回结构化结果而不抛异常。"""
+    """真实调用一次 AI 服务，验证 Key 是否可用。返回结构化结果而不抛异常。"""
     import time
 
     if not api_key or not api_key.strip():
         return {"ok": False, "message": "尚未填写 API Key。", "model": None, "latency_ms": None}
 
-    client = DeepSeekClient(api_key.strip(), base_url, model, timeout_s=45)
+    # 思考模型（glm-4.7-flash 等）首字慢、且免费档可能排队，45s 太紧会误报超时。
+    client = DeepSeekClient(api_key.strip(), base_url, model, timeout_s=90)
     started = time.perf_counter()
     try:
         result = await client.chat(
@@ -1107,7 +1328,9 @@ async def test_api_key(api_key: str, base_url: str = DEFAULT_BASE_URL, model: st
                 {"role": "user", "content": "回复两个字：正常"},
             ],
             temperature=TEMPERATURE_REVIEW,
-            max_tokens=16,
+            # 思考模型（glm-4.7-flash 等）会先把额度喂给 reasoning，16 太小必然
+            # 「正文为空」而误报连接失败；给足 512 仍是一次极廉价的连通性探测。
+            max_tokens=512,
         )
     except LlmError as exc:
         return {"ok": False, "message": exc.message, "model": None, "latency_ms": None, "hint": exc.hint}

@@ -10,6 +10,8 @@
       3. verify program files, shortcuts, uninstaller, registry entry
       4. launch the installed app and drive the HTTP API from outside
          (proves it really works, not merely that files were copied)
+      4b. double-click for real (GUI path) and verify the second launch wakes the
+          running window instead of starting a second service or dying silently
       5. plant a fake user project + settings in %APPDATA% / Documents
       6. upgrade-install over the existing installation
       7. verify program files were replaced AND user data survived
@@ -126,7 +128,101 @@ function Stop-TestApp {
     Get-Process 'AI-3D-Forge' -ErrorAction SilentlyContinue | ForEach-Object {
         try { $_.Kill() } catch { }
     }
+    # Wait for the kill to really land. A process that is still on its way out still
+    # holds the single-instance lock, and the next Start-Process is then refused with
+    # nothing but a bogus "Local service started" failure to show for it. Mandatory
+    # byte-range locks die with the handle, so "no such process left" *is* "lock free".
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Get-Process 'AI-3D-Forge' -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 500
+    }
     Start-Sleep -Seconds 2
+}
+
+function Get-LockRecordPid {
+    # The pid stored in the lock file, or '' -- purely for naming who holds it, never for
+    # deciding *whether* it is held. Layout (see src/aiforge/single_instance.py): byte 0 is
+    # the lock region, the pid is written from byte 1 on, so a read starting at byte 0 would
+    # hit the mandatory lock while anybody holds it -- seek past it and ask for 24 bytes.
+    param([string]$Path)
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        [void]$stream.Seek(1, [IO.SeekOrigin]::Begin)
+        $buf = New-Object byte[] 24
+        $n = $stream.Read($buf, 0, 24)
+        if ($n -le 0) { return '' }
+        $txt = [Text.Encoding]::ASCII.GetString($buf, 0, $n).Trim()
+        $owner = 0
+        if (-not [int]::TryParse($txt, [ref]$owner)) { return '' }
+        return "$owner"
+    } catch {
+        # An instance of the *previous* build locks wherever its file happened to end, which
+        # can sit right on top of the pid bytes (measured: with a lock on byte 1, an unbuffered
+        # one-byte read at byte 0 comes back fine while the read of the pid bytes raises). No
+        # name to report -- not a claim of freedom.
+        return ''
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Get-LockClaim {
+    # Does an instance of the app still hold the single-instance lock? '' means nobody living.
+    # Two independent signals, because the pid record alone cannot be trusted to decide this:
+    # the previous build stored the pid at byte 0 while this one reads it from byte 1, so what
+    # comes back out of an old record is "the real number minus its first digit" -- measured on
+    # this machine, such a number was a live *unrelated* process, and a refused second instance
+    # following it brought that other program's window to the foreground. Trusting the same
+    # number here would either block this run on a phantom or wave through a real holder.
+    #   1) a live process named AI-3D-Forge is the honest "an instance runs" signal (it also
+    #      covers an old build, whose lock position is not pinned down);
+    #   2) the lock itself is ground truth for "held": byte 0 carries a *mandatory* byte-range
+    #      lock and a FileStream read asks for 4 KB at once, so reading from byte 0 throws while
+    #      anybody holds a lock over the head of the file -- measured: holders on byte 1 and on
+    #      byte 20 of a 40-byte file both failed it, a lock past the 4 KB window did not, and
+    #      with nobody holding anything the read always succeeded. The drifting lock position of
+    #      an old build therefore still lands inside this window, which is why signal 2 is not
+    #      pinned to "byte 0" in its own wording. It also catches a development instance that
+    #      runs as python.exe and so never shows up under signal 1.
+    # The record is only used to say *who*, never *whether*.
+    $procs = @(Get-Process 'AI-3D-Forge' -ErrorAction SilentlyContinue)
+    if ($procs.Count -gt 0) {
+        $ids = ($procs | ForEach-Object { $_.Id }) -join ','
+        return "$($procs.Count) AI-3D-Forge process(es) alive (pid $ids)"
+    }
+    $file = Join-Path $AppData 'app.lock'
+    if (-not (Test-Path $file)) { return '' }
+    $named = Get-LockRecordPid -Path $file
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        [void]$stream.Seek(0, [IO.SeekOrigin]::Begin)
+        [void]$stream.ReadByte()  # throws IOException while a mandatory lock covers the file head
+    } catch [IO.IOException] {
+        # A lock really is held over the head of the file. Name the holder only when the record
+        # points at a process that could be one of ours at all -- the app exe, or a python
+        # running from a checkout. A garbled or stale record naming somebody else must not put
+        # the blame on a stranger: measured while writing this, an old record mis-read by
+        # exactly one digit landed on a live unrelated process, and the shipped code that
+        # trusted it raised that program's window. Same rule here -- the record may name the
+        # holder, never accuse it.
+        if ($named) {
+            $cand = Get-Process -Id ([int]$named) -ErrorAction SilentlyContinue
+            if ($cand -and @('AI-3D-Forge', 'python', 'pythonw') -contains $cand.ProcessName) {
+                return "lock held over the file head (record says pid=$named name=$($cand.ProcessName))"
+            }
+            return "lock held over the file head (record names pid=$named, which is not a plausible holder)"
+        }
+        return 'lock held over the file head (record unreadable, likely an instance of the previous build)'
+    } catch {
+        return "lock file could not be inspected: $($_.Exception.GetType().Name)"
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+    # Held by nobody and no live app process: whatever the record says, it is just stale bytes.
+    return ''
 }
 
 # --------------------------------------------------------------------------
@@ -232,6 +328,8 @@ Step 'Registered in Add/Remove Programs' ($null -ne $uninstallEntry) $(if ($unin
 Section '2. Installed app actually runs (driven through HTTP)'
 
 Stop-TestApp
+$stuckBefore = Get-LockClaim
+Step 'No live instance claims the app lock' (-not $stuckBefore) $stuckBefore
 $env:AIFORGE_CONSOLE_LOG = '1'
 Start-Process -FilePath $exe -ArgumentList '--server', "--port=$Port" -WindowStyle Hidden
 $ready = Wait-Http -Url "http://127.0.0.1:$Port/api/app/health" -TimeoutSec 90
@@ -243,6 +341,18 @@ if ($ready) {
 
     $page = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/" -TimeoutSec 20 -UseBasicParsing
     Step 'UI is served' ($page.StatusCode -eq 200 -and $page.Content.Length -gt 100) "$($page.Content.Length) bytes"
+
+    # FastAPI has to build the whole route schema for this one. It is the cheapest
+    # proof that a packaging-time exclusion (see AI-3D-Forge.spec excludes) did not
+    # remove something the server only touches here -- a missing optional dep shows
+    # up as a 500 on this request, not as a failed startup.
+    try {
+        $openapi = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/openapi.json" -TimeoutSec 30 -UseBasicParsing
+        $paths = ($openapi.Content | ConvertFrom-Json).paths.PSObject.Properties.Name.Count
+        Step 'OpenAPI schema builds in the packaged app' ($openapi.StatusCode -eq 200 -and $paths -gt 30) "$paths paths"
+    } catch {
+        Step 'OpenAPI schema builds in the packaged app' $false $_.Exception.Message
+    }
 
     try {
         $report = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/env/report" -TimeoutSec 120
@@ -260,6 +370,87 @@ if ($ready) {
 
     Stop-TestApp
     Step 'App stopped cleanly' (-not (Get-Process 'AI-3D-Forge' -ErrorAction SilentlyContinue)) ''
+}
+
+# --------------------------------------------------------------------------
+Section '2b. A second launch wakes the running window instead of starting over'
+
+# This is the real double-click path (no --server, no --browser), so it is the only
+# place where "the refusal actually reaches the user" can be checked: with no console
+# attached, a silent exit and a helpful message look identical from the outside. The
+# self-check guard can only pin the decision table -- it has no desktop window to
+# wake -- which is why this section lives here instead of there.
+#
+# Being told comes in three shapes, and which one you get depends on how the app was
+# started (all three measured with this script, see the two steps below for which is
+# which). The one shape that must never happen is a fourth: exit, say nothing.
+
+if (-not ('AiForgeWin32.Fore' -as [type])) {
+    Add-Type -Namespace AiForgeWin32 -Name Fore -MemberDefinition @'
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+'@
+}
+
+Stop-TestApp
+$gui = Start-Process -FilePath $exe -PassThru
+$firstHwnd = [IntPtr]::Zero
+$deadline = (Get-Date).AddSeconds(90)
+while ((Get-Date) -lt $deadline) {
+    $live = Get-Process 'AI-3D-Forge' -ErrorAction SilentlyContinue |
+        Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+    if ($live) { $firstHwnd = $live.MainWindowHandle; break }
+    Start-Sleep -Milliseconds 500
+}
+Step 'Installed exe opens a real window' ($firstHwnd -ne [IntPtr]::Zero) "hwnd=$firstHwnd"
+
+if ($firstHwnd -ne [IntPtr]::Zero) {
+    # Put the running window out of sight on purpose. Without this, "the window is
+    # there and looks fine" would pass even if the wake path did nothing at all --
+    # the same empty-run trap the self-check guard has its own control for.
+    [void][AiForgeWin32.Fore]::ShowWindow($firstHwnd, 6)   # SW_MINIMIZE
+    Start-Sleep -Seconds 2
+    $minimized = [AiForgeWin32.Fore]::IsIconic($firstHwnd)
+    # Detail is always printed, also on success (that is this script's convention: the
+    # observed fact, not a failure hypothesis), so keep these strings factual.
+    Step 'Control: the running window really got minimized' $minimized "isIconic=$minimized"
+
+    $second = Start-Process -FilePath $exe -PassThru
+    # 8s is well past the refusal path (it returns right after the wake attempt) but
+    # still short: a modal notice blocks forever, and that has to be the finding.
+    [void]$second.WaitForExit(8000)
+    $stillUp = Get-Process -Id $second.Id -ErrorAction SilentlyContinue
+    $notice = [bool](($null -ne $stillUp) -and $stillUp.MainWindowTitle)
+    $woke = ([AiForgeWin32.Fore]::GetForegroundWindow() -eq $firstHwnd)
+    $nowIconic = [AiForgeWin32.Fore]::IsIconic($firstHwnd)
+    $back = $minimized -and (-not $nowIconic)
+    # Restoring the window is the part we own; the foreground is Windows' to grant.
+    # Measured on the installed build: SetForegroundWindow got refused for a second
+    # instance started from here (the right goes to the process that owns the
+    # foreground or received the last input), while the restore always worked.
+    # A window that stays minimized is precisely "I double clicked and nothing
+    # happened", so this step, not the next one, is the sharp end of the check.
+    Step 'Second launch brings the running window back' $back "isIconic before=$minimized after=$nowIconic"
+    # woke / restored / notice: see the section header. Detail stays factual because
+    # Step prints it on success too.
+    $told = $woke -or $back -or $notice
+    Step 'Second launch never exits without a trace' $told `
+        "woke=$woke restored=$back notice=$notice"
+    if (-not $told) {
+        Write-Host "  why: foregroundHwnd=$([AiForgeWin32.Fore]::GetForegroundWindow()) targetHwnd=$firstHwnd" -ForegroundColor DarkGray
+    }
+    # Woken or notified, either way there must not be a second app *window*. Count
+    # windows rather than processes: the refusing process can still be alive sitting
+    # on its own dialog, and that is not a duplicate service.
+    if ($stillUp) {
+        try { $stillUp.Kill() } catch { }
+        $stillUp.WaitForExit(10000) | Out-Null
+    }
+    $wins = @(Get-Process 'AI-3D-Forge' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
+    Step 'No second app window was created' ($wins.Count -eq 1 -and $wins[0].Id -eq $gui.Id) `
+        "$($wins.Count) app window(s), expected only pid $($gui.Id)"
+    Stop-TestApp
 }
 
 # --------------------------------------------------------------------------
@@ -388,6 +579,8 @@ if ($KeepInstalled) {
     Step 'Executable restored' (Test-Path $exe) ''
 
     Stop-TestApp
+    $stuckAgain = Get-LockClaim
+    Step 'No live instance claims the app lock (relaunch)' (-not $stuckAgain) $stuckAgain
     Start-Process -FilePath $exe -ArgumentList '--server', "--port=$Port" -WindowStyle Hidden
     $ready2 = Wait-Http -Url "http://127.0.0.1:$Port/api/app/health" -TimeoutSec 90
     Step 'App runs after reinstall' $ready2 ''

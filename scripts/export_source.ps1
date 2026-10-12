@@ -39,12 +39,19 @@ New-Item -ItemType Directory -Force -Path $Target | Out-Null
 # Directories that never belong in the source package.
 $excludeDirs = @(
     'build', 'node_modules', '.git', '.vscode', '.idea',
-    '__pycache__', '.pytest_cache', '.ruff_cache', '.mypy_cache'
+    '__pycache__', '.pytest_cache', '.ruff_cache', '.mypy_cache',
+    # UI audit leftovers: screenshots plus a report.json that carries ABSOLUTE
+    # LOCAL PATHS. They are gitignored, but the allow-list below reads all of
+    # webui\, so they slipped into the package until this line was added.
+    'shots'
 )
 # File patterns that are outputs, caches or secrets.
 $excludeFiles = @(
     '*.pyc', '*.pyo', '*.log', '*.tmp', '*.bak',
-    'secrets', '.env', '*.local.env', 'config.json', 'credentials.json'
+    'secrets', '.env', '*.local.env', 'config.json', 'credentials.json',
+    # Test reports (absolute paths inside) and ad-hoc debug renders produced
+    # while investigating: neither is part of the product.
+    '*-report.json', '_tmp_*', '*.orig'
 )
 # Path fragments that must never ship (defence in depth against leaking a key).
 $excludeContains = @(
@@ -75,10 +82,30 @@ $allowTopFiles = @(
 # Chinese-named guides are matched by wildcard (this script is ASCII-only).
 $allowTopPatterns = @('README-*.md')
 
+# ---------------------------------------------------------------------------
+# INTERNAL-ONLY notes: these never enter the source package, and because the
+# public repository is mirrored from this export set, they never enter the
+# repository either. They stay in the working tree only.
+#
+# Why the list lives HERE: this export set is the single definition of "what is
+# public". A second list somewhere else would drift, and the drift would be
+# invisible until somebody pushed an internal note.
+#
+# The selfcheck guard "ship docs must not point at unshipped files" reads this
+# same array, so a public doc referencing one of these names fails the build.
+# ---------------------------------------------------------------------------
+$internalDocs = @(
+    'docs\TAKEOVER-2026-10-04.md',
+    'docs\TAKEOVER-2026-10-11.md',
+    'docs\TAKEOVER-2026-10-12.md',
+    'docs\COMPETITIVE-GAPS.md'
+)
+
 $copied = 0
 $skipped = 0
 $totalBytes = 0
 $outsideProject = @()
+$internalExcluded = 0
 
 function Test-AllowedTopLevel {
     param([string]$Relative, [string]$Name)
@@ -107,12 +134,26 @@ Get-ChildItem -Path $Root -Recurse -Force -File | ForEach-Object {
     }
 
     $skip = $false
-    foreach ($fragment in $excludeContains) {
-        if ($full -like "*$fragment*") { $skip = $true; break }
+    foreach ($rel in $internalDocs) {
+        if ($relative -eq $rel) {
+            $script:internalExcluded += 1
+            $skip = $true
+            break
+        }
     }
     if (-not $skip) {
+        foreach ($fragment in $excludeContains) {
+            if ($full -like "*$fragment*") { $skip = $true; break }
+        }
+    }
+    if (-not $skip) {
+        # Match the directory name as ANY path segment, not only at the top:
+        # webui\scripts\shots must be excluded too, and the anchored form
+        # ("$dir\*") only caught a top-level shots\. Measured leak: four UI
+        # screenshots under webui\scripts\shots shipped into the package.
+        $segments = $relative.Split('\')
         foreach ($dir in $excludeDirs) {
-            if ($relative -like "$dir\*" -or $relative -eq $dir) { $skip = $true; break }
+            if ($segments -contains $dir) { $skip = $true; break }
         }
     }
     if (-not $skip) {
@@ -132,6 +173,12 @@ Get-ChildItem -Path $Root -Recurse -Force -File | ForEach-Object {
 }
 
 Write-Ok "Copied $copied files ($([math]::Round($totalBytes/1KB,1)) KB); skipped $skipped"
+if ($internalExcluded -gt 0) {
+    Write-Ok "Internal-only notes excluded from the package: $internalExcluded of $($internalDocs.Count)"
+}
+if ($internalExcluded -lt $internalDocs.Count) {
+    Write-Warn "Only $internalExcluded of $($internalDocs.Count) internal-only notes were present."
+}
 
 # Loudly report anything at the top level that is not part of this project.
 # Silence here is how unrelated code ends up in a public repository.
@@ -197,7 +244,11 @@ $required = @(
     'docs\USER_GUIDE.md', 'docs\DEVELOPMENT.md',
     'scripts\build.ps1', 'scripts\build_installer.ps1', 'scripts\selfcheck.py',
     'scripts\e2e_test.py', 'scripts\test_install.ps1', 'scripts\export_source.ps1',
-    'scripts\check_no_secrets.py', 'scripts\check_oss_files.py'
+    'scripts\check_no_secrets.py', 'scripts\check_oss_files.py',
+    # The publish flow in docs\PUBLISH-TO-GITHUB.md tells the reader to run this
+    # script. It used to live in build\work\ (gitignored, never exported), so a
+    # fresh clone following the doc died on the very first command.
+    'scripts\sync_github_repo.py'
 )
 $missing = @()
 foreach ($item in $required) {
@@ -216,6 +267,33 @@ if ($missing.Count -gt 0) {
     exit 1
 }
 Write-Ok "Package completeness check passed ($($required.Count) files + $($readmeDocs.Count) localized guides)"
+
+# --- Hygiene check: no test leftovers ---------------------------------------
+# Why this exists: the allow-list reads whole top-level folders, so anything a
+# test produced inside scripts\ or webui\ ships unless it is excluded. Measured
+# leak: webui\scripts\shots\report.json (absolute local paths inside) and four
+# ad-hoc debug renders scripts\_tmp_ring_*.png. Both are gitignored, so git did
+# not warn -- only this check catches them. Images are allowed only under
+# docs\images\ (product screenshots referenced by the READMEs).
+$stray = @()
+Get-ChildItem -Path $Target -Recurse -Force -File | ForEach-Object {
+    $relative = $_.FullName.Substring($Target.Length).TrimStart('\')
+    if ($relative -like 'docs\images\*') { return }
+    if ($_.Extension -in @('.png', '.jpg', '.jpeg', '.gif', '.webp')) {
+        $stray += $relative
+    } elseif ($_.Name -like '*-report.json' -or $_.Name -like '_tmp_*') {
+        $stray += $relative
+    }
+}
+if ($stray.Count -gt 0) {
+    Write-Host ''
+    Write-Host '  [FAIL] Test leftovers found in the package:' -ForegroundColor Red
+    $stray | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+    Write-Host '  Add the pattern to $excludeDirs/$excludeFiles instead of shipping it.' -ForegroundColor Red
+    Remove-Item $Target -Recurse -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+Write-Ok 'Hygiene check passed: no screenshots / test reports / debug renders outside docs\images'
 
 # --- Zip it ----------------------------------------------------------------
 $zipPath = Join-Path $OutDir 'AI-3D-Forge-Source.zip'

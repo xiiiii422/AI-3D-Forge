@@ -39,12 +39,16 @@ import type {
   ProjectSummary,
   RenameProjectRequest,
   SelectedPrinterResponse,
+  SendToSlicerResult,
   SelectPrinterRequest,
   SelectPrinterResponse,
   Settings,
   SettingsUpdate,
+  SlicersResponse,
   UpdateParamsRequest,
   VersionInfo,
+  WindowRuntimeInstallResponse,
+  WindowRuntimeStatus,
 } from './types';
 
 /** 所有请求都走这个前缀，dev 期由 Vite proxy 转发到后端 */
@@ -236,6 +240,38 @@ export const api = {
     request<ProjectSummary>(`/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
   deleteProject: (id: string) =>
     request<OkResponse>(`/projects/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /** POST /api/projects/{id}/restore —— 回退到某个历史版本（会生成新的一版） */
+  restoreRevision: (id: string, revision: number) =>
+    request<{ project_id: string; restored_from: number; revision: number }>(
+      `/projects/${encodeURIComponent(id)}/restore`,
+      { method: 'POST', body: { revision } },
+    ),
+  /** POST /api/projects/{id}/save —— 弹原生保存框，写到用户选定目录 */
+  saveProjectFile: (id: string, kind: 'stl' | 'scad' | '3mf') =>
+    request<{ status: 'saved' | 'canceled' | 'no-dialog'; path?: string }>(
+      `/projects/${encodeURIComponent(id)}/save`,
+      { method: 'POST', body: { kind } },
+    ),
+
+  /* 4A. 切片软件（只三个调用：列表、手动指定、送出）*/
+  /** GET /api/slicers —— rescan=true 强制重扫（刚装完切片软件时用） */
+  listSlicers: (opts: { rescan?: boolean; signal?: AbortSignal } = {}) =>
+    request<SlicersResponse>('/slicers', {
+      query: { rescan: opts.rescan ? 1 : undefined },
+      signal: opts.signal,
+    }),
+  /** POST /api/slicers/pick —— 弹原生选择框指定主程序（自动检测漏了才需要） */
+  pickSlicer: () =>
+    request<SlicersResponse & { status: 'added' | 'canceled' | 'nodialog'; path?: string }>(
+      '/slicers/pick',
+      { method: 'POST' },
+    ),
+  /** POST /api/projects/{id}/send-to-slicer —— 不传 slicer 就用默认/检测到的第一个 */
+  sendToSlicer: (id: string, slicer?: string) =>
+    request<SendToSlicerResult>(`/projects/${encodeURIComponent(id)}/send-to-slicer`, {
+      method: 'POST',
+      body: slicer ? { slicer } : {},
+    }),
 
   /* 5. 设置 */
   getSettings: (signal?: AbortSignal) => request<Settings>('/settings', { signal }),
@@ -259,6 +295,11 @@ export const api = {
     }),
   health: (signal?: AbortSignal) => request<HealthResponse>('/app/health', { signal }),
   shutdown: () => request<OkResponse>('/app/shutdown', { method: 'POST' }),
+  /** 原生窗口组件状态：只在「被浏览器打开」时拉一次（那条横幅需要它） */
+  windowRuntime: (signal?: AbortSignal) =>
+    request<WindowRuntimeStatus>('/app/window-runtime', { signal }),
+  installWindowRuntime: () =>
+    request<WindowRuntimeInstallResponse>('/app/window-runtime/install', { method: 'POST' }),
 };
 
 /* ------------------------------------------------------------------ *
@@ -273,6 +314,10 @@ export const stlDownloadUrl = (projectId: string) =>
 export const scadDownloadUrl = (projectId: string) =>
   `${API_BASE}/projects/${encodeURIComponent(projectId)}/scad`;
 
+/** GET /api/projects/{id}/3mf —— 切片软件用的 3MF（声明 mm 单位 + 机型/材料元数据） */
+export const threeMfDownloadUrl = (projectId: string) =>
+  `${API_BASE}/projects/${encodeURIComponent(projectId)}/3mf`;
+
 /** GET /api/projects/{id}/stl/raw —— inline，供 STLLoader 直接 fetch */
 export const stlRawUrl = (projectId: string, revision?: number) =>
   `${API_BASE}/projects/${encodeURIComponent(projectId)}/stl/raw${
@@ -282,6 +327,50 @@ export const stlRawUrl = (projectId: string, revision?: number) =>
 /** GET /api/projects/{id}/thumbnail —— image/png */
 export const thumbnailUrl = (projectId: string) =>
   `${API_BASE}/projects/${encodeURIComponent(projectId)}/thumbnail`;
+
+/** GET /api/projects/{id}/metrics —— 持久化的实测数据（重开项目时合成结果卡用） */
+export const projectMetrics = (id: string, signal?: AbortSignal) =>
+  request<Record<string, unknown>>(`/projects/${encodeURIComponent(id)}/metrics`, { signal });
+
+/** 各提供商的免费模型（供顶栏“切换免费模型”下拉） */
+export const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
+export const ZHIPU_BASE_URL = 'https://open.bigmodel.cn/api/paas/v4';
+
+/** 三种使用模式：免费 / 付费均衡 / 混合性价比（生成付费 + 解析评审免费） */
+export interface ModePreset {
+  id: 'free' | 'deepseek' | 'hybrid';
+  label: string;
+  base_url: string;
+  model: string;
+  economy_base_url: string;
+  economy_model: string;
+}
+export const MODE_PRESETS: ModePreset[] = [
+  {
+    id: 'free',
+    label: '免费·GLM Flash',
+    base_url: ZHIPU_BASE_URL,
+    model: 'glm-4.7-flash',
+    economy_base_url: '',
+    economy_model: '',
+  },
+  {
+    id: 'deepseek',
+    label: 'DeepSeek·付费均衡',
+    base_url: DEEPSEEK_BASE_URL,
+    model: 'deepseek-chat',
+    economy_base_url: '',
+    economy_model: '',
+  },
+  {
+    id: 'hybrid',
+    label: '混合·性价比',
+    base_url: DEEPSEEK_BASE_URL,
+    model: 'deepseek-chat',
+    economy_base_url: ZHIPU_BASE_URL,
+    economy_model: 'glm-4.7-flash',
+  },
+];
 
 /** 触发浏览器另存为，不新开标签页 */
 export function triggerDownload(url: string, filename?: string): void {

@@ -12,19 +12,15 @@
 
 from __future__ import annotations
 
+import bisect
 import math
 import random
 import re
 import struct
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-
-# 常见消费级 FDM 打印机的成型尺寸（mm）与喷嘴直径。
-# 这两个常量只作为「没有指定机型时」的兜底默认值；
-# 真实判断请用 printers.resolve_process() 得到的 AnalysisLimits。
-DEFAULT_BUILD_VOLUME = (220.0, 220.0, 250.0)
-NOZZLE_MM = 0.4
-MAX_TRIANGLES_COMFORTABLE = 400_000
+from typing import Any
 
 
 class StlError(RuntimeError):
@@ -85,6 +81,34 @@ class MeshMetrics:
     # 旧的「包围盒最小边」对空心件完全失效：桌面垃圾桶 110×186×110、壁厚 2.4mm，
     # 包围盒最小边 110mm，壁做得再薄也不会报警 —— 而容器正是本软件的主要用途。
     wall: "WallThickness | None" = None
+    # 射线法实测的孔径（在模型中部高度，从轴线向两侧走到撞上材料）。
+    # 为什么必须实测（HANDOVER P0）：改孔径时若源码把孔写成表达式（如 d=outer-2*wall），
+    # 参数核对根本看不到孔变没变；而几何明明能量。None = 该高度轴线上是材料（无孔）。
+    hole_diameter_mm: float | None = None
+    # 三条轴上「被材料夹住的空档」最大值（夹口/插槽/内腔那类减法特征的指纹）。
+    # 为什么必须由外部按需补测（jobs 在源码声明了间隙尺寸时才测）：
+    # 刀具没切到实体时，模型是一整块实心料 —— 零件数 1、封闭、壁厚「很充足」、
+    # 包围盒也对，所有既有指标全绿，只有「找不到任何空隙」能揭穿它。
+    interior_gaps: "InteriorGaps | None" = None
+    # 源码顶层参数里声明的间隙/夹口/插槽：(标签, mm, 参数名)。由 jobs 填入，
+    # 与 interior_gaps 配成一条实测判定（判据是「自洽」：AI 自己声明的要它自己做到）。
+    declared_gaps: list[tuple[str, float, str]] = field(default_factory=list)
+    # 多个高度的实测孔径剖面（六个探针高度，自底向上）。
+    # 为什么不只量中部：一个模型可能同时有「腔体」和「底部小孔」，只量中部会
+    # 把腔体直径当成孔径（实测杯子：中部量到的是腔、排水孔在底部）。改动校验
+    # 拿剖面去匹配用户声明的孔径——**任一高度匹配即视为做到**，避免误报。
+    # 探针里两个贴底、一个贴顶（`_HOLE_PROFILE_PLAN`）：只按比例取会漏掉薄底座里的孔。
+    hole_profile: list[float | None] = field(default_factory=list)
+    # 贴底/贴顶那一层里「足迹内部是材料」的比例（0~1）。判“实心底”有没有被挖成开口管。
+    # 为什么需要它（实测，31 份真模型）：AI 写的笔筒经常用
+    # `difference(){ 外坯; cylinder(r=inner, h=height+0.01); }` —— 内腔圆柱从 z=0 就开挖，
+    # 于是**底部整个是开的**（只留下一圈壁厚）。件数 1、封闭、包围盒对、壁厚不报、
+    # 孔径剖面全 None（因而“量不到就不报”），一切现有指标全绿，而笔放进去就漏。
+    # 实测 31 份历史版本交付时底是开口的有 18 份，产品当时对用户说的是“改好了”。
+    # 两端都要量（不只是底）：盖子/罩壳这类件**天生开口朝下**，只看底会把正确设计
+    # 报成缺陷；“两端都开”才是无论怎么放都装不了东西的开口管。
+    bottom_coverage: float | None = None
+    top_coverage: float | None = None
     # 支撑量估算与耗材用量估算。
     # support 在 analyze() 里算（只需要自支撑角）；usage 需要材料密度，
     # 由调用方（jobs）拿到用户选的材质后再算。
@@ -121,6 +145,23 @@ class MeshMetrics:
                 {"z": round(z, 2), "count": n} for z, n in self.cavity_islands
             ],
             "wall": self.wall.to_dict() if self.wall else None,
+            "hole_diameter_mm": (
+                round(self.hole_diameter_mm, 2) if self.hole_diameter_mm is not None else None
+            ),
+            "interior_gaps": self.interior_gaps.to_dict() if self.interior_gaps else None,
+            "declared_gaps": [
+                {"label": label, "mm": round(float(mm), 2), "param": name}
+                for label, mm, name in self.declared_gaps
+            ],
+            "hole_profile": [
+                round(d, 2) if d is not None else None for d in self.hole_profile
+            ],
+            "bottom_coverage_pct": (
+                round(self.bottom_coverage * 100.0, 1) if self.bottom_coverage is not None else None
+            ),
+            "top_coverage_pct": (
+                round(self.top_coverage * 100.0, 1) if self.top_coverage is not None else None
+            ),
             "support": self.support.to_dict() if self.support else None,
             "orientation_hint": self.orientation_hint,
             "usage": self.usage.to_dict() if self.usage else None,
@@ -252,6 +293,38 @@ def _parse_ascii(raw: bytes) -> list[tuple[float, float, float]]:
         vertices.append(point)
     if not vertices:
         raise StlError("无法解析模型文件内容，可能文件已损坏。")
+
+    # 完整性自校验（二进制路径早就有，ASCII 一直是个缺口）。
+    #
+    # 为什么必须补：OpenSCAD 在这里默认写的是 **ASCII STL**（实测：同一模型
+    # 171,329 字节 / 1,024 个 facet），而写一半就被中断的 ASCII 文件能被上面
+    # 那个循环**完好地解析出一堆合法坐标** —— 没有 NaN、没有错位，只是少了
+    # 后面的面。于是一份残缺网格被当成正常模型送去分析，所有判据都建在
+    # 切掉一半的几何上（实测过一次同一 SCAD 量出 512 面而其余 12 次都是 1024，
+    # 那一轮的孔径判据直接翻了：hole=None vs 17.60）。
+    #
+    # 三条都是「文件自己与自己矛盾」，不会误伤正规导出器：
+    #   1. 每个 facet 恰好 3 个 vertex → 顶点数必为 3 的倍数；
+    #   2. `facet normal` 的个数 = 顶点数 / 3（切在 facet 中间时两条一起错，
+    #      刚好切在边界上时只有第二条与第三条错）；
+    #   3. 规范要求以 `endsolid` 收尾，写完才有这一行。
+    if len(vertices) % 3:
+        raise StlError(
+            f"模型文件不完整：顶点数 {len(vertices):,} 不是 3 的倍数，最后某个三角面被截断了。",
+            hint="OpenSCAD 可能没写完（被中断、磁盘满或被安全软件拦截）。请重新生成。",
+        )
+    facet_count = text.count("facet normal")
+    if facet_count != len(vertices) // 3:
+        raise StlError(
+            f"模型文件不完整：声明了 {facet_count:,} 个三角面，实际只读到 "
+            f"{len(vertices) // 3:,} 个。",
+            hint="OpenSCAD 可能没写完（被中断、磁盘满或被安全软件拦截）。请重新生成。",
+        )
+    if "endsolid" not in text:
+        raise StlError(
+            "模型文件不完整：ASCII STL 缺少收尾的 endsolid 行。",
+            hint="OpenSCAD 可能没写完（被中断、磁盘满或被安全软件拦截）。请重新生成。",
+        )
     return vertices
 
 
@@ -342,17 +415,35 @@ def measure_thread_depth(points: list[tuple[float, float, float]]) -> float | No
     if height < 0.6:
         return None
     band = min(1.2, max(0.5, height / 8.0))
-    z0 = lo + height * 0.35
-    z1 = min(z0 + band, hi)
-    radii = [math.hypot(p[0], p[1]) for p in points if z0 <= p[2] <= z1]
-    if len(radii) < 64:
-        return None
-    outer = [r for r in radii if r > (max(radii) + min(radii)) / 2]
-    if len(outer) < 32:
-        return None
-    depth = max(outer) - min(outer)
-    # 阈值 0.15mm：光滑圆筒的镶嵌噪声远小于它，而 0.5mm 螺距的牙深约 0.3mm
-    return round(depth, 3) if depth >= 0.15 else None
+    # 多带扫描：螺纹不一定布满全高（例如升口径转接环翻转后外螺纹只在顶部，
+    # 固定单带会采到光滑的外扩台肩或跨到挡肩过渡区，量出 0 或 2.4mm 的假值）。
+    # 逐带取「外表面半径极差」，只接受 plausible 的牙深（0.15~2.0mm：
+    # 0.5mm 螺距牙深约 0.3mm，3mm 螺距牙深约 1.8mm；跨过渡区的假值通常 >2mm），
+    # 取其中最大者；所有带都不 plausible 才返回 None（不猜）。
+    best: float | None = None
+    for frac in (0.15, 0.35, 0.55, 0.75, 0.9):
+        z0 = lo + height * frac
+        z1 = min(z0 + band, hi)
+        if z1 <= z0:
+            continue
+        radii = [math.hypot(p[0], p[1]) for p in points if z0 <= p[2] <= z1]
+        if len(radii) < 64:
+            continue
+        # 内外分界的极值必须**只算一次**拿出去。
+        # 写成 `[r for r in radii if r > (max(radii) + min(radii)) / 2]` 看上去没毛病，
+        # 但那个条件对**每个元素**都重算一遍全表 max/min —— 代价从 O(N) 变成 O(N²)。
+        # 实测（本机，cProfile）：24,016 面的模型上本函数吃 **41.4s**，
+        # 占整段 analyze 47.8s 的 86%（`max` 32.4 万次 + `min` 34.8 万次）；
+        # 而它在每个生成作业里都无条件跑 —— 手机支架、水杯架这些根本没有螺纹。
+        r_lo, r_hi = min(radii), max(radii)
+        outer = [r for r in radii if r > (r_lo + r_hi) / 2]
+        if len(outer) < 32:
+            continue
+        depth = max(outer) - min(outer)
+        # 阈值 0.15mm：光滑圆筒的镶嵌噪声远小于它；上限 2.0mm 排除跨过渡区的假值
+        if 0.15 <= depth <= 2.0 and (best is None or depth > best):
+            best = depth
+    return round(best, 3) if best is not None else None
 
 
 def detect_helix_thread(points: list[tuple[float, float, float]]) -> bool | None:
@@ -413,10 +504,18 @@ def detect_helix_thread(points: list[tuple[float, float, float]]) -> bool | None
     return best >= 0.5
 
 
-def analyze(path: Path, limits: AnalysisLimits | None = None) -> MeshMetrics:
+def analyze(
+    path: Path,
+    limits: AnalysisLimits | None = None,
+    declared_gaps: list[tuple[str, float, str]] | None = None,
+) -> MeshMetrics:
     """完整分析一个 STL 文件。
 
     limits 决定「薄壁」「放不下」这类判断的阈值；不传则用通用 FDM 默认值。
+
+    declared_gaps（(标签, mm, 参数名)，由 jobs 从源码顶层参数里提出来）非空时才会
+    去测内部空隙：本函数已经在内存里握着 points，顺手测比让调用方回头重读一次
+    STL 便宜得多；而「声明了什么间隙」只有拿着源码的调用方知道。
     """
     active = limits or AnalysisLimits()
     if not path.is_file():
@@ -527,6 +626,59 @@ def analyze(path: Path, limits: AnalysisLimits | None = None) -> MeshMetrics:
     if metrics.thread_depth_mm is not None:
         # 有牙型起伏还不够 —— 还要确认它是**螺旋**，而不是同心环（拧不进去的那种）
         metrics.thread_is_helix = detect_helix_thread(points)
+    # 孔径实测：参数核对看不到「把孔写成表达式」的改法，几何能。
+    # 七个高度（1 个主测量 + 6 个剖面）**共用一张面网格与一个时间预算**：
+    # 网格构建是 O(面数)（实测 31k 面 0.14s），旧写法每次调用重建一遍 = 白付 7 次；
+    # 预算共用则把「测一个孔」的代价锁在 _HOLE_PHASE_BUDGET_S 内，测不完就如实 None。
+    # 剖面高度见 `_hole_profile_heights()`：其中两个贴底、一个贴顶，为了照到薄底座里的孔。
+    mid_z = (metrics.bbox_min[2] + metrics.bbox_max[2]) / 2.0
+    hole_center = (
+        (metrics.bbox_min[0] + metrics.bbox_max[0]) / 2.0,
+        (metrics.bbox_min[1] + metrics.bbox_max[1]) / 2.0,
+    )
+    hole_deadline = time.monotonic() + _HOLE_PHASE_BUDGET_S
+    hole_grid = _FaceGrid(points, triangle_count, 1.0) if triangle_count else None
+    metrics.hole_diameter_mm = measure_hole_diameter(
+        points,
+        triangle_count,
+        mid_z,
+        center=hole_center,
+        deadline=hole_deadline,
+        grid=hole_grid,
+    )
+    # 多高度剖面：供改动校验判断「用户声明的孔径到底做没做到」。
+    # 高度取自 `_hole_profile_heights()`（含贴底/贴顶的绝对探针，见那里的实测理由）。
+    metrics.hole_profile = [
+        measure_hole_diameter(
+            points,
+            triangle_count,
+            z,
+            center=hole_center,
+            deadline=hole_deadline,
+            grid=hole_grid,
+        )
+        for z in _hole_profile_heights(metrics.bbox_min[2], metrics.bbox_max[2])
+    ]
+    # 两端材料占比：贴底与贴顶各量一层（判“实心底被挖穿了”）。
+    # 代价实测（本仓 31 份真模型里最大的 30,980 面）：3~5 条扫线 0.005~0.05s，
+    # 比一个孔径探针还便宜，所以给**自己的一份小预算**而不是挤用孔测量剩下的时间：
+    # 孔那边超预算时不能连这条也顺带变 None（那会把一个真需求从清单上抹掉）。
+    # 两端各用自己的 deadline：只量底会把开口朝下的盖子误判成缺陷（见函数 docstring）。
+    metrics.bottom_coverage = measure_end_coverage(
+        points,
+        triangle_count,
+        metrics,
+        grid=hole_grid,
+        deadline=time.monotonic() + _END_BUDGET_S,
+    )
+    metrics.top_coverage = measure_end_coverage(
+        points,
+        triangle_count,
+        metrics,
+        at_top=True,
+        grid=hole_grid,
+        deadline=time.monotonic() + _END_BUDGET_S,
+    )
     metrics.support = estimate_support(points, triangle_count, metrics, active.max_overhang_deg)
     # 支撑占比高时顺带算一次「哪个方向更省」。
     # 注意：六个方向的支撑量用的是同一个粗糙模型，所以**绝对值不可靠、相对比较才有意义** ——
@@ -550,6 +702,26 @@ def analyze(path: Path, limits: AnalysisLimits | None = None) -> MeshMetrics:
                 metrics.orientation_hint = best
 
     _collect_issues(metrics, active)
+    # 内部空隙实测：只在源码声明了间隙/夹口时才测（为什么放在这里见 analyze 的 docstring）。
+    # 放到所有测量都定稿之后：本段要用 bbox/壁厚等已完成的结果，而追加的 issue 行
+    # 也需要排在其它实测问题后面（用户从上往下读就是这个优先级）。
+    # 测不出东西本身就是要报的缺陷（那一刀完全没切到），因此把结论也进 issues：
+    # 否则「程序测量未发现明显几何问题」这句话会继续骗人（实测的假绿就是这么来的）。
+    if declared_gaps:
+        wanted = [float(mm) for _label, mm, _name in declared_gaps if float(mm) > 0]
+        if wanted:
+            metrics.declared_gaps = list(declared_gaps)
+            metrics.interior_gaps = measure_interior_gaps(
+                points, triangle_count, metrics, min_gap_mm=min(wanted)
+            )
+            gaps = metrics.interior_gaps
+            if gaps is not None and gaps.max_mm < min(wanted) * 0.7:
+                solid_axis = gaps.solid_axis
+                metrics.issues.append(
+                    f"源码声明了间隙/夹口（最小 {min(wanted):g}mm），但网格实测三轴最大被夹空档只有 "
+                    f"{gaps.max_mm:.2f}mm（沿 {'XYZ'[solid_axis]} 最长连续材料 "
+                    f"{gaps.longest_material[solid_axis]:.1f}mm）—— 那一刀很可能没切到实体"
+                )
     return metrics
 
 
@@ -574,7 +746,9 @@ def _count_parts(
     包围盒完全包住 —— 两条同时成立才认定为内腔面。
     """
     if face_count <= 0:
-        return 0, 0
+        # 必须返回**三个**值（零件数 / 散件数 / 散件明细）：调用方按三元组解包。
+        # 以前这里只回两个，空网格时直接 ValueError 崩在分析步里。
+        return 0, 0, []
 
     parent: dict[tuple[int, int, int], tuple[int, int, int]] = {}
 
@@ -998,6 +1172,108 @@ class _FaceGrid:
     def candidates(self, cell: tuple[int, int, int]) -> list[int]:
         return self.buckets.get(cell, [])
 
+
+class _LineCrossings:
+    """固定高度 z 的水平线（沿 X）：扫一遍收齐表面交点，之后按 x 回答判据。
+
+    为什么必须这样改（实测，不是推测）：旧写法每问一次「(x, y) 在不在材料里」
+    都要从 x 重新走到模型最右端把所有交点数一遍 —— 而量一个孔要问 ≈50 次，
+    搜一次孔轴要问几千次，代价 = 采样点数 × 射线路径长度。实测用户真实模型
+    （5,346 面）**单个高度**就要 2.3~16.5s，7 个高度合计 38.9s；结果是时间预算
+    把后面 6 个剖面高度全部饿死 —— 明明量得到却报「没量到」，又回到误判。
+
+    关键观察：同一条线（y 固定）上的交点集合与要问多少个点无关。扫一遍把
+    交点收齐排序，之后「这个点在材料里吗」「这个空洞有多宽」都退化成一次
+    二分查找。搜索阶段每条 y 线会被问几十次，于是少算几十倍。
+
+    奇偶口径与旧 `inside()` **完全一致**（同一个 `_ray_triangle`、同一个三角面
+    去重、同一个采样抖动），所以这是「少算」而不是「改判据」。
+    """
+
+    def __init__(
+        self,
+        points: list[tuple[float, float, float]],
+        grid: _FaceGrid,
+        z: float,
+        x_lo: float,
+        x_hi: float,
+    ) -> None:
+        self._points = points
+        self._grid = grid
+        # 采样线稍微抬一点、挪一点：正好落在顶点/棱上时交点会被数两次或漏掉，
+        # 奇偶就反了（实测把「6mm 实心底」读成「从 z=0 就是空的」）。
+        self._z = z + 0.0137
+        self._x_lo = x_lo
+        self._x_hi = x_hi
+        self._cache: dict[float, list[float]] = {}
+
+    def _sweep(self, yy: float) -> list[float]:
+        """这条线上所有表面交点的 x（升序）。"""
+        points, grid = self._points, self._grid
+        origin = (self._x_lo, yy, self._z)
+        xs: list[float] = []
+        seen: set[int] = set()
+
+        def consider(other: int) -> None:
+            if other in seen:
+                return
+            seen.add(other)
+            base = other * 3
+            t = _ray_triangle(
+                origin, (1.0, 0.0, 0.0), points[base], points[base + 1], points[base + 2]
+            )
+            if t is not None and t > 1e-6:
+                x = self._x_lo + t
+                if x <= self._x_hi:
+                    xs.append(x)
+
+        for other in grid.oversized:
+            consider(other)
+        visited: set[tuple[int, int, int]] = set()
+        travelled = 0.0
+        limit = (self._x_hi - self._x_lo) + 1.0
+        while travelled <= limit:
+            cell = grid.cell_of((self._x_lo + travelled, yy, self._z))
+            if cell not in visited:
+                visited.add(cell)
+                for other in grid.candidates(cell):
+                    consider(other)
+            travelled += grid.cell
+        xs.sort()
+        return xs
+
+    def crossings(self, y: float) -> list[float]:
+        yy = y + 0.0173
+        got = self._cache.get(yy)
+        if got is None:
+            got = self._sweep(yy)
+            self._cache[yy] = got
+        return got
+
+    def _interval(self, x: float, y: float) -> tuple[int, int]:
+        """x 落在那一段：返回 (不大于 x 的交点个数 j, 交点总数 n)。"""
+        xs = self.crossings(y)
+        return bisect.bisect_right(xs, x + 1e-6), len(xs)
+
+    def inside(self, x: float, y: float) -> bool:
+        """这个点在材料里吗（它右侧的交点数是奇数）—— 与旧 `inside()` 同一口径。"""
+        j, n = self._interval(x, y)
+        return (n - j) % 2 == 1
+
+    def void_span(self, x: float, y: float) -> tuple[float, float] | None:
+        """x 所在**空洞**区间的左右墙面位置；在材料里、或那是模型外空气时 None。
+
+        「某一侧没有交点」必须是空气而不是孔：旧实现靠「走不出 window 就返回 None」
+        间接得到这个结论，这里直接判，不靠运气的采样范围。
+        """
+        j, n = self._interval(x, y)
+        if (n - j) % 2 == 1:
+            return None  # 在材料里
+        if j == 0 or j >= n:
+            return None  # 左边或右边没有墙面 → 那不是孔
+        xs = self.crossings(y)
+        return xs[j - 1], xs[j]
+
 def _ray_triangle(
     origin: tuple[float, float, float],
     direction: tuple[float, float, float],
@@ -1168,6 +1444,590 @@ def measure_wall_thickness(
     )
 
 
+def measure_hole_diameter(
+    points: list[tuple[float, float, float]],
+    face_count: int,
+    z: float,
+    *,
+    window: float = 15.0,
+    center: tuple[float, float] | None = None,
+    deadline: float | None = None,
+    grid: Any | None = None,
+) -> float | None:
+    """在给定高度量孔的内径：从**孔轴线**向两侧走，直到撞上材料（射线奇偶法）。
+
+    为什么并入 mesh.py（HANDOVER P0）：改孔径时若源码把孔写成表达式
+    （如 d = outer - 2*wall），参数核对根本看不到孔变没变；而实测几何明明能量。
+    旧实现只存在于测试脚本 verify_modify_matrix，产品判据用不上。
+
+    为什么用射线而不是找顶点（实测踩过）：孔是一次 linear_extrude 出来的，
+    孔壁只有最上/最下两圈顶点，采样高度落在中间时一个顶点都找不到 ——
+    一个完全正确的 Ø8 孔被量成 None，于是报「孔径没改到」。
+
+    为什么从孔轴往外走、而不是「取最靠中的空点差」：后者量到的是**半径**
+    （实测 Ø10 量成 5.0、Ø8 量成 4.0），差一个因子 2 却看起来「有数」。
+
+    返回 None 表示该高度没有找到孔（轴线上是材料，或走出 window 仍未撞上材料）。
+
+    --- 孔轴必须**找**，不能假设在 (0,0) ---
+    旧实现直接从 `(0, 0)` 出发走射线，于是只对「**同心**的竖直孔」成立。
+    实测两个都是 Ø10 的孔（`cube(center=true)` 减 `cylinder(d=10)`）：
+      * 孔在中心   → 量得 9.8 ✅
+      * 孔偏心 12mm → 量得 **None** ❌（(0,0) 落在实体里，直接判「这个高度没有孔」）
+    后果很重：判据据此说「孔径没改到」，而 AI 其实改对了 —— 用户的正确修改
+    被判失败，正是本项目最不想出现的那类误判。偏心孔在真实模型里很常见
+    （`translate([x,y,0]) cylinder(...)`、面板上的安装孔、阵列孔都是）。
+    现在先**搜出孔轴**再量：居中孔算出来的轴仍是 (0,0)，结果与旧实现逐位一致
+    （不回归），偏心孔则能正确定位。
+
+    --- 锚点也不能只给 (0,0)：模型本身常常不以原点为中心 ---
+    上面那一修只照到了「同心孔」这一半。实测另一半的形状：
+    **完全同心的孔 + 从原点角上长出来的模型**（`cube([60,40,8])` 不写 center，
+    孔在包围盒中心 (30,20)）—— (0,0) 是**顶角**，在模型外，走不出材料对，
+    于是旧实现同样返回 None。拿真实量级的 3,616 面模型实测：
+        当前代码（只试 (0,0)）  → None，0.006s（直接碰着面数上限就退出）
+        改试包围盒中心       → 9.8，0.110s
+    所以快路径现在**多试一个锚点**：(0,0)（旧口径，逐位不变）与包围盒中心。
+    一个锚点只是 300 次射线（~0.1s 量级），比整段搜索便宜一个数量级，
+    而它把「能测」的范围从 0% 拉回了真实模型的绝大多数。
+
+    `center` 是模型在 XY 上的包围盒中心（调用方已有 bbox，不必重算）。
+    `deadline` 是 `time.monotonic()` 意义上的绝对截止时刻：超预算就如实
+    返回 None（作业是前台跑的，宁可不报也不把界面卡住）。
+    `grid` 让调用方把面网格复用给多次同高度外的测量（analyze 要测 7 个高度）。
+
+    --- 代价的形状：交点按**线**缓存，不是按采样点重走 ---
+    墙的位置不再靠「按 0.1mm 一步步走」找，而是把整条水平线的表面交点扫
+    一遍存下来（`_LineCrossings`），之后每个查询只是一次二分。一个锚点从
+    ≈50 次全程射线降到 1 次扫线；搜索阶段几十条 y 线各扫一次，而不是每个
+    采样点扫一次。实测 23,296 面：单高度 1.2~2.1s → 0.1s 量级，7 个高度能全部
+    走完而不是被预算饿死后 6 个。副产品：墙面取的是**精确交点**而不是
+    「最后一个还空的采样点」，Ø10 不再系统性读成 9.8。
+    """
+    if face_count <= 0:
+        return None
+    if deadline is None:
+        deadline = time.monotonic() + _HOLE_SEARCH_BUDGET_S
+    if grid is None:
+        grid = _FaceGrid(points, face_count, 1.0)
+    # 一次遍历把 XY 范围拿全（扫线要从几何左边开始，(0,0) 在不在模型内也要用它判）
+    x_lo = y_lo = math.inf
+    x_hi = y_hi = -math.inf
+    for px, py, _pz in points[: face_count * 3]:
+        if px < x_lo:
+            x_lo = px
+        if px > x_hi:
+            x_hi = px
+        if py < y_lo:
+            y_lo = py
+        if py > y_hi:
+            y_hi = py
+    if not math.isfinite(x_lo) or x_hi <= x_lo:
+        return None
+
+    lines = _LineCrossings(points, grid, z, x_lo - 1.0, x_hi + 1.0)
+
+    def hole_at(ax: float, ay: float) -> float | None:
+        """把 (ax, ay) 当成孔轴试一下：命中就返回实测内径，否则 None。"""
+        if time.monotonic() > deadline or lines.inside(ax, ay):
+            return None
+        box = lines.void_span(ax, ay)
+        if box is None:
+            return None
+        # 两侧都必须在 window 内撞上墙面，否则那是凹槽/开口而不是孔
+        if ax - box[0] > window or box[1] - ax > window:
+            return None
+        width = box[1] - box[0]
+        # 小于 _HOLE_MIN_DIAMETER_MM 不算孔（锚点落在重合面/刀刃之间的微缝隙）；
+        # 不直接返回而是**继续走**：真正偏心的孔还得靠后面的搜索去找。
+        if width < _HOLE_MIN_DIAMETER_MM:
+            return None
+        return width
+
+    # --- 快路径：先试已知的候选轴位，不需要任何搜索 ---
+    # (0,0) 排在第一个，所以**以原点为中心的模型**结果与以前逐位相同（不回归）；
+    # 但它落在模型外时直接跳过（那是个顶角，不可能量出孔）。
+    anchors: list[tuple[float, float]] = []
+    if x_lo + 0.5 <= 0.0 <= x_hi - 0.5 and y_lo + 0.5 <= 0.0 <= y_hi - 0.5:
+        anchors.append((0.0, 0.0))
+    if center is not None:
+        cxy = (float(center[0]), float(center[1]))
+        if cxy not in anchors:
+            anchors.append(cxy)
+    for ax, ay in anchors:
+        if time.monotonic() > deadline:
+            return None
+        got = hole_at(ax, ay)
+        if got is not None:
+            return got
+
+    # --- 慢路径：锚点都在材料里（或只量到微缝隙），去搜 ---
+    # 代价按**时间**封顶而不是按面数：测得完就报实测值，测不完就返回 None。
+    # 判据只能来自实测，宁可"没测出来"也不能给猜的数。
+    axis = _find_hole_axis(
+        lines,
+        x_lo=x_lo, x_hi=x_hi, y_lo=y_lo, y_hi=y_hi, window=window, deadline=deadline,
+    )
+    if axis is None:
+        return None
+    return hole_at(axis[0], axis[1])
+
+
+def _find_hole_axis(
+    lines: _LineCrossings,
+    *,
+    x_lo: float,
+    x_hi: float,
+    y_lo: float,
+    y_hi: float,
+    window: float,
+    deadline: float,
+) -> tuple[float, float] | None:
+    """在给定高度找出孔的轴线位置（孔内空点聚类后取形心）。
+
+    为什么需要：孔不一定在模型中心（见 `measure_hole_diameter` 的说明）。
+    做法：在包围盒内按粗步长采样，凡是「自身是空、且两侧墙面都在 window 内」
+    的点就算孔内点；把这些点按粗网格做连通聚类，取**最大的一簇**的形心。
+    取最大簇而不是全部平均：模型上常有好几处凹槽/缺口，只认最大的那个孔
+    才不会被浅表的凹陷带偏。
+
+    「空 + 两侧有墙」直接问 `_LineCrossings.void_span`：一次二分就拿精确墙面。
+    旧写法是按 0.6mm 往左右各走一遍，每走一步重算一次「这个点右侧几个交点」——
+    而同一个高度只有一条线要扫，走 50 步等于把同一条线的信息重复算 50 次。
+    顺带修掉一个近似误差：薄于一个探测步长的墙旧写法会跨过去（当成更远的墙），
+    现在取的是真实交点。
+
+    采样分辨率保持不动（还是 ≤400 个点、粗步长 ≥0.5mm）：这一轮要证明的是
+    「少算」能把代价降下来，不是「算得更细」。调分辨率必须另配实测代价曲线。
+
+    代价必须封顶：时间花完就如实返回 **None**，不返回半程筛出来的簇 ——
+    那样可能只扫到一个小孔而漏掉更大的那个，把「量到哪个」变成运气，
+    而这套判据要拿来宣布「用户的改动没做到」。宁可 None 也不猜。
+    """
+    # 粗采样步长：保证采样点总数不超过上限，同时比最小孔径细得多。
+    span = max(x_hi - x_lo, y_hi - y_lo, 1.0)
+    max_samples = 400
+    coarse = max(span / 40.0, 0.5)
+    while True:
+        nx = int((x_hi - x_lo) / coarse) + 1
+        ny = int((y_hi - y_lo) / coarse) + 1
+        if nx * ny <= max_samples or coarse >= span:
+            break
+        coarse *= 1.5
+
+    void_pts: list[tuple[float, float]] = []
+    x = x_lo
+    while x <= x_hi:
+        y = y_lo
+        while y <= y_hi:
+            if time.monotonic() > deadline:
+                return None
+            box = lines.void_span(x, y)
+            if box is not None and x - box[0] <= window and box[1] - x <= window:
+                # 自身是空还不够：两侧都得在 window 内有墙面，否则那是模型外侧
+                # 空气（void_span 已经排掉「某一侧没有交点」）或贯穿的开口。
+                void_pts.append((x, y))
+            y += coarse
+        x += coarse
+
+    if not void_pts:
+        return None
+
+    # 粗网格连通聚类（8 邻域）。**所有**簇都留着，按大小依次验证（见下面的说明）：
+    # 只取最大簇会被「假孔」抢位 —— 一个 Ø74 内腔顶上那段月牙形空档，采样点比
+    # 旁边那个真 Ø10 孔的还多，于是最大簇是月牙，真孔一辈子轮不到。
+    buckets: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for px, py in void_pts:
+        buckets.setdefault((int(px / coarse), int(py / coarse)), []).append((px, py))
+    seen_cells: set[tuple[int, int]] = set()
+    clusters: list[list[tuple[float, float]]] = []
+    for cell in buckets:
+        if cell in seen_cells:
+            continue
+        stack = [cell]
+        seen_cells.add(cell)
+        cluster: list[tuple[float, float]] = []
+        while stack:
+            cx, cy = stack.pop()
+            cluster.extend(buckets.get((cx, cy), ()))
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    nb = (cx + dx, cy + dy)
+                    if nb in buckets and nb not in seen_cells:
+                        seen_cells.add(nb)
+                        stack.append(nb)
+        clusters.append(cluster)
+    clusters.sort(key=len, reverse=True)
+
+    for cluster in clusters:
+        if time.monotonic() > deadline:
+            return None  # 预算花完就 None：不把半程验过的簇当成结论
+        axis = (
+            sum(p[0] for p in cluster) / len(cluster),
+            sum(p[1] for p in cluster) / len(cluster),
+        )
+        if _hole_prism_ok(lines, axis[0], axis[1], y_lo=y_lo, y_hi=y_hi, deadline=deadline):
+            return axis
+    return None
+
+
+def _hole_prism_ok(
+    lines: _LineCrossings,
+    ax: float,
+    ay: float,
+    *,
+    y_lo: float,
+    y_hi: float,
+    deadline: float,
+) -> bool:
+    """确认 (ax, ay) 那段「两侧有墙的空隙」是一段**孔**，而不是腔体顶上的月牙。
+
+    为什么需要这一条（本机实测，不是推测）：Ø80 笔筒（内腔 Ø74、底座 5mm、
+    底座正中一个 Ø10 排水孔）在 **z=15 这个根本没有孔的高度**上报出过孔径 **11.36**。
+    搜索的准入条件是「自身是空 + 两侧墙面都在 window 内」，而贴着多边形腔壁的那条
+    月牙**完全满足**它 —— 单看一条水平线，月牙两侧确实都是材料，2D 上无从分辨。
+    后果是【问题 8】那句「要求 10mm，实测 11.36」：**一个做对了的改动被判失败**，
+    还会驱动修复循环去改一个本来没坏的东西。
+
+    区分办法用孔的本质：孔是**竖直棱柱**，沿 Y 离开轴线一点，宽度只按圆弧缓慢变化
+    （圆孔在 ±d/3 处宽 0.87d）；月牙的宽度在同一距离上会直接翻倍或者根本没有空腔。
+    所以再问两条线（同一个 `_LineCrossings` 对象换个 y，各一次扫线）验宽度稳定。
+
+    代价：只在**慢路径**（已经付过一次搜索）每个候选簇 +1~2 次扫线，锚点快路径不受影响。
+    判不准就返回 False（少报一个高度），绝不放行一个错数 —— 错数会直接对用户说假话，
+    少报只是判据保持沉默。
+    """
+    box = lines.void_span(ax, ay)
+    if box is None:
+        return False  # 形心落在材料里（非凸簇、或根本没有空腔）
+    width = box[1] - box[0]
+    if width < _HOLE_MIN_DIAMETER_MM:
+        return False
+    off = max(width / 3.0, 0.5)
+    checked = 0
+    for y2 in (ay + off, ay - off):
+        if not y_lo <= y2 <= y_hi:
+            continue  # 这一侧已经出了模型包围盒，没什么可验的
+        if time.monotonic() > deadline:
+            return False
+        span2 = lines.void_span(ax, y2)
+        if span2 is None:
+            return False
+        width2 = span2[1] - span2[0]
+        if not 0.5 * width <= width2 <= 2.0 * width:
+            return False  # 宽度在 d/3 内就翻倍/消失 → 那是缝隙不是孔
+        checked += 1
+    return checked == 2  # 上下两条都必须在：只验一条等于没验
+
+
+# 内部空隙扫描的面数上限与最大采样密度：纯 Python 射线扫描，必须给代价封顶。
+# 超过面数上限就不测（只当「没测出来」，绝不拿猜测当结论）。
+_GAP_MAX_FACES = 200_000
+_GAP_MAX_LINES = 21
+# 小于这个厚度的材料段视为网格噪声（共面/相切处的退化面）
+_GAP_MIN_MATERIAL_MM = 1e-4
+
+# 找孔轴的代价封顶（纯 Python 射线扫描，代价随面数与采样点**相乘**）。
+#
+# 为什么用**墙钟预算**而不是面数上限（实测数据，本机）：
+#   旧上限 `_HOLE_AXIS_MAX_FACES = 1200` 是在探测步长还是 0.1mm 的那一版量出来的。
+#   步长优化到 0.6mm 之后没人重取这个数 —— 于是它把「能测」的范围压到了
+#   用户真实模型的 0%：本机 14 份真实项目 STL 的面数是 3,041 ~ 122,771，
+#   **全部**超过 1200，也就是每一份真实模型的孔都是「量不到」。
+#   而刚过线的那一件（1,202 面）解除上限后只花 0.19s 就量出了 Ø9.9。
+# 优化后的实测代价曲线（单次整段搜索）：
+#   1,216 面 → 0.17s    3,616 面 → 0.67s    9,616 面 → 3.16s   24,016 面 → 7.34s
+#   （凸台分散的真实分布更便宜：10,820 面 → 1.26s，30,980 面 → 2.70s）
+# 锚点快路径比这个便宜得多（粗探+二分后 5,056 面单次只 0.12s）。
+# 按时间封顶比按面数封顶诚实：**测得完就报实测值，测不完就如实返回 None**，
+# 不会因为一个过期的常数把本来 0.2 秒能测出来的模型判成「没测出来」。
+_HOLE_SEARCH_BUDGET_S = 0.45   # 单次找孔轴的墙钟预算
+_HOLE_PHASE_BUDGET_S = 2.2     # analyze 里 7 次孔径测量共用的总预算
+#
+# 2.2s 这个数是照着实测代价定的：一个锚点 ≈ 16 次射线（5,056 面时 0.12s），
+# 7 个高度都要试锚点，再加上中部那一次可能的整段搜索。
+# 取小了会把**后面几个剖面高度**饿死（它们本来 0.1s 就能量到），
+# 取大了会让复杂件的分析变慢 —— 分析跑在前台作业里，界面会冻。
+#
+# `analyze` 会在中部高度先做一次（可能付钱搜索），剩下的剖面高度共用同一个
+# 截止时间：预算花完就返回 None，绝不把作业卡住（前台作业，界面会冻）。
+
+# 小于这个直径的「孔」不当孔看（mm）。为什么要这一条（实测踩到）：
+# 用户的真实模型 5,346 面上报过 **孔径 = 0.02mm**。那不是孔，是锚点刚好
+# 落在两个重合面/刀刃之间那一丝网格缝隙里；而二分细化把精度做到 0.02mm，
+# 恰好让这个假读数从前的「0.0」变成了一个**看起来像测量值**的数。
+# 危害具体：这个数会进 `to_dict()`/AI 摘要，也会出现在【问题 8】那句
+# 「实测剖面为 0.02、……」里 —— 对一个按 0.2mm 喷嘴打印的产品，
+# 这句话本身就是假的。而 0.5mm 以下根本不可能是用户点名的孔（最小打印
+# 孔径在毫米级），宁可走搜索也不能拿一个微噪声当结论。
+_HOLE_MIN_DIAMETER_MM = 0.5
+
+# 剖面高度：不能**只**按比例取。本项目的注释早就写着「一个模型可能同时有腔体和
+# 底部小孔，只量中部会把腔体直径当成孔径」，但旧的六个高度是
+# (0.15, 0.3, 0.45, 0.6, 0.75, 0.9) —— **最低的也在 15% 处**。
+# 实测 Ø80 笔筒（总高 100、底座 5mm、底座正中 Ø10 排水孔）：
+#   孔只存在于 z=0~5，而最低探针在 z=15 → 六个高度全部量不到那个孔。
+# 底座上的排水孔/走线孔/安装孔就是这个形状，所以探针里必须有**贴底/贴顶的绝对高度**。
+# 总高度数不变（还是 6 个），代价与旧剖面同量级（本机实测：31k 面 1.28s → 1.3~1.5s）。
+_HOLE_PROFILE_PLAN: tuple[tuple[str, float], ...] = (
+    ("lo", 0.6),
+    ("lo", 2.5),
+    ("frac", 0.3),
+    ("frac", 0.5),
+    ("frac", 0.7),
+    ("hi", 0.6),
+)
+
+
+def _hole_profile_heights(z_lo: float, z_hi: float) -> list[float]:
+    """按 `_HOLE_PROFILE_PLAN` 把六个探针高度算出来（自底向上）。
+
+    贴底/贴顶的探针按**绝对毫米数**取（这样才能照到薄底座里的孔），但极薄的
+    模型（总高几毫米）不能让它们跑到中面以外，所以各自封顶在总高的 20%。
+    """
+    height = max(z_hi - z_lo, 0.0)
+    band = min(height * 0.2, 4.0)
+    out: list[float] = []
+    for kind, value in _HOLE_PROFILE_PLAN:
+        if kind == "lo":
+            out.append(z_lo + min(value, band))
+        elif kind == "hi":
+            out.append(z_hi - min(value, band))
+        else:
+            out.append(z_lo + height * value)
+    return out
+
+
+# 贴边探针离表面的距离：必须**贴边**（实体底/顶的第一层材料），否则边上方/下方的
+# 内壁会把结果抬高。0.3mm 在 0.4 喷嘴的层高量级里安全，且对总高很薄的件会再收敛一层。
+_END_PROBE_MM = 0.3
+# 占比低于这个值就算“这一端是开的”。留出大孔的余量：本机 OpenSCAD 实测
+# Ø80 壳 / 5mm 底板 / 底座正中 Ø10 排水孔 → 贴底 0.958、贴顶 0.085（顶部敞开），
+# 而内腔从 z=0 开挖的开口管两端都只有 0.085 —— 封底与开底差一个数量级，
+# 50% 落在中间，不是凑的数。
+# （0.958 而不是按面积算的 0.875：`span` 取**每条扫线自己**的最外交点，Ø10 的
+# 排水孔只落在正中那条线上，左右两条线整条都是料 → 1.0，三条取均值。）
+_END_MIN_COVERAGE = 0.5
+# 每一端自己的时间预算（实测最坏 0.05s/3 条线，给 0.35s 已是十倍余量）。
+_END_BUDGET_S = 0.35
+
+
+def measure_end_coverage(
+    points: list[tuple[float, float, float]],
+    face_count: int,
+    metrics: MeshMetrics,
+    *,
+    at_top: bool = False,
+    grid: Any | None = None,
+    deadline: float | None = None,
+    fracs: tuple[float, ...] = (0.5, 0.3, 0.7),
+) -> float | None:
+    """在贴底（或贴顶）那一层量“足迹里有多少是材料”（3 条扫线取均值，0~1）。量不了时 None。
+
+    为什么只靠扫线而不是“看有没有底面三角形”：STL 里“底面有一圈环”与“底完整”
+    无法用面数区分，而奇偶射线直接回答“这条线上哪几段是料”。
+
+    为什么不拿包围盒体积/壁厚等现有指标凑：它们对开口管**全部正常**
+    （实测见 `MeshMetrics.bottom_coverage` 那段注释）：31 份真模型交付版本里
+    底是开口的占多数，而零件数/封闭/包围盒/壁厚/孔径剖面没一项报出事 —— 这正是
+    本指标要堵的洞。
+
+    为什么两端都要量：只看底会把**天生开口朝下**的件（盖子、罩壳、倒扣的壳）
+    报成缺陷，而修复循环会真去把底封上 —— 那是把对的改成错的。有了另一端，
+    “两端都开”才是无论怎么放都装不住东西的开口管 —— 只有这种情况才值得拦住修改。
+
+    取 3 条 y 线而不是 1 条：只过中心那一条会被“底上刚好有筋/凸台”带偏，
+    多取两条横向往两侧错开就能抗住；代价实测 0.005~0.05s（最大 30,980 面），
+    所以不是“多取几条贵很多”那种权衡，3 条是本机实测下白送的数量级。
+
+    “足迹”按那条线上**最外两个交点**算（不是包围盒）：这样一个偏心模型
+    也不会因为包围盒比实体大而偷高分数。材料长度取奇配对：最左交点以右是料，
+    所以下标 (0,1)、(2,3)… 的区间就是材料（与 `_LineCrossings.inside` 同一口径）。
+    """
+    if face_count <= 0:
+        return None
+    if deadline is None:
+        deadline = time.monotonic() + _END_BUDGET_S
+    if grid is None:
+        grid = _FaceGrid(points, face_count, 1.0)
+    x_lo, x_hi = metrics.bbox_min[0], metrics.bbox_max[0]
+    y_lo, y_hi = metrics.bbox_min[1], metrics.bbox_max[1]
+    height = metrics.bbox_max[2] - metrics.bbox_min[2]
+    if x_hi <= x_lo or y_hi <= y_lo or height <= 0:
+        return None
+    band = min(_END_PROBE_MM, max(height * 0.05, 0.05))
+    # 贴顶那一层要往下退一个 band（`_LineCrossings` 自己只往上抖 0.0137）。
+    z = metrics.bbox_max[2] - band if at_top else metrics.bbox_min[2] + band
+    lines = _LineCrossings(points, grid, z, x_lo - 1.0, x_hi + 1.0)
+    ratios: list[float] = []
+    for frac in fracs:
+        if time.monotonic() > deadline:
+            break
+        yy = y_lo + (y_hi - y_lo) * frac
+        xs = lines.crossings(yy)
+        if len(xs) < 2:
+            continue
+        span = xs[-1] - xs[0]
+        if span <= 1e-6:
+            continue
+        material = sum(xs[i + 1] - xs[i] for i in range(0, len(xs) - 1, 2))
+        ratios.append(min(material / span, 1.0))
+    if not ratios:
+        return None
+    return sum(ratios) / len(ratios)
+
+
+@dataclass
+class InteriorGaps:
+    """三条轴上「两侧都被材料夹住」的空档最大值（mm）。
+
+    为什么必须能测这个：夹口、插槽、卡座这类**减法功能特征**在参数、包围盒、
+    连通分量里完全看不出来 —— 刀具没切到时模型就是一整块实心料：
+    `solid_parts=1`、`watertight=True`、包围盒对，而壁厚反而因为「根本没有腔」
+    显得“很充足”。实测交付给用户的那版 Pocket3 手机夹就是这样：
+    源码声明 `clamp_gap=14` 的夹口，网格沿 Y 实测内部空隙 **0.00mm**，
+    而需求核对表 9 项全绿、打印性判定 pass/85 分。
+
+    这个测量只回答**空隙存不存在**（不回答位置对不对）：夹口/卡槽/内腔都会被检出；
+    三个方向都不被材料夹住的完全对穿开口不在本判据适用范围内（那种由孔径剖面去量）。
+    """
+
+    per_axis: tuple[float, float, float]
+    longest_material: tuple[float, float, float]
+    lines: int
+
+    @property
+    def max_mm(self) -> float:
+        return max(self.per_axis)
+
+    @property
+    def max_axis(self) -> int:
+        return list(self.per_axis).index(max(self.per_axis))
+
+    @property
+    def solid_axis(self) -> int:
+        """最长连续材料所在的轴 —— 「这一刀本该切进去却没切」的那个方向。
+
+        注意它和 max_axis 不是一回事：前者看的是**实心长度**，后者看的是**空隙**，
+        两个数组的值域方向相反，拿一个去查另一个的下标会直接 ValueError。
+        """
+        return max(range(len(self.longest_material)), key=lambda i: self.longest_material[i])
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "per_axis_mm": [round(v, 2) for v in self.per_axis],
+            "max_mm": round(self.max_mm, 2),
+            "max_axis": "XYZ"[self.max_axis],
+            "longest_material_mm": [round(v, 1) for v in self.longest_material],
+            "lines": self.lines,
+        }
+
+
+def measure_interior_gaps(
+    points: list[tuple[float, float, float]],
+    face_count: int,
+    metrics: MeshMetrics,
+    *,
+    lines: int = 9,
+    min_gap_mm: float | None = None,
+) -> InteriorGaps | None:
+    """沿三条轴打扫描线，量「两侧都有材料夹着」的空档最大长度。
+
+    做法：从包围盒外一点沿轴打射线，收集**全部**交点，按奇偶配对得到材料段；
+    相邻材料段之间的空档就是一个被夹住的空隙（夹口/卡槽/内腔）。
+
+    `min_gap_mm` 用来自适应采样密度：扫描线间距必须**小于要找的空隙**，
+    否则会整列都恰好避开它，把存在的夹口扫成「没找到」——
+    这是这条判据唯一的假失败来源，必须按目标尺寸加密。
+
+    只测量、不下结论：要不要算缺陷由调用方拿声明值去比。
+    """
+    if face_count <= 0 or face_count > _GAP_MAX_FACES:
+        return None
+    lo, hi = metrics.bbox_min, metrics.bbox_max
+    spans = tuple(hi[a] - lo[a] for a in range(3))
+    if min(spans) <= 0.5:
+        return None
+    if min_gap_mm and min_gap_mm > 0:
+        lines = max(
+            lines, min(_GAP_MAX_LINES, int(max(spans) / (float(min_gap_mm) * 0.6)) or 0)
+        )
+    lines = max(3, min(lines, _GAP_MAX_LINES))
+    diag = math.sqrt(sum(v * v for v in spans))
+    grid = _FaceGrid(points, face_count, max(diag / 20.0, 1.0))
+    step = grid.cell / 2.0
+
+    per_axis = [0.0, 0.0, 0.0]
+    longest = [0.0, 0.0, 0.0]
+    for axis in (0, 1, 2):
+        other_u = (axis + 1) % 3
+        other_v = (axis + 2) % 3
+        direction = [0.0, 0.0, 0.0]
+        direction[axis] = 1.0
+        origin = [0.0, 0.0, 0.0]
+        origin[axis] = lo[axis] - 1.0  # 从包围盒外出发，第一次撞上就是表面
+        reach = spans[axis] + 2.0
+        for i in range(1, lines + 1):
+            fu = lo[other_u] + spans[other_u] * i / (lines + 1)
+            # 非整数偏移：避开「采样线正好落在顶点/棱上」的退化情形（奇偶会反）
+            fu += 0.0137
+            for j in range(1, lines + 1):
+                fv = lo[other_v] + spans[other_v] * j / (lines + 1) + 0.0173
+                origin[other_u] = fu
+                origin[other_v] = fv
+                start = tuple(origin)
+                hits: list[float] = []
+                seen: set[int] = set()
+                visited: set[tuple[int, int, int]] = set()
+                travelled = 0.0
+                while travelled <= reach:
+                    probe = list(start)
+                    probe[axis] += travelled
+                    cell = grid.cell_of(tuple(probe))
+                    if cell not in visited:
+                        visited.add(cell)
+                        for other in grid.candidates(cell) + grid.oversized:
+                            if other in seen:
+                                continue  # 同一个面存在多个桶里，去重才能保奇偶正确
+                            seen.add(other)
+                            base = other * 3
+                            t = _ray_triangle(
+                                start,
+                                tuple(direction),
+                                points[base],
+                                points[base + 1],
+                                points[base + 2],
+                            )
+                            if t is not None:
+                                hits.append(t)
+                    if travelled + step > reach:
+                        break
+                    travelled += step
+                if len(hits) < 2:
+                    continue
+                hits.sort()
+                uniq = [hits[0]]
+                for t in hits[1:]:
+                    if t - uniq[-1] > 1e-6:
+                        uniq.append(t)
+                runs = [
+                    (uniq[k], uniq[k + 1])
+                    for k in range(0, len(uniq) - 1, 2)
+                    if uniq[k + 1] - uniq[k] > _GAP_MIN_MATERIAL_MM
+                ]
+                if not runs:
+                    continue
+                longest[axis] = max(longest[axis], max(b - a for a, b in runs))
+                for (a, _b), (c, _d) in zip(runs, runs[1:]):
+                    if c - _b > per_axis[axis]:
+                        per_axis[axis] = c - _b
+    return InteriorGaps(
+        per_axis=(per_axis[0], per_axis[1], per_axis[2]),
+        longest_material=(longest[0], longest[1], longest[2]),
+        lines=lines,
+    )
+
+
 def _face_stats(
     points: list[tuple[float, float, float]], face_count: int
 ) -> tuple[list[float], list[tuple[float, float, float]], list[tuple[float, float, float]]]:
@@ -1232,11 +2092,14 @@ def _axis_plan(axes: tuple[str, str, str]) -> tuple[tuple[int, float], ...]:
 
 def _transform_faces(
     axes: tuple[str, str, str],
-    areas: list[float],
     normals: list[tuple[float, float, float]],
     centroids: list[tuple[float, float, float]],
 ) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]], float]:
-    """按坐标置换把法线/重心转到新朝向，并把模型落到平台上。"""
+    """按坐标置换把法线/重心转到新朝向，并把模型落到平台上。
+
+    面积不跟着转：刚体旋转不改变任何一个面的面积，所以本函数**不**接 `areas`
+    （以前接了却一行没用，调用方会以为传进去的那列也被重排了）。
+    """
     (i0, s0), (i1, s1), (i2, s2) = _axis_plan(axes)
 
     new_normals = [(s0 * n[i0], s1 * n[i1], s2 * n[i2]) for n in normals]
@@ -1349,9 +2212,7 @@ def estimate_support(
     total_weight = sum(item[0] for item in needing)
 
     volume = 0.0
-    sampled_weight = 0.0
     step = grid.cell / 2.0
-    reach = math.sqrt(sum(v * v for v in metrics.bbox))
     for _ in range(count):
         pick = rng.random() * total_weight
         running = 0.0
@@ -1425,7 +2286,7 @@ def orientation_candidates(
         return []
     out: list[dict[str, object]] = []
     for name, ax, ay, az in _ORIENTATIONS:
-        t_normals, t_centroids, _ = _transform_faces((ax, ay, az), areas, normals, centroids)
+        t_normals, t_centroids, _ = _transform_faces((ax, ay, az), normals, centroids)
         volume, _ = _support_for_orientation(areas, t_normals, t_centroids, angle_limit)
         height = max((c[2] for c in t_centroids), default=0.0)
         out.append(
@@ -1785,6 +2646,32 @@ def _collect_issues(metrics: MeshMetrics, limits: AnalysisLimits) -> None:
         )
 
 
+def _gap_line(metrics: MeshMetrics) -> str:
+    """给 AI 的一句话：源码声明了多大间隙 vs 网格上实际量到多大被夹空档。
+
+    为什么也要写进「给 AI 的客观数据」：不给它这条，它会对着一个根本没夹口的模型
+    继续说「可以打印」，程序只能在它说完之后把判定改回来。
+    没声明间隙时返回空串（不占提示词篇幅）。
+    """
+    if not metrics.declared_gaps:
+        return ""
+    declared = "、".join(
+        f"{label}={float(mm):g}mm" for label, mm, _name in metrics.declared_gaps[:4]
+    )
+    gaps = metrics.interior_gaps
+    if gaps is None:
+        measured = "本次未测（面数或尺寸超出上限）"
+    else:
+        measured = "三轴最大被夹空档 " + "、".join(
+            f"{axis}向 {float(v):.2f}mm" for axis, v in zip("XYZ", gaps.per_axis)
+        )
+    return (
+        f"间隙实测：源码声明 {declared}，而网格{measured}"
+        " —— 声明值明显大于实测量到的空档时，difference 的刀具根本没切到实体"
+        "（依然能编译、STL 非空、没 warning）。"
+    )
+
+
 def summarize_for_ai(metrics: MeshMetrics, filename: str, limits: AnalysisLimits | None = None) -> str:
     """给 AI 的客观数据摘要（打印性检查的事实依据）。"""
     active = limits or AnalysisLimits()
@@ -1890,4 +2777,7 @@ def summarize_for_ai(metrics: MeshMetrics, filename: str, limits: AnalysisLimits
         lines.append("按上述基准自动检测到的问题：" + "；".join(metrics.issues))
     else:
         lines.append("按上述基准自动检测：未发现明显几何问题。")
+    gap_line = _gap_line(metrics)
+    if gap_line:
+        lines.append(gap_line)
     return "\n".join(lines)

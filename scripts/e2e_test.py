@@ -15,6 +15,7 @@ API Key 只从环境变量读取，绝不写入任何文件。
 
 from __future__ import annotations
 
+import console_utf8  # noqa: F401,E402 —— 必须最先导入：GBK 控制台下 print 中文/符号会弄崩脚本（见 src/aiforge/stdio.py）
 import json
 import os
 import re
@@ -444,7 +445,8 @@ def main() -> int:
         step("OpenSCAD 自动检测通过", bool(openscad_item and openscad_item["status"] == "ok"),
              openscad_item["detail"] if openscad_item else "缺少该项")
 
-        candidates = client.get("/api/openscad/candidates").json()["candidates"]
+        # 副本列表就在 detect 的结果里（不另开一个端点：一个动作只留一条主路径）
+        candidates = client.get("/api/openscad/detect").json()["candidates"]
         step("能列出所有 OpenSCAD 副本", len(candidates) >= 1, f"{len(candidates)} 个：{[c['path'] for c in candidates][:2]}")
 
         # --- OpenSCAD 自动安装（模拟未安装的电脑）-------------------------

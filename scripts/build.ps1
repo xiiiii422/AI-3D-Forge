@@ -70,6 +70,44 @@ function Write-Ok   { param([string]$Text) Write-Host "  [OK]   $Text" -Foregrou
 function Write-Warn { param([string]$Text) Write-Host "  [WARN] $Text" -ForegroundColor Yellow }
 function Write-Err  { param([string]$Text) Write-Host "  [FAIL] $Text" -ForegroundColor Red }
 
+# Runs a native command, returns its output with stderr merged in, and leaves the
+# command's exit code in $NativeCode. Every native call in this file goes through it.
+#
+# WHY: Windows PowerShell 5.1 turns a native command's stderr into ERROR RECORDS, and
+# while $ErrorActionPreference is 'Stop' the first record becomes a TERMINATING error.
+# Measured on the build machine (one line on stderr, then exit 0 -- i.e. a command that
+# succeeded but had something to say):
+#   cmd 2>&1 | Out-Null        -> RemoteException, script dies right there
+#   cmd 2>&1 | ForEach-Object  -> same
+#   $x = cmd 2>&1 (no pipeline) -> same; a pipeline is not what triggers it
+#   cmd | Out-Null   (no merge) -> survives, real exit code
+#   under 'Continue' + merge    -> survives, real exit code, text captured
+# And $LASTEXITCODE read afterwards is NOT the command's verdict: sampled 5 times on a
+# child that exited 0, it came back -1 four times and 0 once. So "just wrap it in
+# try/catch and check the code" cannot work either -- which is why this function both
+# survives and reports the code itself.
+# So a slow pypi.org once made pip print "WARNING: Retrying (...) Read timed out" and
+# this build died at step 2 with a PowerShell error record instead of pip's own verdict;
+# a genuinely FAILED pip would have died the same way, also with the wrong message.
+# The pitfall was already known here (see the npm block) and still bit a different line,
+# which is why it is now one function plus a self-check guard instead of a comment.
+# Do not hand-write `2>&1` at a call site again.
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(ValueFromRemainingArguments = $true)][string[]]$CmdParams
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = @(& $Exe @CmdParams 2>&1 | ForEach-Object { "$_" })
+        $script:NativeCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return $lines
+}
+
 $BuildId = (Get-Date -Format 'yyyyMMdd-HHmmss')
 $env:AIFORGE_BUILD_ID = $BuildId
 
@@ -90,7 +128,7 @@ if (-not (Test-Path $Python)) {
     & $Python -m ensurepip --upgrade | Out-Null
 }
 
-$pyVersion = (& $Python -V 2>&1) -join ''
+$pyVersion = (Invoke-Native $Python '-V') -join ''
 Write-Ok "Python: $pyVersion"
 
 $nodeOk = $false
@@ -110,9 +148,20 @@ if (-not $SkipFrontend) {
 # --------------------------------------------------------------------------
 Write-Step '2/8  Installing Python dependencies'
 
-& $Python -m pip install --upgrade pip --quiet 2>&1 | Out-Null
-& $Python -m pip install -r (Join-Path $Root 'requirements-build.txt') --quiet 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Err 'Dependency installation failed.'; exit 1 }
+$pipOut = @(Invoke-Native $Python '-m' 'pip' 'install' '--upgrade' 'pip' '--quiet')
+$pipCode = $NativeCode
+if ($pipCode -ne 0) {
+    Write-Err "pip could not update itself (exit $pipCode)."
+    $pipOut | Select-Object -Last 8 | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+    exit 1
+}
+$pipOut = @(Invoke-Native $Python '-m' 'pip' 'install' '-r' (Join-Path $Root 'requirements-build.txt') '--quiet')
+$pipCode = $NativeCode
+if ($pipCode -ne 0) {
+    Write-Err "Dependency installation failed (exit $pipCode)."
+    $pipOut | Select-Object -Last 8 | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
+    exit 1
+}
 $pkgCount = (& $Python -m pip list --format=freeze | Measure-Object).Count
 Write-Ok "Dependencies ready ($pkgCount packages)"
 
@@ -120,14 +169,23 @@ Write-Ok "Dependencies ready ($pkgCount packages)"
 if ($nodeOk) {
     Write-Step '3/8  Building frontend'
     Push-Location (Join-Path $Root 'webui')
+    # npm writes notices ("npm notice New major version of npm available") to stderr,
+    # which is the trap Invoke-Native exists for; this used to hand-roll the same
+    # 'Continue' dance here. Keep the update notifier off too, so the notice is not
+    # produced at all.
+    $env:npm_config_update_notifier = 'false'
     try {
         if (-not (Test-Path 'node_modules')) {
             Write-Host '  Installing frontend dependencies...' -ForegroundColor DarkGray
-            & npm install --no-audit --no-fund 2>&1 | Select-Object -Last 5 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-            if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
+            $installOut = @(Invoke-Native 'npm' 'install' '--no-audit' '--no-fund' '--loglevel=error')
+            $installCode = $NativeCode
+            $installOut | Select-Object -Last 10 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+            if ($installCode -ne 0) { throw "npm install failed (exit $installCode)" }
         }
-        & npm run build 2>&1 | Select-Object -Last 12 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
-        if ($LASTEXITCODE -ne 0) { throw 'npm run build failed' }
+        $buildOut = @(Invoke-Native 'npm' '--loglevel=error' 'run' 'build')
+        $buildCode = $NativeCode
+        $buildOut | Select-Object -Last 12 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        if ($buildCode -ne 0) { throw "npm run build failed (exit $buildCode)" }
     } catch {
         Write-Err $_.Exception.Message
         Pop-Location
@@ -148,23 +206,23 @@ Write-Ok "Frontend ready ($distSize KB)"
 
 # --------------------------------------------------------------------------
 Write-Step '4/8  Generating version resource and icon'
-$verOut = & $Python (Join-Path $Root 'scripts\make_version_info.py') 2>&1 | ForEach-Object { "$_" }
-if ($LASTEXITCODE -ne 0) { Write-Err 'Failed to generate version info.'; exit 1 }
+$verOut = @(Invoke-Native $Python (Join-Path $Root 'scripts\make_version_info.py'))
+if ($NativeCode -ne 0) { Write-Err "Failed to generate version info (exit $NativeCode)."; exit 1 }
 $verOut | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
 
 # The app icon is used by the exe, the shortcuts, the installer wizard and the
 # Add/Remove Programs entry. Without it the software looks unfinished and is
 # hard to find among other shortcuts.
-$iconOut = & $Python (Join-Path $Root 'scripts\make_icon.py') 2>&1 | ForEach-Object { "$_" }
-if ($LASTEXITCODE -ne 0) { Write-Err 'Failed to generate the app icon.'; exit 1 }
+$iconOut = @(Invoke-Native $Python (Join-Path $Root 'scripts\make_icon.py'))
+if ($NativeCode -ne 0) { Write-Err "Failed to generate the app icon (exit $NativeCode)."; exit 1 }
 $iconOut | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
 
 # Guard against the nastiest trap in this repo: a non-ASCII byte inside a .ps1
 # comment can be mis-decoded by Windows PowerShell 5.1 into a backtick, which it
 # treats as a line-continuation -- the next line gets swallowed and the script
 # stops partway with no error at all. Refuse to build if that is present.
-$encCheck = & $Python (Join-Path $Root 'scripts\check_ps_encoding.py') 2>&1 | ForEach-Object { "$_" }
-if ($LASTEXITCODE -ne 0) {
+$encCheck = @(Invoke-Native $Python (Join-Path $Root 'scripts\check_ps_encoding.py'))
+if ($NativeCode -ne 0) {
     Write-Err 'A .ps1 file contains a line that Windows PowerShell 5.1 would mis-parse.'
     $encCheck | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }
     Write-Host '  Fix: python scripts\check_ps_encoding.py --fix' -ForegroundColor Yellow
@@ -175,11 +233,10 @@ Write-Ok 'PowerShell scripts are encoding-safe'
 # --------------------------------------------------------------------------
 if (-not $SkipSelfcheck) {
     Write-Step '5/8  Backend self-check'
-    # Capture first, then filter: Windows PowerShell 5.1 turns a native command's
-    # stderr into a terminating error while $ErrorActionPreference is 'Stop', and
-    # the Python logger writes to stderr.
-    $selfcheckOut = & $Python (Join-Path $Root 'scripts\selfcheck.py') 2>&1 | ForEach-Object { "$_" }
-    $selfcheckCode = $LASTEXITCODE
+    # Capture first, then filter. Invoke-Native is what keeps a stderr line from
+    # killing the build here (the Python logger writes to stderr).
+    $selfcheckOut = @(Invoke-Native $Python (Join-Path $Root 'scripts\selfcheck.py'))
+    $selfcheckCode = $NativeCode
     $selfcheckOut | Where-Object { $_ -match '^\s*\[(OK|FAIL)\]|^  ' } |
         ForEach-Object { Write-Host "    $_" }
     if ($selfcheckCode -ne 0) {
@@ -257,8 +314,12 @@ Pop-Location
 
 $exe = Join-Path $packageDir 'AI-3D-Forge.exe'
 if (-not (Test-Path $exe)) { Write-Err "Missing executable: $exe"; exit 1 }
+# Report both numbers. This is a onefolder build: the exe itself is only a launcher,
+# so saying "Packaged: <exe> (39.2 MB)" was flat-out wrong (the exe is ~7 MB, the
+# folder is 39 MB) and that wrong number ended up in CHANGELOG.md.
 $pkgSize = [math]::Round(((Get-ChildItem $packageDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)
-Write-Ok "Packaged: $exe ($pkgSize MB)"
+$exeSize = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+Write-Ok "Packaged: $packageDir ($pkgSize MB folder total, executable $exeSize MB)"
 
 # --------------------------------------------------------------------------
 Write-Step '7/8  Smoke test on packaged build'
@@ -324,8 +385,8 @@ $Stopwatch.Stop()
 Write-Host ''
 Write-Host ('=' * 72) -ForegroundColor DarkGray
 Write-Host ("  Build finished in {0:N1} minutes" -f $Stopwatch.Elapsed.TotalMinutes) -ForegroundColor Green
-Write-Host "  App dir   : $packageDir" -ForegroundColor White
-Write-Host "  Executable: $exe" -ForegroundColor White
+Write-Host "  App dir   : $packageDir ($pkgSize MB)" -ForegroundColor White
+Write-Host "  Executable: $exe ($exeSize MB)" -ForegroundColor White
 $setup = Join-Path $Root 'installer\Output\AI-3D-Forge-Setup.exe'
 if (Test-Path $setup) {
     $setupSize = [math]::Round((Get-Item $setup).Length / 1MB, 1)

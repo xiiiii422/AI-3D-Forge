@@ -683,6 +683,36 @@ export interface ProjectDetail extends ProjectSummary {
   metrics?: ProjectMetrics | null;
 }
 
+/**
+ * 回收站里的一条（`Projects/.deleted/` 下的一个目录）。
+ *
+ * `entry` 是**目录名**而不是项目 id：恢复/彻底删除都按它找目录，
+ * 后端会拒绝任何带分隔符或 `..` 的名字（路径穿越防护）。
+ */
+export interface TrashItem {
+  entry: string;
+  name: string;
+  project_id: string;
+  revision: number;
+  /** 删除时间（由目录名里的时间戳反解），旧格式可能为空串 */
+  deleted_at: string;
+  files: number;
+  size_bytes: number;
+  has_stl: boolean;
+}
+
+export interface TrashListResponse {
+  items: TrashItem[];
+  count: number;
+  dir: string;
+}
+
+export interface TrashRestoreResponse {
+  ok: boolean;
+  project: ProjectSummary;
+  message: string;
+}
+
 /** 射线法实测的壁厚分布 */
 export interface WallInfo {
   min_mm: number;

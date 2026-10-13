@@ -668,7 +668,35 @@ interface ProjectDetail extends ProjectSummary {
 }
 ```
 ### `PATCH /api/projects/{id}` → `{ "name": string }` → `ProjectSummary`
-### `DELETE /api/projects/{id}` → `{ "ok": true }`（移入回收站而非彻底删除）
+### `DELETE /api/projects/{id}` → `{ "ok": true, "message": string }`（移入回收站而非彻底删除）
+
+### 回收站（删掉的项目住在 `Projects/.deleted/`）
+
+> **路由顺序是硬约束**：`/api/projects/trash` 必须比 `/api/projects/{id}` 先注册。
+> FastAPI 按注册顺序匹配，顺序反了不会报错，只会把 `trash` 当成一个项目 id 去查 → `404`，
+> 而 404 在界面上看起来就是「回收站是空的」。自检 `t_projects` 里有一条真 HTTP 请求盯这个顺序
+> （mock 服务同样按这个顺序写，否则界面验收永远验不到真情形状）。
+
+#### `GET /api/projects/trash` → `{ "items": TrashItem[], "count": number, "dir": string }`
+```ts
+interface TrashItem {
+  entry: string;        // .deleted 下的目录名（`<目录名>__<YYYYmmdd-HHMMSS>`），不是项目 id
+  name: string;         // meta.json 里的项目名
+  project_id: string;
+  revision: number;
+  deleted_at: string;   // 由目录名反解；旧格式可能为 ""
+  files: number;
+  size_bytes: number;
+  has_stl: boolean;
+}
+```
+#### `POST /api/projects/trash/{entry}/restore` → `{ "ok": true, "project": ProjectSummary, "message": string }`
+移回 `Projects/`。同名目录已被占用时自动加 `-1`/`-2` 后缀，**绝不覆盖已有项目**；
+id 不变（历史与作业记录仍对得上）。条目不存在/名字越界 → `404`。
+#### `POST /api/projects/trash/{entry}/purge` → 请求 `{ "confirm": true }` → `{ "ok": true, "message": string }`
+不可恢复的彻底删除，**必须带 `confirm: true`**：没带就 `400`（不拿「接口被调了」当「用户真想删」）。
+`entry` 只接受 `.deleted` 的直接子目录名：带 `/`、`\`、`..`、盘符或绝对路径一律当「找不到」，
+后端不会拿去拼路径（项目 id 那条链路本来就不拼路径，回收站是第一次按名字找目录，防护只能做在这里）。
 
 ### `POST /api/projects/{id}/save` → 请求 `{ "kind"?: "stl" | "scad" | "3mf" }`（默认 `stl`）
 弹系统「另存为」框，把当前文件写到用户选的位置。返回三态，**不靠“没报错”当“已保存”**：

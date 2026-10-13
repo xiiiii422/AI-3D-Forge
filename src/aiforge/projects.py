@@ -31,6 +31,10 @@ from .paths import paths
 log = logging.getLogger(__name__)
 
 NAME_SAFE_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+#: 删除的项目住在这里（项目目录下的一个点开头目录，`_iter_dirs` 会跳过）。
+TRASH_DIRNAME = ".deleted"
+#: 回收站条目名：`<原目录名>__<YYYYmmdd-HHMMSS>`（`delete()` 写，这里反解）。
+TRASH_ENTRY_RE = re.compile(r"^(?P<name>.+)__(?P<stamp>\d{8}-\d{6})$")
 RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
@@ -311,6 +315,130 @@ class ProjectStore:
         except OSError as exc:
             log.warning("移入回收站失败：%s", exc)
             return False
+
+    # --- 回收站：删掉的项目在这里等恢复 --------------------------------
+    @property
+    def trash_dir(self) -> Path:
+        return self.root / TRASH_DIRNAME
+
+    def _trash_entry(self, entry_name: str) -> Path | None:
+        """把界面给的条目名解析成 `.deleted` **里面**的一个目录；不合法返回 None。
+
+        名字是客户端传来的，所以这一步必须自己钉住三件事：不含路径分隔符与 `..`、
+        解析后仍是 `.deleted` 的直接子项、且确实是个目录。少做任一条，
+        「恢复 / 彻底删除」就变成了「按调用者给的路径移动/删除目录」。
+        项目 id 那一条链路本来就不拼路径（`directory_for` 是扫 meta.json 比 id），
+        回收站是第一次**按名字找目录**，所以穿越防护只能在这里做。
+        """
+        raw = (entry_name or "").strip()
+        if not raw or raw in {".", ".."} or any(sep in raw for sep in ("/", "\\", "\x00", ":")):
+            return None
+        target = self.trash_dir / raw
+        try:
+            base = self.trash_dir.resolve()
+            resolved = target.resolve()
+        except OSError:
+            return None
+        if resolved.parent != base or not target.is_dir():
+            return None
+        return target
+
+    def trash_list(self) -> list[dict[str, Any]]:
+        """列出回收站里的条目（最新的在前），给设置页的「回收站」卡片用。"""
+        trash = self.trash_dir
+        if not trash.is_dir():
+            return []
+        out: list[dict[str, Any]] = []
+        for entry in trash.iterdir():
+            if not entry.is_dir():
+                continue
+            deleted_at = ""
+            matched = TRASH_ENTRY_RE.match(entry.name)
+            if matched:
+                s = matched.group("stamp")
+                deleted_at = (
+                    f"{s[0:4]}-{s[4:6]}-{s[6:8]}T{s[9:11]}:{s[11:13]}:{s[13:15]}"
+                )
+            name = entry.name
+            project_id = ""
+            revision = 0
+            meta = entry / "meta.json"
+            if meta.is_file():
+                try:
+                    data = json.loads(meta.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    data = {}
+                name = str(data.get("name") or name)
+                project_id = str(data.get("id") or "")
+                try:
+                    revision = int(data.get("revision") or 0)
+                except (TypeError, ValueError):
+                    revision = 0
+            files = 0
+            total_bytes = 0
+            has_stl = False
+            try:
+                for child in entry.rglob("*"):
+                    if not child.is_file():
+                        continue
+                    files += 1
+                    try:
+                        total_bytes += child.stat().st_size
+                    except OSError:
+                        pass
+                    if child.name == "model.stl":
+                        has_stl = True
+            except OSError:
+                pass
+            out.append(
+                {
+                    "entry": entry.name,
+                    "name": name,
+                    "project_id": project_id,
+                    "revision": revision,
+                    "deleted_at": deleted_at,
+                    "files": files,
+                    "size_bytes": total_bytes,
+                    "has_stl": has_stl,
+                }
+            )
+        out.sort(key=lambda item: (item["deleted_at"], item["entry"]), reverse=True)
+        return out
+
+    def trash_restore(self, entry_name: str) -> Project | None:
+        """把条目从回收站移回项目目录；同名占用时添 `-1`、`-2`，绝不覆盖已有项目。"""
+        entry = self._trash_entry(entry_name)
+        if entry is None:
+            return None
+        matched = TRASH_ENTRY_RE.match(entry.name)
+        base = matched.group("name") if matched else entry.name
+        target = self.root / base
+        counter = 1
+        while target.exists():
+            target = self.root / f"{base}-{counter}"
+            counter += 1
+        try:
+            shutil.move(str(entry), str(target))
+        except OSError as exc:
+            log.warning("从回收站恢复失败：%s", exc)
+            return None
+        project = self._load(target)
+        if project is not None:
+            project.updated_at = now_iso()
+            self.save(project)
+        return project
+
+    def trash_purge(self, entry_name: str) -> bool:
+        """彻底删除回收站里的**一个**条目（不可恢复，调用方必须先拿到显式确认）。"""
+        entry = self._trash_entry(entry_name)
+        if entry is None:
+            return False
+        try:
+            shutil.rmtree(entry)
+        except OSError as exc:
+            log.warning("彻底删除回收站条目失败：%s", exc)
+            return False
+        return True
 
     # --- 内部 -----------------------------------------------------------
     def _iter_dirs(self) -> Iterator[Path]:

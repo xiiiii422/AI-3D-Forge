@@ -9,10 +9,11 @@
  *       实时尺寸标注（整体 / 单条棱线 / 开关）→ 参数微调 → 重开历史项目的实测数据 →
  *       设置/诊断/关于 → 页面切换动画 → 液态玻璃外观（材质切换 / 透明度 / 降级）→
  *       缺 WebView2 时的页面顶部说明与一键安装 → 文件位置里的真实日志路径 →
+ *       回收站（删 → 列 → 恢复 → 彻底删，不可逆操作必须二次确认）→
  *       两种窗口尺寸下的溢出审计。
- * 产出：scripts/shots/*.png 截图 + 控制台错误清单。
+ * 产出：scripts/shots/<两位编号>-*.png 截图 + scripts/shots/report.json（只清自己写的那批）。
  */
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectPage, launchBrowser, sleep } from './cdp.mjs';
@@ -424,8 +425,17 @@ async function auditColors(page, label) {
 }
 
 async function main() {
-  rmSync(SHOTS, { recursive: true, force: true });
+  // 只删自己写的产物。以前这里是 `rmSync(SHOTS, {recursive:true})` 整目录清掉，
+  // 于是把**别的脚本写到同一个目录**的东西一起删了：跑一次本脚本，
+  // `verify-glass-contrast.mjs` 的 `contrast-report.json` 就消失，而 README-开发者
+  // 与 docs/API-CONTRACT.md 都拿它当「玻璃数字能在报告里找到」的出处 ——
+  // 文档指针当场变断链（本轮就是被自检的「随包文档指针」那条抓出来的）。
   mkdirSync(SHOTS, { recursive: true });
+  for (const name of readdirSync(SHOTS)) {
+    if (/^\d{2}[a-z]?-.*\.png$/.test(name) || name === 'report.json') {
+      rmSync(join(SHOTS, name), { force: true });
+    }
+  }
 
   const browser = await launchBrowser({ port: PORT, width: 1280, height: 800 });
   const page = await connectPage(browser.port, 'about:blank');
@@ -1848,6 +1858,201 @@ async function main() {
       if (!info.shown.includes(api.data_dir)) bad.push('「配置与缓存」那行显示的不是 data_dir');
       if (bad.length) throw new Error(bad.join('；'));
       return `配置 …${api.data_dir.slice(-14)}｜日志 …${api.log_dir.slice(-14)}`;
+    });
+
+    /* ---------------- 12e. 回收站：删 → 列 → 恢复 → 彻底删 ----------------
+       以前只能告诉用户「去资源管理器把目录挪回来」，界面没入口就等于没这个能力。
+       这三步跑的是真链路：删的是**非当前项目**，不干扰后面「含真实模型」的布局复检；
+       而不可逆的那一步必须能验到「没确认就删不掉」。 */
+    const victim = { name: '', before: 0, after: 0 };
+
+    await step('侧栏删除一个项目：先进回收站，不是真删（确认框文案得跟能力一致）', async () => {
+      await page.goto(`${BASE}/#/studio`);
+      await page.waitForFunction(`!!document.querySelector('.proj')`, { label: '项目侧栏' });
+      await sleep(500);
+      victim.name = '';
+      const picked = await page.evaluate(`(() => {
+        const rows = [...document.querySelectorAll('.proj')];
+        const victimRow = rows.find((r) => !r.className.includes('is-active'));
+        if (!victimRow) return null;
+        const name = victimRow.querySelector('.proj-name').textContent.trim();
+        victimRow.querySelector('.proj-more').click();
+        // 只能把数据「递回 Node」：页面上没有 victim 这个对象，写进去就是 ReferenceError
+        return { name, before: rows.length };
+      })()`);
+      if (!picked || !picked.name) throw new Error('侧栏里没有可删的非当前项目，这条会空跑');
+      victim.name = picked.name;
+      victim.before = picked.before;
+      await sleep(300);
+      const menuHit = await page.evaluate(`(() => {
+        const item = [...document.querySelectorAll('[role="menuitem"]')]
+          .find((b) => b.textContent.trim() === '删除');
+        if (!item) return false;
+        item.click();
+        return true;
+      })()`);
+      if (!menuHit) throw new Error('项目菜单里找不到「删除」这一项');
+      await page.waitForFunction(`!!document.querySelector('.modal')`, { label: '删除确认框' });
+      const say = await page.evaluate(`(() => {
+        const m = document.querySelector('.modal');
+        return (m.querySelector('.muted')?.textContent || '').replace(/\\s+/g, ' ').trim();
+      })()`);
+      const bad = [];
+      // 文案必须说「能在设置里恢复」——界面存在与否是一回事，文案骗人是另一回事
+      if (!say.includes('回收站')) bad.push(`确认框没提回收站：${say}`);
+      if (/暂不支持恢复|资源管理器/.test(say)) bad.push('确认框还在说「程序内不支持恢复」这种旧话');
+      if (bad.length) throw new Error(bad.join('；'));
+      await page.evaluate(`(() => {
+        const btn = [...document.querySelectorAll('.modal-foot button')]
+          .find((b) => b.textContent.trim() === '删除');
+        btn.click();
+      })()`);
+      await sleep(900);
+      victim.after = await page.evaluate(`document.querySelectorAll('.proj').length`);
+      const still = await page.evaluate(
+        `(async () => (await (await fetch('/api/projects/trash')).json()).count)()`,
+      );
+      const bad2 = [];
+      if (victim.after !== victim.before - 1) bad2.push(`删后侧栏应有 ${victim.before - 1} 条，实际 ${victim.after}`);
+      if (!(still >= 1)) bad2.push(`后端回收站里应该有东西，count=${still}`);
+      if (await page.evaluate(`!!document.querySelector('.modal')`)) bad2.push('确认后弹窗没关');
+      if (bad2.length) throw new Error(bad2.join('；'));
+      return `侧栏 ${victim.before}→${victim.after}，后端回收站 ${still} 条`;
+    });
+
+    await step('设置→回收站：列得出刚删的项目，点「恢复」后侧栏数目回来', async () => {
+      await page.goto(`${BASE}/#/settings`);
+      await page.waitForFunction(`document.querySelectorAll('.card').length >= 6`, { label: '设置页' });
+      const card = await page.evaluate(`(() => {
+        const h2 = [...document.querySelectorAll('.card-head h2')]
+          .find((el) => el.textContent.trim() === '文件位置');
+        const box = h2 && h2.closest('.card');
+        const field = box && [...box.querySelectorAll('.field')]
+          .find((f) => (f.querySelector('.field-label')?.textContent || '').trim() === '回收站');
+        if (!field) return { missing: '没有「回收站」这一栏' };
+        const rows = [...field.querySelectorAll('.path-box')].map((r) => ({
+          name: (r.querySelector('code')?.textContent || '').trim(),
+          restore: !![...r.querySelectorAll('button')].find((b) => b.textContent.trim() === '恢复'),
+          purge: !![...r.querySelectorAll('button')].find((b) => b.textContent.trim() === '彻底删除'),
+        }));
+        return { rows };
+      })()`);
+      if (card.missing) throw new Error(card.missing);
+      const hit = card.rows.find((r) => r.name === victim.name);
+      const bad = [];
+      if (!hit) bad.push(`回收站里没有「${victim.name}」：${JSON.stringify(card.rows.map((r) => r.name))}`);
+      if (hit && (!hit.restore || !hit.purge)) bad.push('条目上没有「恢复」或「彻底删除」按钮');
+      if (hit) {
+        await page.evaluate(`(() => {
+          const field = [...document.querySelectorAll('.field')]
+            .find((f) => (f.querySelector('.field-label')?.textContent || '').trim() === '回收站');
+          const row = [...field.querySelectorAll('.path-box')]
+            .find((r) => (r.querySelector('code')?.textContent || '').trim() === ${JSON.stringify(victim.name)});
+          [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === '恢复').click();
+        })()`);
+        await sleep(900);
+        const left = await page.evaluate(
+          `(async () => (await (await fetch('/api/projects/trash')).json()).items.map((i) => i.name))()`,
+        );
+        if (left.includes(victim.name)) bad.push('点了恢复，后端回收站里还有它');
+        await page.goto(`${BASE}/#/studio`);
+        await page.waitForFunction(`!!document.querySelector('.proj')`, { label: '项目侧栏' });
+        await sleep(700);
+        const back = await page.evaluate(`document.querySelectorAll('.proj').length`);
+        if (back !== victim.before) bad.push(`恢复后侧栏应有 ${victim.before} 条，实际 ${back}`);
+      }
+      if (bad.length) throw new Error(bad.join('；'));
+      return `列出 ${card.rows.length} 条→恢复→侧栏回到 ${victim.before} 条`;
+    });
+
+    await step('回收站「彻底删除」：没确认删不掉，确认了才真少一条', async () => {
+      // 先再删一次同一个项目，让它回到回收站
+      await page.goto(`${BASE}/#/studio`);
+      await page.waitForFunction(`!!document.querySelector('.proj')`, { label: '项目侧栏' });
+      await sleep(500);
+      const found = await page.evaluate(`(() => {
+        const rows = [...document.querySelectorAll('.proj')];
+        const row = rows.find((r) => (r.querySelector('.proj-name')?.textContent || '').trim() === ${JSON.stringify(victim.name)});
+        if (!row) return false;
+        row.querySelector('.proj-more').click();
+        return true;
+      })()`);
+      if (!found) throw new Error(`侧栏里找不到刚恢复的「${victim.name}」，恢复其实没成功`);
+      await sleep(300);
+      await page.evaluate(`(() => {
+        const item = [...document.querySelectorAll('[role="menuitem"]')]
+          .find((b) => b.textContent.trim() === '删除');
+        item && item.click();
+      })()`);
+      await page.waitForFunction(`!!document.querySelector('.modal')`, { label: '删除确认框' });
+      await page.evaluate(`(() => {
+        const btn = [...document.querySelectorAll('.modal-foot button')]
+          .find((b) => b.textContent.trim() === '删除');
+        btn && btn.click();
+      })()`);
+      await sleep(900);
+      await page.goto(`${BASE}/#/settings`);
+      await page.waitForFunction(`document.querySelectorAll('.card').length >= 6`, { label: '设置页' });
+      const openPurge = await page.evaluate(`(() => {
+        const field = [...document.querySelectorAll('.field')]
+          .find((f) => (f.querySelector('.field-label')?.textContent || '').trim() === '回收站');
+        const row = field && [...field.querySelectorAll('.path-box')]
+          .find((r) => (r.querySelector('code')?.textContent || '').trim() === ${JSON.stringify(victim.name)});
+        if (!row) return false;
+        [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === '彻底删除').click();
+        return true;
+      })()`);
+      if (!openPurge) throw new Error('回收站里找不到那一栏的「彻底删除」入口');
+      await page.waitForFunction(`!!document.querySelector('.modal')`, { label: '二次确认弹窗' });
+      const warn = await page.evaluate(`(() => {
+        const m = document.querySelector('.modal');
+        const t = m.querySelector('.modal-head')?.textContent || '';
+        const b = m.querySelector('p')?.textContent || '';
+        return (t + ' ' + b).replace(/\\s+/g, ' ').trim();
+      })()`);
+      const bad = [];
+      if (!/无法恢复|永久/.test(warn)) bad.push(`不可逆操作没警告用户：${warn}`);
+      // 先点「取消」：条目必须还在（这验的是「没确认就删不掉」）
+      await page.evaluate(`(() => {
+        const btn = [...document.querySelectorAll('.modal-foot button')]
+          .find((b) => b.textContent.trim() === '取消');
+        btn.click();
+      })()`);
+      await sleep(500);
+      const cntBefore = await page.evaluate(
+        `(async () => (await (await fetch('/api/projects/trash')).json()).count)()`,
+      );
+      await page.evaluate(`(() => {
+        const field = [...document.querySelectorAll('.field')]
+          .find((f) => (f.querySelector('.field-label')?.textContent || '').trim() === '回收站');
+        const row = [...field.querySelectorAll('.path-box')]
+          .find((r) => (r.querySelector('code')?.textContent || '').trim() === ${JSON.stringify(victim.name)});
+        [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === '彻底删除').click();
+      })()`);
+      await page.waitForFunction(`!!document.querySelector('.modal')`, { label: '二次确认弹窗' });
+      await page.evaluate(`(() => {
+        const btn = [...document.querySelectorAll('.modal-foot button')]
+          .find((b) => b.textContent.trim() === '确认彻底删除');
+        btn.click();
+      })()`);
+      await sleep(900);
+      const cntAfter = await page.evaluate(
+        `(async () => (await (await fetch('/api/projects/trash')).json()).count)()`,
+      );
+      const listed = await page.evaluate(
+        `(async () => (await (await fetch('/api/projects/trash')).json()).items.map((i) => i.name))()`,
+      );
+      if (cntAfter !== cntBefore - 1) bad.push(`确认后条目应少一条：${cntBefore}→${cntAfter}`);
+      if (listed.includes(victim.name)) bad.push('后端回收站里还能按名字查到它');
+      const gone = await page.evaluate(`(() => {
+        const field = [...document.querySelectorAll('.field')]
+          .find((f) => (f.querySelector('.field-label')?.textContent || '').trim() === '回收站');
+        return ![...field.querySelectorAll('.path-box')]
+          .some((r) => (r.querySelector('code')?.textContent || '').trim() === ${JSON.stringify(victim.name)});
+      })()`);
+      if (!gone) bad.push('界面行没跟着消失（只能刷新才准）');
+      if (bad.length) throw new Error(bad.join('；'));
+      return `取消不删（仍 ${cntBefore} 条）→ 确认后 ${cntAfter} 条；${warn.slice(0, 26)}…`;
     });
 
     /* ---------------- 13. 1600×900 溢出复检 ---------------- */

@@ -791,7 +791,7 @@ export default function Studio() {
     setBusy(false);
     setDeleteTarget(null);
     if (ok) {
-      toast.ok('项目已移入回收站。');
+      toast.ok('项目已移入回收站，可在「设置 → 回收站」恢复。');
       if (deleteTarget.id === activeId) {
         setEntries([]);
         setParams([]);
@@ -1137,9 +1137,8 @@ export default function Studio() {
         busy={busy}
         message={
           <>
-            将把「{deleteTarget?.name}」从项目列表里移除，文件会移到项目文件夹的{' '}
-            <code>.deleted</code> 目录里（程序内暂不支持恢复，需要时可以在资源管理器里
-            把它移回来）。确定要删除吗？
+            将把「{deleteTarget?.name}」从项目列表里移除。文件不会真删，会先进项目文件夹的{' '}
+            <code>.deleted</code> 目录，你可以在「设置 → 文件位置 → 回收站」里把它恢复回来。确定要删除吗？
           </>
         }
         confirmText="删除"

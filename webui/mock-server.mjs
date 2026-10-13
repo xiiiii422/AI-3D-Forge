@@ -409,6 +409,9 @@ function parseScadParams(scad) {
 }
 
 const state = {
+  /** 回收站：[{ item, project }]。删项目不真删，与后端 `Projects/.deleted` 同构，
+   *  这样「设置页列出/恢复/彻底删除」这条新链路在 mock 上也是真跑得动的。 */
+  trash: [],
   /** 修改类作业的核对结论：ok=改得干净 / bad=没改到位还顺手改坏别处 */
   verdictKind: process.env.MOCK_VERDICT === 'bad' ? 'bad' : 'ok',
   /** 「送到切片软件」的返回场景：ok / forwarded / failed / none（错误分支靠它验） */
@@ -1835,6 +1838,40 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, projectSummary(project));
     }
     const projectMatch = /^\/api\/projects\/([^/]+)$/.exec(path);
+    /* ---------- 回收站：必须排在 `/api/projects/{id}` 前面 ----------
+       真实后端同样靠注册顺序；mock 写成后置的话，界面验收会拿到 404，
+       而 404 看起来就是「回收站是空的」—— 顺序错在两边都会饶过去。 */
+    if (path === '/api/projects/trash' && method === 'GET') {
+      return sendJson(res, 200, {
+        items: state.trash.map((row) => row.item),
+        count: state.trash.length,
+        dir: 'C:\\Users\\dev\\Documents\\AI-3D-Forge\\Projects\\.deleted',
+      });
+    }
+    const trashRestore = /^\/api\/projects\/trash\/([^/]+)\/restore$/.exec(path);
+    if (trashRestore && method === 'POST') {
+      const index = state.trash.findIndex((row) => row.item.entry === decodeURIComponent(trashRestore[1]));
+      if (index < 0) return sendError(res, 404, '找不到回收站里的这个条目。', 'INTERNAL');
+      const [row] = state.trash.splice(index, 1);
+      state.projects.unshift(row.project);
+      return sendJson(res, 200, {
+        ok: true,
+        project: projectSummary(row.project),
+        message: `已恢复「${row.project.name}」。`,
+      });
+    }
+    const trashPurge = /^\/api\/projects\/trash\/([^/]+)\/purge$/.exec(path);
+    if (trashPurge && method === 'POST') {
+      const body = await readBody(req);
+      if (body.confirm !== true) {
+        return sendError(res, 400, '彻底删除后无法恢复，需要明确确认。', 'INTERNAL', '界面上需要再点一次「确认彻底删除」。');
+      }
+      const entry = decodeURIComponent(trashPurge[1]);
+      const before = state.trash.length;
+      state.trash = state.trash.filter((row) => row.item.entry !== entry);
+      if (state.trash.length === before) return sendError(res, 404, '找不到回收站里的这个条目。', 'INTERNAL');
+      return sendJson(res, 200, { ok: true, message: '已彻底删除。' });
+    }
     if (projectMatch) {
       const project = state.projects.find((p) => p.id === projectMatch[1]);
       if (!project) return sendError(res, 404, '找不到这个项目。', 'INTERNAL', '它可能已经被删除。');
@@ -1850,7 +1887,25 @@ const server = http.createServer(async (req, res) => {
       if (method === 'DELETE') {
         state.projects = state.projects.filter((p) => p.id !== project.id);
         modelCache.delete(project.id);
-        return sendJson(res, 200, { ok: true });
+        // 与真实后端同构：不是真删，而是进回收站等恢复（条目名带时间戳）。
+        const stamp = new Date().toISOString().replace(/[-:TZ]/g, '').slice(0, 13);
+        state.trash.unshift({
+          project,
+          item: {
+            entry: `${project.id.slice(0, 8)}__${stamp}00`,
+            name: project.name,
+            project_id: project.id,
+            revision: project.revision,
+            deleted_at: nowIso(),
+            files: 3,
+            size_bytes: 24_576,
+            has_stl: true,
+          },
+        });
+        return sendJson(res, 200, {
+          ok: true,
+          message: '已移入回收站（项目文件夹的 .deleted 目录），可在「设置 → 回收站」恢复。',
+        });
       }
     }
     /* GET /api/projects/{id}/metrics —— 真实后端会现场重分 STL，

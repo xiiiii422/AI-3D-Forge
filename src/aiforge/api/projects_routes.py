@@ -70,6 +70,51 @@ async def create_project(payload: CreateProjectRequest) -> dict[str, Any]:
     return project.to_summary()
 
 
+# --------------------------------------------------------------------------
+# 回收站：删掉的项目住在 `Projects/.deleted` 里，在这里列出 / 恢复 / 彻底删除
+#
+# 这三条**必须排在 `/api/projects/{project_id}` 前面**：FastAPI 按注册顺序匹配，
+# 放到后面就会被 `{project_id}` 吞掉（变成「查一个叫 trash 的项目」然后 404），
+# 而 404 在界面上看起来完全就是「回收站是空的」。自检里有一条专门盯这个顺序。
+# --------------------------------------------------------------------------
+@router.get("/api/projects/trash")
+async def list_trash() -> dict[str, Any]:
+    store = projects_mod.store()
+    items = store.trash_list()
+    return {"items": items, "count": len(items), "dir": str(store.trash_dir)}
+
+
+class TrashPurgeRequest(BaseModel):
+    confirm: bool = False
+
+
+@router.post("/api/projects/trash/{entry}/restore")
+async def restore_from_trash(entry: str) -> dict[str, Any]:
+    project = projects_mod.store().trash_restore(entry)
+    if project is None:
+        raise not_found("回收站里的这个条目")
+    return {"ok": True, "project": project.to_summary(), "message": f"已恢复「{project.name}」。"}
+
+
+@router.post("/api/projects/trash/{entry}/purge")
+async def purge_trash_entry(entry: str, payload: TrashPurgeRequest) -> dict[str, Any]:
+    """彻底删除回收站里的一条。**不可恢复**，所以必须带 `confirm: true`。
+
+    不拿「接口被调了」当「用户真想删」：没有显式确认就拒，
+    这样即使以后误调这个端点也不会造成数据丢失。
+    """
+    if not payload.confirm:
+        raise AppError(
+            "彻底删除后无法恢复，需要明确确认。",
+            code="INTERNAL",
+            hint="界面上需要再点一次「确认彻底删除」。",
+            status_code=400,
+        )
+    if not projects_mod.store().trash_purge(entry):
+        raise not_found("回收站里的这个条目")
+    return {"ok": True, "message": "已彻底删除。"}
+
+
 @router.get("/api/projects/{project_id}")
 async def get_project(project_id: str) -> dict[str, Any]:
     project = projects_mod.store().get(project_id)
@@ -98,7 +143,7 @@ async def delete_project(project_id: str) -> dict[str, Any]:
     store = projects_mod.store()
     if not store.delete(project_id):
         raise not_found("这个项目")
-    return {"ok": True, "message": "已移入项目文件夹中的 .deleted 目录，可手动恢复。"}
+    return {"ok": True, "message": "已移入回收站（项目文件夹的 .deleted 目录），可在「设置 → 回收站」恢复。"}
 
 
 @router.get("/api/projects/{project_id}/stl")

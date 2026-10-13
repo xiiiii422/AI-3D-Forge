@@ -119,7 +119,7 @@ cd <项目目录>
 | `scripts/selfcheck.py --offline` | 无 | 94 项中跳 15 项（需真实环境）后剩下的全部：模块/路径/SCAD 处理/契约语义/改名桥/缩放/回退/零件库/线程/编码/密钥/外观材质/切片检测规则/接口面/预算/构建脚本形状/模块内未定义名字/高 DPI 工作区 | 79 通过 / 15 跳过 / 0 失败 |
 | `scripts/selfcheck.py` | OpenSCAD | 加上真实编译、STL 分析、打包检查、路由契约、**无参数 GET 逐条发真请求**等（共 94 项） | 94 通过 / 0 失败 |
 | `scripts/selfcheck_design.py` | 无 | 设计规格与改动机制的 144 项细判据 | 全部通过 |
-| `webui/scripts/verify-flow.mjs` | mock 后端（`--first-run` **新起**）+ vite | 界面全流程：欢迎向导 → 工作台 → 需求确认 → 结果卡片 → 预览（含尺寸标注）→ 线框开关 → 设置（页面动画、液态玻璃 10 条、送到切片软件）→ 缺 WebView2 的回退横幅 4 条 → 溢出审计 | 83/83，且 console/pageErrors/failedRequests 全空（2026-10-12 复跑） |
+| `webui/scripts/verify-flow.mjs` | mock 后端（`--first-run` **新起**）+ vite | 界面全流程：欢迎向导 → 工作台 → 需求确认 → 结果卡片 → 预览（含尺寸标注）→ 线框开关 → 设置（页面动画、液态玻璃 10 条、送到切片软件）→ 缺 WebView2 的回退横幅 4 条 → 溢出审计 | 86/86，且 console/pageErrors/failedRequests 全空（2026-10-13 复跑，含回收站三步） |
 | `webui/scripts/verify-glass-contrast.mjs` | 同上 | 玻璃上的字还读不读得清：逐像素量文字对比度 / 底纹泄漏 / 浮层分界度。写进注释与文档的玻璃数字必须能在报告里找到 | `CONTRAST_OK`（不达标就非零退出） |
 | `webui/scripts/layout-audit.mjs` / `audit-interface.mjs` | 真实后端托管 `webui/dist`（默认 8770）或 vite | 布局溢出/遮挡；对比度、焦点、命名、颜色单载、tabular-nums | 0 问题 + `INTERFACE_AUDIT_OK`（audit 必须含一个真实项目路由 `#/studio/<id>`；2026-10-13 在真后端上复跑：10 组 0 问题，项目路由 tabular 候选 7 个、仅颜色 59、无焦点 25 全部 0 违规） |
 | `scripts/verify_modify_matrix.py` | **真实 AI + OpenSCAD** | 端到端自然语言修改：改高度 / 加通孔 / 改孔径 / 加厚底座 / 整体缩放 / 历史回退，每一步都用 STL 实测判定 | 逐项 OK（见 §7 现状） |
@@ -200,14 +200,19 @@ cd <项目目录>
 **上一版留给接手方补跑、本轮已经跑完的（保留跑法，下次改动照做）：**
 1. `scripts/verify_modify_matrix.py` —— 已在 1.0.1/1.0.2/1.0.3 代码上跑过子集全绿（glm 21/21）；
    全矩阵受免费档额度限制，可用 `AIFORGE_MATRIX_STEPS` 指定步骤。
-2. 界面流程验收 `webui/scripts/verify-flow.mjs` —— 2026-10-12 在新起的 mock + vite 上复跑 **83/83 全绿**
-   （console / pageErrors / failedRequests 均为 0）。那 83 条里比旧基线多的一条是「预览线框开关」：
-   它验的是刚加载的模型也能切线框（上一轮实测到 `Viewer3D.tsx` 的 effect 在异步加载完成前就跑完，
-   新模型一律用默认值渲染）。同一天 `verify-glass-contrast.mjs` 也复跑到 `CONTRAST_OK`。
+2. 界面流程验收 `webui/scripts/verify-flow.mjs` —— 2026-10-13 在新起的 mock + vite 上复跑 **86/86 全绿**
+   （console / pageErrors / failedRequests 均为 0）。从旧基线 82 到现在的 86，多出来的是
+   「预览线框开关」（上一轮：实测到 `Viewer3D.tsx` 的 effect 在异步加载完成前就跑完，新模型
+   一律用默认值渲染）与「回收站」三步（本轮：删→列→恢复→彻底删，含「没二次确认就删不掉」）。同一天 `verify-glass-contrast.mjs` 也复跑到 `CONTRAST_OK`。
    复现要注意两件事：mock 必须用 `--first-run` **新起**（否则第一条「首次启动跳向导」就红）；
    地址栏也不能直接用 127.0.0.1 —— Vite 默认只听 `::1`，脚本默认的 BASE 已改成 `http://localhost:5273`。
    跑法：`node webui\mock-server.mjs --first-run`（新起才有效）+ `npx vite --port 5273` +
    `$env:BASE_URL='http://localhost:5273'; node scripts\verify-flow.mjs`。
+   **两条实测到的顺序坑**：① 别在同一个 mock 上先跑 `verify-glass-contrast.mjs` 再跑本脚本 ——
+   玻璃脚本会 PUT 改设置，污染后「开启液态玻璃：默认普通材质」那一步会假红（本轮实测 84/85）；
+   ② 本脚本**只清自己写的截图与 report.json**，不再 `rmSync` 整个 `shots/` ——
+   整目录清掉会把玻璃脚本的 `contrast-report.json` 一起删了，而两份随包文档拿它当证据出处
+   （自检「随包文档指针」那条就是这么抓出来的）。
 3. `scripts/test_install.ps1` —— 2026-10-13 在**本轮重新打的 1.0.3 安装包**上跑完 **54 通过 / 0 失败**
    （1.0.2 时是 46 项）：2b 段真双开唤窗拿到 `woke=True restored=True`，覆盖安装后用户配置存活，
    卸载后用户项目与配置都还在，跑完自动卸载、不留进程。
@@ -236,7 +241,7 @@ cd <项目目录>
 | 部分已做（1.0.2） | 生成质量随机性：已有几何完整性兜底（散件换路径重生成、薄膜检测、逐轴尺寸校正、零件库确定性直出）；CGAL 变体清单仍可继扩 | 继续扩充 `compiler.explain_failure` 改法清单 |
 | ~~P1~~ 已做（1.0.2） | 端到端矩阵与界面流程已跑绿（矩阵子集 21/21、verify-flow 47/47） | 后续改动后照例重跑 |
 | P1 | "同一维度、方位词不同"的匹配偏保守（如"这个孔的内径"配不上"顶部圆孔直径"） | 现在会退化成"结构改动"由 AI 按原话处理（安全但弱）；可用"维度 + 方位不冲突"分级放宽，并保留阴性对照 |
-| P2 | 历史/项目：删除只能进 `.deleted` 手动恢复，界面没有回收站 | 要么加"回收站"页（列/恢复/彻底删除），要么保持现状文案（已改成如实说明） |
+| ~~P2~~ 已做（2026-10-13） | 历史/项目：删除只能进 `.deleted` 手动恢复，界面没有回收站 | 设置页「文件位置 → 回收站」已能列出/恢复/彻底删除（彻底删需二次确认，后端没带 `confirm` 直接 400）；界面链路由 verify-flow 三步钉住，库层与路径越界由 `t_projects` 钉住 |
 | ~~P2~~ 已做（1.0.2） | 多轮对话上下文：`DesignSpec.to_prompt()` 已全量注入 clarifications（“用户此前补充说明过的要求”），生成/修改/评审三条链路共享；自检「修改提示词携带补充说明」含阴性对照 | 长对话压测仍可补 |
 | P3 | 预览大模型性能 | 已有 CreasedNormals/线框开关；超大 STL 可加进度与"降采样预览" |
 

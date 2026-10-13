@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { api, scadDownloadUrl, stlDownloadUrl, threeMfDownloadUrl, triggerDownload } from '../api/client';
 import type { DesignSpec, JobResult, Printability, SpecEventPayload } from '../api/types';
 import { trimNum } from '../hooks/usePrinters';
+import { formatBytes, formatDateTime } from '../lib/format';
 import { useSlicers } from '../hooks/useSlicers';
 import { toFriendlyError } from '../hooks/errors';
 import { Button } from './Button';
@@ -125,19 +126,6 @@ function errorAction(code: string, hasModel: boolean): { label: string; icon: 'w
     default:
       return hasModel ? { label: '重试', icon: 'refresh' } : null;
   }
-}
-
-function formatDateTime(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '';
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getMonth() + 1}月${d.getDate()}日 ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function formatNumber(value: number, digits = 1): string {

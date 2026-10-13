@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, MODE_PRESETS } from '../api/client';
-import type { OpenScadInfo } from '../api/types';
+import type { OpenScadInfo, TrashItem } from '../api/types';
+import { formatBytes, formatDateTime } from '../lib/format';
 import { Accordion } from '../components/Accordion';
 import { Button } from '../components/Button';
 import { Card } from '../components/Card';
@@ -27,6 +28,7 @@ import {
   PrinterManager,
 } from '../components/PrinterManager';
 import { ProgressBar } from '../components/ProgressBar';
+import { Modal } from '../components/Modal';
 import { StatusDot } from '../components/StatusDot';
 import { useToast } from '../components/Toast';
 import { toFriendlyError } from '../hooks/errors';
@@ -102,6 +104,56 @@ export default function Settings() {
   const [testing3d, setTesting3d] = useState(false);
   const [installJobId, setInstallJobId] = useState<string | null>(null);
   const install = useInstallStream(installJobId);
+
+  /* 回收站：删掉的项目存在 Projects/.deleted，在这里列出与恢复。
+     null = 还没读到（不能把「没读到」当成「空的」显示，那是另一回事）。 */
+  const [trash, setTrash] = useState<TrashItem[] | null>(null);
+  const [trashBusy, setTrashBusy] = useState(false);
+  const [purgeTarget, setPurgeTarget] = useState<TrashItem | null>(null);
+
+  const loadTrash = useCallback(async () => {
+    setTrashBusy(true);
+    try {
+      const res = await api.listTrash();
+      setTrash(res.items);
+    } catch (err) {
+      toast.error(toFriendlyError(err).message);
+    } finally {
+      setTrashBusy(false);
+    }
+  }, [toast]);
+
+  useEffect(() => {
+    void loadTrash();
+  }, [loadTrash]);
+
+  const handleRestore = async (entry: string) => {
+    setTrashBusy(true);
+    try {
+      const res = await api.restoreFromTrash(entry);
+      setTrash((rows) => (rows ? rows.filter((row) => row.entry !== entry) : rows));
+      toast.ok(res.message);
+    } catch (err) {
+      toast.error(toFriendlyError(err).message);
+    } finally {
+      setTrashBusy(false);
+    }
+  };
+
+  const handlePurge = async () => {
+    if (!purgeTarget) return;
+    setTrashBusy(true);
+    try {
+      await api.purgeTrashEntry(purgeTarget.entry);
+      setTrash((rows) => (rows ? rows.filter((row) => row.entry !== purgeTarget.entry) : rows));
+      toast.ok('已彻底删除。');
+      setPurgeTarget(null);
+    } catch (err) {
+      toast.error(toFriendlyError(err).message);
+    } finally {
+      setTrashBusy(false);
+    }
+  };
 
   // 后端设置到达后同步到本地表单
   useEffect(() => {
@@ -855,6 +907,56 @@ export default function Settings() {
             </div>
 
             <div className="field">
+              <span className="field-label">回收站</span>
+              <div className="stack-sm">
+                {trash === null ? (
+                  <span className="field-hint">正在读取回收站…</span>
+                ) : trash.length === 0 ? (
+                  <span className="field-hint">回收站是空的。</span>
+                ) : (
+                  trash.map((row) => (
+                    <div className="path-box" key={row.entry}>
+                      <IconFolder size={16} style={{ color: 'var(--text-3)', flex: 'none' }} />
+                      <code>{row.name}</code>
+                      <span className="field-hint">
+                        {row.deleted_at ? formatDateTime(row.deleted_at) : '时间未知'}・
+                        {formatBytes(row.size_bytes)}・{row.files} 个文件
+                      </span>
+                      <Button
+                        size="sm"
+                        disabled={trashBusy}
+                        onClick={() => void handleRestore(row.entry)}
+                      >
+                        恢复
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="danger"
+                        disabled={trashBusy}
+                        onClick={() => setPurgeTarget(row)}
+                      >
+                        彻底删除
+                      </Button>
+                    </div>
+                  ))
+                )}
+              </div>
+              <span className="field-hint">
+                删除的项目先留在这里，随时可以恢复；「彻底删除」不可恢复。
+              </span>
+              <div>
+                <Button
+                  size="sm"
+                  icon={<IconRefresh size={14} />}
+                  loading={trashBusy}
+                  onClick={() => void loadTrash()}
+                >
+                  刷新回收站
+                </Button>
+              </div>
+            </div>
+
+            <div className="field">
               <span className="field-label">配置与缓存</span>
               <div className="path-box">
                 <IconFolder size={16} style={{ color: 'var(--text-3)', flex: 'none' }} />
@@ -1091,6 +1193,29 @@ export default function Settings() {
         hint="选中后立即生效：之后生成的模型都会按这台机器设计。"
       />
       <PrinterManager open={managerOpen} onClose={() => setManagerOpen(false)} />
+
+      {/* 不可逆操作要再确认一次：后端也会拒掉没带 confirm 的 purge */}
+      <Modal
+        open={purgeTarget !== null}
+        title="彻底删除这个项目？"
+        onClose={() => setPurgeTarget(null)}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setPurgeTarget(null)}>
+              取消
+            </Button>
+            <Button variant="danger" loading={trashBusy} onClick={() => void handlePurge()}>
+              确认彻底删除
+            </Button>
+          </>
+        }
+      >
+        <p>
+          将把「{purgeTarget?.name}」的文件夹从回收站里永久删掉（约{' '}
+          {purgeTarget ? formatBytes(purgeTarget.size_bytes) : ''}）。这一步之后无法恢复，
+          只能重新生成。确定吗？
+        </p>
+      </Modal>
     </div>
   );
 }

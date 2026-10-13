@@ -45,6 +45,8 @@ import type {
   Settings,
   SettingsUpdate,
   SlicersResponse,
+  TrashListResponse,
+  TrashRestoreResponse,
   UpdateParamsRequest,
   VersionInfo,
   WindowRuntimeInstallResponse,
@@ -240,6 +242,23 @@ export const api = {
     request<ProjectSummary>(`/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
   deleteProject: (id: string) =>
     request<OkResponse>(`/projects/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /**
+   * 回收站（`Projects/.deleted/`）。
+   *
+   * 后端里 `/api/projects/trash` 必须比 `/api/projects/{project_id}` 先注册，
+   * 否则这个请求会被当成「查一个叫 trash 的项目」而 404（自检盯住这一条）。
+   */
+  listTrash: (signal?: AbortSignal) => request<TrashListResponse>('/projects/trash', { signal }),
+  restoreFromTrash: (entry: string) =>
+    request<TrashRestoreResponse>(`/projects/trash/${encodeURIComponent(entry)}/restore`, {
+      method: 'POST',
+    }),
+  /** 不可恢复：后端要求 `confirm: true`，少了它直接 400 */
+  purgeTrashEntry: (entry: string) =>
+    request<OkResponse>(`/projects/trash/${encodeURIComponent(entry)}/purge`, {
+      method: 'POST',
+      body: { confirm: true },
+    }),
   /** POST /api/projects/{id}/restore —— 回退到某个历史版本（会生成新的一版） */
   restoreRevision: (id: string, revision: number) =>
     request<{ project_id: string; restored_from: number; revision: number }>(

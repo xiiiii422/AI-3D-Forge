@@ -6515,9 +6515,136 @@ def t_projects() -> str:
             )
         finally:
             shutil.rmtree(dotproj.dir, ignore_errors=True)
+
+        # ---- 回收站：列出 / 恢复 / 彻底删除，且名字只能停在 .deleted 里 ----
+        # 「删掉的项目只能去资源管理器手动挪回来」以前是写在确认框里的实话，
+        # 现在得有界面；而界面一来就带来两个新风险：按名字找目录（路径穿越）
+        # 与不可逆的「彻底删除」（不能拿接口被调当用户真想删）。
+        binned = store.create("待恢复的项目")
+        (binned.dir / "model.stl").write_bytes(b"solid x\n" + b" " * 40)
+        store.save(binned)
+        binned_id, binned_name = binned.id, binned.name
+        assert store.delete(binned.id)
+        # 用增量而不是「回收站只有一条」做断言：同一个 store 里前面用例删掉的项目
+        # （以及上一次自检的残留）都还在 `.deleted` 里 —— 先写成 ==1 自己被自己绊倒。
+        trashed = store.trash_list()
+        mine = [t for t in trashed if t["project_id"] == binned_id]
+        assert len(mine) == 1, [t["entry"] for t in mine]
+        entry0 = mine[0]
+        assert entry0["name"] == binned_name, entry0
+        assert entry0["has_stl"] and entry0["size_bytes"] > 0, entry0
+        assert entry0["deleted_at"].startswith("20"), entry0
+        # 回收站的内容不能算「项目列表」（否则恢复前就会重复出现）
+        assert binned_id not in [p.id for p in store.list()]
+
+        restored = store.trash_restore(entry0["entry"])
+        assert restored is not None, "恢复失败（界面只能告诉用户「点不动」）"
+        assert restored.id == binned_id, "恢复后必须是同一个项目（否则历史/作业对不上）"
+        assert (restored.dir / "model.stl").is_file(), "恢复后文件必须跟着回来"
+        assert binned_id in [p.id for p in store.list()], "恢复后应重新出现在项目列表里"
+        assert entry0["entry"] not in [t["entry"] for t in store.trash_list()], "恢复后条目还挂在回收站里"
+
+        # 同名占用：新建一个同名的再恢复，不许覆盖已有项目
+        clash = store.create(binned_name)
+        assert store.delete(restored.id)
+        again = [t for t in store.trash_list() if t["project_id"] == binned_id]
+        assert again, "删两次之后找不到那个条目"
+        moved = store.trash_restore(again[0]["entry"])
+        assert moved is not None and moved.id == binned_id
+        assert moved.dir != clash.dir, "恢复时覆盖掉了同名项目（用户会少一个项目）"
+        assert store.get(clash.id) is not None, "原同名项目被恢复顶掉了"
+        assert store.delete(moved.id)
+
+        # 名字不能跑出 .deleted：分隔符/.. /绝对路径 / 空名全部当「找不到」
+        outside = store.root.parent / "did-not-exist-before.txt"
+        outside.write_text("keep", encoding="utf-8")
+        try:
+            for bad in ("..", "..\\..", "../..", str(store.root), "", "   ", ".", "a:b", "no-such-entry"):
+                assert store.trash_purge(bad) is False, f"回收站接受了一个越界名字：{bad!r}"
+                assert store.trash_restore(bad) is None, f"恢复接受了一个越界名字：{bad!r}"
+            assert outside.is_file(), "越界尝试已经动到了 .deleted 以外的东西"
+
+            # 上面那些全部只靠**字符串**就能拦住，所以它们验不到 resolve() 那一层。
+            # 真正的形状是：条目名字完全合法，但它是指向外面的**联接**——
+            # 不拦的话，「彻底删除一条回收站记录」就会顺着联接把外面那棵树删掉。
+            far = store.root.parent / f"trash-link-target-{os.getpid()}"
+            far.mkdir(parents=True, exist_ok=True)
+            sentinel = far / "must-survive.txt"
+            sentinel.write_text("keep", encoding="utf-8")
+            link = store.trash_dir / f"联接条目__{binned.dir.name}"
+            made = False
+            try:
+                if os.name == "nt":
+                    # junction 不需要管理员权限（symbolic-link 要），也正是用户机器上会出现的那种
+                    import subprocess as _sp
+
+                    proc = _sp.run(
+                        ["cmd", "/c", "mklink", "/J", str(link), str(far)],
+                        capture_output=True,
+                        timeout=60,
+                    )
+                    made = proc.returncode == 0 and link.exists()
+                else:  # pragma: no cover - 非 Windows 走普通符号链接
+                    os.symlink(far, link, target_is_directory=True)
+                    made = link.is_symlink()
+            except OSError:
+                made = False
+            link_note = "联接用例未跑（建不出联接）"
+            if made:
+                # 不能只断言「返回 False」：Windows 上 rmtree 自己就拒绝走进 junction，
+                # 把 resolve() 防护删掉它也一样返回 False —— 那是一条验不出东西的断言
+                # （实测：投毒后守卫仍然全绿）。真正能区分的是「条目有没有被动过」：
+                # 没有防护时 trash_restore 会顺着名字把整个 junction **搬走**。
+                assert store.trash_purge(link.name) is False, "指向外面的联接条目竟然能彻底删除"
+                assert store.trash_restore(link.name) is None, "指向外面的联接条目竟然能恢复"
+                assert link.exists() and sentinel.is_file(), (
+                    "条目或链接目标被动过了：拒绝必须是「不碰它」，而不是「碰了但报错」"
+                )
+                assert link.name in [t["entry"] for t in store.trash_list()], (
+                    "越界条目从回收站列表里消失了（等于被隐式处理掉了）"
+                )
+                link_note = "指向 .deleted 外面的联接条目：拒删、拒恢复，且条目原地不动"
+            # 先拆链接本身（os.rmdir 对 junction/符号链接只删链接，不走进目标），再删靶子目录
+            try:
+                os.rmdir(link)
+            except OSError:
+                pass
+            shutil.rmtree(far, ignore_errors=True)
+        finally:
+            outside.unlink(missing_ok=True)
+
+        # 真 HTTP 往返：路由顺序 + 不可逆操作的显式确认
+        from fastapi.testclient import TestClient
+
+        from aiforge.app import create_app
+
+        client = TestClient(create_app(), base_url="http://127.0.0.1:8760", raise_server_exceptions=False)
+        got = client.get("/api/projects/trash")
+        assert got.status_code == 200, f"{got.status_code} {got.text[:200]}"
+        body = got.json()
+        assert isinstance(body, dict) and "items" in body, (
+            f"/api/projects/trash 被 `/api/projects/{{project_id}}` 吞掉了（路由注册顺序错）：{body}"
+        )
+        assert body["count"] == len(body["items"]) and body["items"], body
+        victims = [t for t in body["items"] if t["project_id"] == binned_id]
+        assert victims, f"接口列不出刚删的那个项目：{[t['entry'] for t in body['items']][:6]}"
+        victim_entry = victims[0]["entry"]
+        noreply = client.post(f"/api/projects/trash/{victim_entry}/purge", json={})
+        assert noreply.status_code == 400, f"没给 confirm 就能彻底删除：{noreply.status_code}"
+        still = client.get("/api/projects/trash").json()["count"]
+        assert still == body["count"], "未确认的 purge 还是删掉了条目"
+        ok_purge = client.post(f"/api/projects/trash/{victim_entry}/purge", json={"confirm": True})
+        assert ok_purge.status_code == 200, ok_purge.text
+        assert client.get("/api/projects/trash").json()["count"] == still - 1
+        gone = client.post(f"/api/projects/trash/{victim_entry}/restore", json={})
+        assert gone.status_code == 404, f"彻底删除后还能恢复：{gone.status_code}"
+        assert store.delete(clash.id)
     finally:
         shutil.rmtree(project.dir, ignore_errors=True)
-    return f"创建/读写/历史/重命名/删除/回收站/名字安全/往返不丢字段/无 id 项目可点开 全部正确（{store.root}）"
+    return (
+        f"创建/读写/历史/重命名/删除/回收站列出与恢复/彻底删需显式确认/越界名字与联接全拒"
+        f"（{link_note}）/名字安全/往返不丢字段/无 id 项目可点开 全部正确（{store.root}）"
+    )
 
 
 def t_config_and_secrets() -> str:
@@ -9144,7 +9271,7 @@ def t_doc_section_refs() -> str:
     同一篇文档的 `## 8` 又物理排在 `## 6` 前面 —— 都是「文档骗人」，和已删函数的引用同一类。
     已有的守卫只盯 `module.func()` 这种点号形式，管不到 `§号`。靠人记得查不如写成守卫。
 
-    名字引用是同一轮里拓出来的第二种句式：CHANGELOG 写了「见下面『守卫与验收的实测数据』段」
+    名字引用是同一轮里抓出来的第二种句式：CHANGELOG 写了「见下面『守卫与验收的实测数据』段」
     而那个标题根本不存在 —— `§号` 的正管不到它，因为它是按中文标题指人的。
     """
     docs = _doc_files()

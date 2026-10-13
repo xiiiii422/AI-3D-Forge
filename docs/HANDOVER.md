@@ -208,8 +208,13 @@ cd <项目目录>
    地址栏也不能直接用 127.0.0.1 —— Vite 默认只听 `::1`，脚本默认的 BASE 已改成 `http://localhost:5273`。
    跑法：`node webui\mock-server.mjs --first-run`（新起才有效）+ `npx vite --port 5273` +
    `$env:BASE_URL='http://localhost:5273'; node scripts\verify-flow.mjs`。
-3. `scripts/test_install.ps1` —— 本轮在 **1.0.3 安装包**上跑完 **54/54**（1.0.2 时是 46 项）。
-   **每次发布后必须补验**：2b 段（真双开唤窗）只有装到本机才验得到，代码改不动它坏没坏。
+3. `scripts/test_install.ps1` —— 2026-10-13 在**本轮重新打的 1.0.3 安装包**上跑完 **54 通过 / 0 失败**
+   （1.0.2 时是 46 项）：2b 段真双开唤窗拿到 `woke=True restored=True`，覆盖安装后用户配置存活，
+   卸载后用户项目与配置都还在，跑完自动卸载、不留进程。
+   **每次发布后必须补验**：2b 段只有装到本机才验得到，代码改不动它坏没坏。
+   两个环境前提（实测）：① 打包链需要先有 `build\dist\AI-3D-Forge`（跑 `.\scripts\build.ps1`）；
+   ② 本机若没有 Inno Setup，`build_installer.ps1` 会**联网自动获取**到用户目录（属于往本机装东西，
+   动手前要用户同意）。
 4. 真后端界面审计（2026-10-13 跑通，跑法记在这里，别再当成「本机做不了」）：先把数据目录
    指到沙箱，**不拿真实用户项目做审计**：
    `$env:AIFORGE_DATA_DIR='build\work\audit-data'`、`$env:AIFORGE_LOCAL_DIR='build\work\audit-local'`、

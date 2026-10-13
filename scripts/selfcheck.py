@@ -241,6 +241,28 @@ def t_scad_validation() -> str:
         result = scad.validate(sneaky)
         assert not result.ok, f"字符串里的 // 把同行代码吃掉了，必须拦：{sneaky!r}"
 
+    # ---- 未闭合的引号也不许把**下一行**的真代码当成字符串内容抹掉 ----
+    # 与上面那个坑是对称的：`strip_comments` 修好了「字符串里的注释符」，但
+    # `strip_strings` 自己也有一个同类问题 —— 它的字符集以前把换行也算进字符串内容，
+    # 遇到没闭合的引号就一路跳行吹走后面的代码。实测（修复前）：
+    #     x = "abc;                          ← 少打一个闭合引号
+    #     import("C:/Windows/win.ini");       ← 被当成上一段字符串的内容抹掉
+    #     y = "def";                          ← 真正的闭合引号在这里才出现
+    # 整份代码能顺利过 `validate()`（ok=True），与「拒绝读写本地文件」的承诺不符。
+    unterminated_quote = 'x = "abc;\nimport("C:/Windows/win.ini");\ny = "def";\ncube([1,1,1]);'
+    result = scad.validate(unterminated_quote)
+    assert not result.ok, f"未闭合引号不该把下一行的 import 当成字符串内容放过去：{result.issues}"
+    detail = "；".join(i.detail for i in result.issues if i.severity == "error")
+    assert "第 2 行" in detail, f"报错行号必须跟原文对齐：{detail}"
+    # 反向：闭合正常的字符串不能被误伤（不然 echo("import") 这类都会被拦）
+    for fine in (
+        'echo("import");\ncube([1,1,1]);',
+        'text("use <x>", size=5);\ncube([1,1,1]);',
+        'x = "a\\"b";\ncube([1,1,1]);',  # 转义引号不能把闭合引号误判成开头引号
+    ):
+        result = scad.validate(fine)
+        assert result.ok, f"不该误拦正常代码：{fine!r} -> {result.issues}"
+
     # 反过来：注释里出现不成对的引号 / 行注释里写 /*，都不该把后面的代码带倒。
     # （旧实现同样在这里错：先把整行删掉再抹字符串，就不会遇到不成对引号；
     # 一旦顺序反过来而不做成一遍扫描，这些就是新产生的误拦。）
@@ -277,7 +299,8 @@ def t_scad_validation() -> str:
 
     return (
         "安全拦截（含 include/use 读文件）/ 报错带行号片段 / 合法 module shell 不误拦 / "
-        "字符串里的 // 与 /* 不吃同行代码 / 注释里的不成对引号不误拦 / 删注释保行号 均正确"
+        "字符串里的 // 与 /* 不吃同行代码 / 未闭合引号不吹走下一行真代码 / 注释里的不成对引号不误拦 / "
+        "删注释保行号 均正确"
     )
 
 
@@ -2879,6 +2902,16 @@ def t_parts_library() -> str:
     assert "use <aiforge_parts.scad>" in block and "filter_adapter" in block, block[:200]
     # 无关需求不该被塞零件块（否则每次生成都要多花 token）
     assert not parts_lib.match("设计一个桌面手机支架，高度 100mm"), "无关需求不应命中零件库"
+
+    # 单字关键词的阴性对照（实测踩到）：「掩盖瑕疵」「覆盖所有表面」这种散文用法
+    # 以前会因为命中「盖」这一个字而被当成要设计螺纹盖，把零件块塞进毫不相关的提示词。
+    # 中文单字必须写成复合词（瓶盖/镜头盖/盖子…）才能当关键词，否则就是在骗人：
+    # llm._parts_block_for 自己的注释写的是「prompt 只在真正相关时才变长」。
+    assert not parts_lib.match("帮我掩盖一下表面瑕疵"), "「掩盖」的「盖」不是盖子"
+    assert not parts_lib.match("这个设计要覆盖所有表面，不留缝隙"), "「覆盖」的「盖」不是盖子"
+    # 复合词必须仍能命中，防止「一刀切删关键词」把召回率也删没了
+    assert any(p.id == "threaded_cap" for p in parts_lib.match("设计一个饮料瓶盖，内径 28mm")), "瓶盖必须命中螺纹盖"
+    assert any(p.id == "threaded_cap" for p in parts_lib.match("做一个相机镜头盖")), "镜头盖必须命中螺纹盖"
 
     proc = _subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "verify_parts.py")],

@@ -117,7 +117,13 @@ PARTS: tuple[PartSpec, ...] = (
             PartParam("top_t", "顶盖厚度", "mm", 2.0, 0.8, 6),
             PartParam("clearance", "内螺纹单边间隙", "mm", 0.35, 0.15, 0.8),
         ),
-        keywords=("盖", "旋盖", "镜头盖", "防尘盖", "瓶盖", "盖子", "cap", "lid", "cover"),
+        # 「盖」这种单字关键词必须写成复合词，不能只留单字：
+        # 实测 `match("帮我掩盖一下表面瑕疵")`、`match("这个设计要覆盖所有表面")`
+        # 都因为「盖」这一个字命中 threaded_cap，把零件块塞进完全不相关的提示词 ——
+        # 而 `_parts_block_for` 自己的注释写的是「prompt 只在真正相关时才变长」，
+        # 这就是那句注释在骗人。中文单字（盖/罩/座…）在散文里几乎都有别的词义，
+        # 必须连词成词才能当关键词，对应守卫见 selfcheck.py::t_parts_library 的阴性对照。
+        keywords=("旋盖", "镜头盖", "防尘盖", "瓶盖", "盖子", "螺纹盖", "cap", "lid", "cover"),
         usage="use <aiforge_parts.scad>\nthreaded_cap(inner_d = 67);",
         verified="scripts/verify_parts.py：封闭、单一实体、Ø72.5×12、牙深 0.35mm",
     ),

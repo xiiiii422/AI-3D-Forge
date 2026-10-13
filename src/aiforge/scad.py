@@ -185,8 +185,20 @@ def strip_comments(source: str) -> str:
 
 
 def strip_strings(source: str) -> str:
-    """去掉字符串字面量内容（保留引号），避免 echo("import") 之类误判。"""
-    return re.sub(r'"(?:[^"\\]|\\.)*"', '""', source)
+    """去掉字符串字面量内容（保留引号），避免 echo("import") 之类误判。
+
+    必须**不允许跨行**，跟 `strip_comments` 对字符串的假设保持一致（见那里
+    的注释：OpenSCAD 的字符串不跨行）。旧实现的字符集 `[^"\\]` 把换行也算
+    在内，遇到**没闭合**的引号就会一路吃掉后面的换行和真代码，直到下一个
+    引号才停 —— 实测：`x = "abc;` + 下一行 `import("C:/Windows/win.ini");` 能让
+    `validate()` 返回 `ok=True`（那个 `import(` 被当成字符串内容抹掉了，根本
+    没进 FORBIDDEN_CALLS 的扫描面），与文件开头承诺的「拒绝能让 OpenSCAD
+    读写本地文件的语句」不符。AI 少打一个引号是现实会发生的事（本文件
+    处理过的其他坑也都是同类：不成对的符号把后面的真代码带偷），修好这一
+    类不匹配比事后依赖「反正 OpenSCAD 也会语法报错」更可靠 —— 那道门本来就是
+    编译之前的唯一静态拦截，不能让它在语法错之前就先撒谎说安全。
+    """
+    return re.sub(r'"(?:[^"\\\r\n]|\\.)*"', '""', source)
 
 
 def validate(source: str) -> ScadValidation:

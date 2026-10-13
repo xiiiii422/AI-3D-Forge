@@ -1297,17 +1297,19 @@ class DeepSeekClient:
         }
         payload.update(self._thinking_control())
         url = f"{self.base_url}/chat/completions"
-        for budget in (budget_default, budget_retry):
+        # P2-13：以前拿 `budget >= VISION_MAX_TOKENS_RETRY`（DeepSeek 的 16384）当终止判据。
+        # 对智谱不成立：`vision_max_tokens_for` 对 glm 返回 `(1024, 1024)`（上限就 1024，没有
+        # 更大的档可试），于是 `1024 >= 16384` 永远为假 —— 这个循环会把同一个 1024 额度
+        # 原样重发一遍（双倍延迟/双倍计费面，却拿不到任何新信息），第二次仍为空才返回空串。
+        # 正确判据：`budget_retry` 真的比 `budget_default` 大，才值得重试。
+        budgets = (budget_default,) if budget_retry <= budget_default else (budget_default, budget_retry)
+        for budget in budgets:
             payload["max_tokens"] = budget
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    response = await client.post(url, headers=self._headers(), json=payload)
-            except httpx.HTTPError as exc:
-                raise LlmError(
-                    f"复核模型图片时网络失败：{exc}",
-                    hint="图片复核失败不影响模型本身，可稍后重试。",
-                    code="API_UNREACHABLE",
-                ) from exc
+            # 以前这里自己开 `httpx.AsyncClient` 直接 `.post`，绕过了 `_post_with_connect_retry`：
+            # 没有连接阶段重试（代理抖动时一次失败就放弃），没有智谱高峰 429/5xx 退避，
+            # 异常文案也没走 `_describe_network_error`（实测又出现过一次「网络失败：」冒号后空白的同
+            # 类现象）。下面改走同一个入口，与文本调用保持同一套重试/报错纪律。
+            response = await self._post_with_connect_retry(url, payload)
             if response.status_code >= 400:
                 # 不能在这里调 `_try_fallback`：那个方法处理的是「文本模型过载/不可用」的降级，
                 # 会把 `payload["model"]` 改成 `self.fallback_model`（一个**文本**模型）。
@@ -1331,8 +1333,9 @@ class DeepSeekClient:
             if text:
                 return text
             # 空正文 + finish_reason=length = 思考过程把额度吃光了，不是「没问题」。
-            # 放大额度重试一次；仍然为空就返回空串，由调用方如实说成「没有结论」。
-            if choice.get("finish_reason") != "length" or budget >= VISION_MAX_TOKENS_RETRY:
+            # 放大额度重试一次（只有真的有更大一档可试时才会走到这里，见上面 budgets）；
+            # 仍然为空就返回空串，由调用方如实说成「没有结论」。
+            if choice.get("finish_reason") != "length" or budget >= budget_retry:
                 return ""
             log.info(
                 "图片复核额度用尽（reasoning 吃满 %d tokens），放大额度重试", budget

@@ -6230,7 +6230,33 @@ def t_visual_review() -> str:
     assert llm.VISION_MAX_TOKENS_RETRY > llm.VISION_MAX_TOKENS
     review_body = inspect.getsource(llm.DeepSeekClient.review_snapshot)
     assert '"length"' in review_body, "必须识别「额度用尽导致的空正文」，不能当成没问题"
-    assert "VISION_MAX_TOKENS_RETRY" in review_body, "额度用尽后必须放大额度重试一次"
+    # 本轮修的真缺陷：放大重试的终止判据以前写的是 `budget >= VISION_MAX_TOKENS_RETRY`，
+    # 拿的是 **DeepSeek 的常量**当尺；而 `vision_max_tokens_for` 对智谱返回 `(1024, 1024)`
+    # （上限就 1024，根本没有更大的档可试），`1024 >= 16384` 永远为假 —— 于是同一个 1024
+    # 额度被原样重发一遍（双倍延迟/双倍计费面，却拿不到任何新信息）。
+    # 不能用 `"VISION_MAX_TOKENS_RETRY" not in review_body` 这种裸字符串包含判断：
+    # 下面修复时写的解释注释本身就提到了这个旧写法，会被误判成「还在用」（同一文件里
+    # `_try_fallback` 那条已经踩过这个坑，改用 AST 而不是正则/裸字符串）。
+    import ast as _ast_budget
+
+    review_tree_budget = _ast_budget.parse(inspect.cleandoc(review_body))
+    loaded_names_budget = {
+        n.id
+        for n in _ast_budget.walk(review_tree_budget)
+        if isinstance(n, _ast_budget.Name) and isinstance(n.ctx, _ast_budget.Load)
+    }
+    called_names_budget = {
+        n.func.id
+        for n in _ast_budget.walk(review_tree_budget)
+        if isinstance(n, _ast_budget.Call) and isinstance(n.func, _ast_budget.Name)
+    }
+    assert "VISION_MAX_TOKENS_RETRY" not in loaded_names_budget and "VISION_MAX_TOKENS" not in loaded_names_budget, (
+        "review_snapshot 不能直接拿 DeepSeek 的 VISION_MAX_TOKENS/RETRY 常量当尺，"
+        "必须走 vision_max_tokens_for() 按提供商分（否则智谱用户会被拿 16384 跟自己的 1024 上限做比较）"
+    )
+    assert "vision_max_tokens_for" in called_names_budget, (
+        "review_snapshot 必须调用 vision_max_tokens_for() 拿到按提供商算好的额度档位"
+    )
     # 本轮新查出的缺陷：`_try_fallback` 是「文本模型过载时降级」的工具函数，会改写
     # `payload["model"]`。以前 `review_snapshot` 在 >=400 时也调了它 —— 于是视觉请求
     # 的模型被换成一个**不会看图**的文本模型重发，那个模型会回一句「我无法查看图片」

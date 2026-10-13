@@ -9294,17 +9294,65 @@ def t_paths() -> str:
     return f"数据目录与项目目录均可用"
 
 
+def _git_ignored(rel_paths: "list[str]") -> "tuple[set[str], str]":
+    """问 git「这些相对路径会不会被忽略」，返回（被忽略集合, 状态说明）。
+
+    为什么需要它：`_shipped_text_files()` 的注释写着「口径必须和 .gitignore 一致」，
+    实现却是一份硬编码目录黑名单 —— 本轮新出现的 `.ai-memory/`（工具工作记录，
+    里面写的就是本机绝对路径）黑名单里没有，于是两个守卫同时把它当提交集扫：
+    一个报 CRLF、另一个本该报本机路径泄漏。拿 git 当单一事实源，
+    以后任何新增的忽略目录都不会再跑错范围（也正是发布流程 `git add -A` 用的同一套规则）。
+
+    **状态必须带原因**：第一版只 `return None` 不说明原因，于是「本文件没导入 subprocess」
+    的 NameError 被伪装成「git 不可用」，默默退回了黑名单。降级可以，但不能拿一个
+    假的解释代替真的 bug（宽 `except` 抹掉原因就是这个效果）。
+    """
+    import subprocess
+
+    if not rel_paths:
+        return set(), "没有待判定的路径"
+    # 两个必须同时做对的细节（都是量出来的，不是推测）：
+    # 1) `-c core.quotePath=false`：git 默认把非 ASCII 路径**转义加引号**输出
+    #    （`"build/work/__\345\217\243...__.md"`），拿它去做集合比对就全部对不上。
+    #    上一轮「`git ls-files` 的八进制转义让两份中文名文档从未被密钥扫描」
+    #    就是同一个坑的另一个版本，这次是它回过来咬了我的新代码。
+    # 2) 走**字节**而不是 text=True：文本模式会把输入的 '\n' 翻译成 '\r\n'，
+    #    git 再带着那个 `\r` 把路径输出回来（Windows 管道实测）。
+    payload = ("\n".join(rel_paths) + "\n").encode("utf-8", "surrogateescape")
+    try:
+        proc = subprocess.run(
+            ["git", "-c", "core.quotePath=false", "check-ignore", "--stdin"],
+            cwd=str(ROOT),
+            input=payload,
+            capture_output=True,
+            timeout=120,
+        )
+    except Exception as exc:  # noqa: BLE001 - 降级可以，但不能不说原因
+        return set(), f"git 不可用（{type(exc).__name__}: {exc}）"
+    if proc.returncode not in (0, 1):
+        # 0=有命中、1=全没命中，其他是 git 自己出错（不在仓库里等）
+        return set(), (
+            f"git 执行失败（rc={proc.returncode}）："
+            f"{(proc.stderr or b'').decode('utf-8', 'replace').strip()[:120]}"
+        )
+    text = (proc.stdout or b"").decode("utf-8", "replace")
+    return {ln.strip() for ln in text.splitlines() if ln.strip()}, "ok"
+
+
 def _shipped_text_files() -> "list[Path]":
     """仓库里「会进版本库 / 源码包」的文本文件。
 
     口径必须和 `.gitignore`、`scripts\\export_source.ps1` 一致：
     build/（venv、缓存、自检临时数据、打包产物）、node_modules、dist、
     界面截图与体检报告都是**生成物**，既不该被扫描，也本来就不会被提交。
+
+    黑名单只当 **git 不可用时的兜底**；正常运行时走 `_git_ignored()`，
+    否则每新增一个忽略目录都要记得改这里 —— 而这件事一漏就是误报或漏报。
     """
     unshipped_dirs = {
         "build", "node_modules", "dist", "dist-ssr", ".git", ".vscode", ".idea",
         ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache",
-        "Output", "shots", ".deleted",
+        "Output", "shots", ".deleted", ".ai-memory",
     }
     text_exts = {
         ".py", ".ts", ".tsx", ".js", ".mjs", ".cjs", ".css", ".html", ".json", ".md",
@@ -9319,7 +9367,11 @@ def _shipped_text_files() -> "list[Path]":
             continue
         if path.name in (".gitignore", ".gitattributes") or path.suffix.lower() in text_exts:
             files.append(path)
-    return sorted(files)
+    files = sorted(files)
+    ignored, _git_note = _git_ignored([p.relative_to(ROOT).as_posix() for p in files])
+    if ignored:
+        files = [p for p in files if p.relative_to(ROOT).as_posix() not in ignored]
+    return files
 
 
 def t_source_encoding() -> str:
@@ -9334,7 +9386,31 @@ def t_source_encoding() -> str:
       * 一次工具写入把 27 个提交文件写成了 CRLF 行尾（仓库约定是 LF），
         代码照跑、测试照过，只有 diff 满屏空白变动时才被人看见。
     三次都是「看着像成功、实际已损坏」，只有扫描才能挡住。
+
+    扫描范围必须等于「会被 `git add -A` 提交的范围」：上一版拿硬编码黑名单自己划，
+    新的忽略目录（本轮的 `.ai-memory/`）一出现就把工具工作记录当成提交集扫，当场误报。
+    下面第 0 段把这个口径本身钉住（双向：忽略区必须被排除、随包文件必须在集合里）。
     """
+    # 0) 口径校验：拿 git 的忽略规则当单一事实源，而不是再维护一份名单
+    probe = ["build/work/__口径探针__.md", "README.md", "docs/HANDOVER.md"]
+    ignored, git_note = _git_ignored(probe)
+    scope_note = "扫描范围按 git 忽略规则取（与 `git add -A` 同源）"
+    if git_note != "ok":
+        # 不硬失败：没 git 的环境（某些容器）也得能跑完自检。但原因必须出现在结果里：
+        # 上一版只留一句「git 不可用」，把自己漏导入 subprocess 的 NameError 抹成了静默降级。
+        scope_note = f"git 忽略规则不可用，退回目录黑名单；原因：{git_note}"
+    else:
+        assert "build/work/__口径探针__.md" in ignored, (
+            f"忽略判定失效（{sorted(ignored)}）：build/ 下的工具文件会被当成提交集，"
+            "本轮误报就是这么来的"
+        )
+        assert "README.md" not in ignored and "docs/HANDOVER.md" not in ignored, (
+            f"随包文档被误当成忽略：{sorted(ignored)} —— 口径反了会「扫不到东西却报全绿」"
+        )
+        listed = {p.relative_to(ROOT).as_posix() for p in _shipped_text_files()}
+        assert "README.md" in listed and "docs/HANDOVER.md" in listed, (
+            f"随包文档不在扫描集合里（共 {len(listed)} 个），这条守卫就是空跑"
+        )
     # 这些字符只在「GBK 误读 UTF-8 中文」的产物里成堆出现，正常中文里几乎见不到。
     # 刻意用码点构造而不是字面量：否则本文件自己就带着一堆疑似乱码字符，
     # 规则会被自己绊倒（这个坑在写这条规则时当场踩到过）。
@@ -9400,7 +9476,7 @@ def t_source_encoding() -> str:
         f"只扫到 {scanned} 个提交文本文件，明显不对"
         "（仓库是不是被放在 build/ 之类的被跳过目录下了？）"
     )
-    return f"{scanned} 个提交文本文件：无 BOM、无 U+FFFD、无乱码字符、行尾统一"
+    return f"{scanned} 个提交文本文件：无 BOM、无 U+FFFD、无乱码字符、行尾统一（{scope_note}）"
 
 
 def t_no_personal_paths() -> str:
@@ -9411,6 +9487,11 @@ def t_no_personal_paths() -> str:
     （搭建命令、踩坑示例、目录树根）外加前端 mock 里 7 处真实账号名。
     规则**不能硬编码本机路径**（那样规则自己就是泄漏），
     所以用运行时推导：当前用户目录 + 当前仓库根目录。
+
+    比较必须**忽略大小写**：Windows 路径不区分大小写，而盘符大小写取决于当时怎么写的。
+    本轮实测：同一个仓库根路径只把盘符写成小写，旧判据**一条也不报**
+    —— 别人 clone 后看到的仍然是本机绝对路径。
+    这里刻意不把本机路径写成字面量（那本身就是泄漏），只描述形状。
     """
     home = Path.home()
     needles: list[tuple[str, str]] = [(str(ROOT), "本机仓库绝对路径")]
@@ -9420,8 +9501,24 @@ def t_no_personal_paths() -> str:
     # JS/JSON 里的反斜杠是转义的（C:\\Users\\x），正斜杠写法也很常见，都要覆盖
     variants: list[tuple[str, str]] = []
     for needle, label in needles:
-        variants.append((needle, label))
-        variants.append((needle.replace("\\", "/"), label))
+        variants.append((needle.lower(), label))
+        variants.append((needle.replace("\\", "/").lower(), label))
+
+    def leaks(text: str) -> str | None:
+        """命中哪一类本机路径；没命中返回 None。全文小写比对（盘符大小写不算豁免）。"""
+        low = text.lower()
+        flattened = low.replace("\\\\", "\\")
+        for needle, label in variants:
+            if needle in low or needle in flattened:
+                return label
+        return None
+
+    # 判据自己的双向对照：小写盘符必须被报，与本机无关的相对路径不能误报
+    assert leaks(f"{str(ROOT)[0].lower()}{str(ROOT)[1:]}\\build\\work\\x.py") == "本机仓库绝对路径", (
+        "本机路径判据对「盘符小写」失效：Windows 路径不区分大小写，"
+        "写 `d:\\…` 就能把仓库绝对路径递进公开仓库"
+    )
+    assert leaks("build\\\\work\\\\testdata\\\\x.py") is None, "相对路径被误报成本机绝对路径"
 
     problems: list[str] = []
     scanned = 0
@@ -9429,10 +9526,9 @@ def t_no_personal_paths() -> str:
         rel = path.relative_to(ROOT).as_posix()
         scanned += 1
         text = path.read_text(encoding="utf-8", errors="replace")
-        flattened = text.replace("\\\\", "\\")
-        for needle, label in variants:
-            if needle in text or needle in flattened:
-                problems.append(f"{rel}: 含{label}（{needle}）")
+        label = leaks(text)
+        if label:
+            problems.append(f"{rel}: 含{label}")
 
     assert not problems, "；".join(problems)
     assert scanned >= 20, (

@@ -73,6 +73,33 @@ OFFLINE_SKIPS: dict[str, str] = {
 }
 
 
+class SkipSelfcheck(Exception):
+    """运行时环境不够，这一项**现在验不了**（不是失败，也不算通过）。
+
+    为什么需要它（而不是只靠 `OFFLINE_SKIPS` 那份名单）：静态名单按**名字**跳，
+    它不知道这台机器到底有没有 OpenSCAD、有没有构建产物。结果是同一项在开发机上跑、
+    在 CI / 新 clone 上直接挂（本轮把镜像仓库克隆到项目外跑 `--offline`，实测四条红：
+    需要真编译的、要 `build/` 里那个生成图标的、依赖 `build/venv` 的预算守卫、
+    以及只能靠静态名单解决的那条路由检查）。而 `OFFLINE_SKIPS` 仍按名字服务于
+    「需要网络/会装机」这类不能跑在 CI 里的项 —— 两者职责不同。
+    跳过必须单独计数并打印原因，绝不混进「通过」（跟 `--offline` 同一个红线）。
+    """
+
+
+def _openscad_ready() -> bool:
+    """这台机器到底能不能真编译（新 clone / CI 上通常不能）。
+
+    不能拿 `--offline` 名单代拾：同一份代码在装了 OpenSCAD 的机器上应当硬断言，
+    在没装的机器上应当**说清楚验不了**；静态名单只能二选一，就会要么漏覆盖、要么假红。
+    """
+    try:
+        from aiforge import openscad as _osc
+
+        return _osc.resolve_executable() is not None
+    except Exception:  # noqa: BLE001 - 探测本身不能把自检带崩
+        return False
+
+
 def check(name: str, fn) -> None:
     if OFFLINE and name in OFFLINE_SKIPS:
         reason = OFFLINE_SKIPS[name]
@@ -83,6 +110,11 @@ def check(name: str, fn) -> None:
         result = fn()
         PASSED.append(f"{name}" + (f" —— {result}" if result else ""))
         _SAFE_PRINT(f"  [OK]   {name}" + (f" —— {result}" if result else ""))
+    except SkipSelfcheck as exc:
+        # 放在通用 `except Exception` **前面**：否则“验不了”会被当成失败（假报警），
+        # 更会被当成“红=得修”而逼人去把环境搭出来。
+        SKIPPED.append((name, str(exc)))
+        _SAFE_PRINT(f"  [SKIP] {name} —— {exc}（当前机器环境验不了；不是失败也不是通过）")
     except Exception as exc:  # noqa: BLE001
         FAILED.append((name, f"{type(exc).__name__}: {exc}"))
         # 为什么不能直接用 print：失败分支上的那行字里带异常消息，而那正是最容易
@@ -2899,6 +2931,11 @@ def t_deterministic_part() -> str:
     source = parts_lib.render_source(part, values, name="67转77滤镜转接环", summary=part.summary)
     validation = _scad.validate(source)
     assert validation.ok, validation.issues
+    if not _openscad_ready():
+        # 上面那些（映射/回退/安全校验）都不依赖环境，已经跑完了；
+        # 真编译这一段在没装 OpenSCAD 的机器上验不了，跳过并说原因，
+        # 不拿「本机没装引擎」当产品缺陷报（CI 与新 clone 都会被这条逼红）。
+        raise SkipSelfcheck("几何与尺寸那一段需要 OpenSCAD 真编译（本机未安装；映射/回退/校验已验完）")
     with _tempfile.TemporaryDirectory(prefix="det_") as tmp:
         res = _compiler.compile_to_stl(source, _Path(tmp), basename="model")
         assert res.ok and res.stl_path, res.message or res.fatal
@@ -6393,8 +6430,11 @@ def t_bundle_budget() -> str:
         absent.append("安装包")
 
     assert not over, "体积/依赖超预算：" + "；".join(over)
-    # 同上：一条什么都没查的守卫给的是假安全感
-    assert len(checked) >= 4, f"预算守卫只核对了 {len(checked)} 项，太少（守卫没生效？）：{checked}"
+    # 同上：一条什么都没查的守卫给的是假安全感。但**下限只能按「不依赖构建产物的那几项」算**：
+    # 声明类三项（运行期/构建期/前端依赖）始终要核到，而 JS/CSS/免安装版/安装包
+    # 在**新 clone / CI** 上根本不存在（实测克隆体里只剩 3 项，旧下限 4 直接假红）。
+    # 没核到的那些由下面的 tail 写明，不拿「没查到」冒充「通过」。
+    assert len(checked) >= 3, f"预算守卫只核对了 {len(checked)} 项，太少（守卫没生效？）：{checked}"
     tail = f"（未构建，本次没核对：{'、'.join(absent)}）" if absent else ""
     return "预算内：" + "、".join(checked) + tail
 
@@ -6917,11 +6957,18 @@ def t_http_api() -> str:
 
     detect = client.get("/api/openscad/detect")
     assert detect.status_code == 200, detect.text
-    assert detect.json()["found"] is True, detect.json()
+    openscad_note = ""
+    if detect.json()["found"]:
+        assert detect.json()["found"] is True, detect.json()
 
-    cli = client.post("/api/openscad/test")
-    assert cli.status_code == 200, cli.text
-    assert cli.json()["ok"] is True, cli.json()
+        cli = client.post("/api/openscad/test")
+        assert cli.status_code == 200, cli.text
+        assert cli.json()["ok"] is True, cli.json()
+    else:
+        # 没装 OpenSCAD 的机器（新 clone / CI）上这两条验不了：路由本身已经挨到了（200 +
+        # 带 `found` 字段的完整形状）；拿「这台机器没装引擎」当产品缺陷报，
+        # 等于逼 CI 去装一个 21MB 的二进制。装了引擎的机器照旧硬断言，覆盖没有变小。
+        openscad_note = "（本机无 OpenSCAD：只验接口 200 与字段形状，不验 found/cli_ok）"
 
     settings = client.get("/api/settings")
     assert settings.status_code == 200, settings.text
@@ -7026,6 +7073,7 @@ def t_http_api() -> str:
         f"health/version/report/diagnostics/openscad/settings/安全拦截 全部通过；"
         f"{len(set(sweep))} 条无参数 GET 逐个跑过无 5xx；"
         "未处理异常的 500 与人话同步校验（日志里确实带上了 traceback）"
+        + openscad_note
     )
 
 
@@ -8950,7 +8998,29 @@ def _internal_doc_paths() -> set[str]:
 
 
 def _repo_relpaths() -> set[str]:
-    """仓库里真的存在的文件（剪掉 build/ node_modules/ .git/ dist/ 这些不入库的）。"""
+    """仓库里**真的会被别人拿到**的文件（posix 相对路径）。
+
+    口径以 `git ls-files -z` 为准，不再看本地磁盘：上一版用 `os.walk` 数文件，
+    于是**开发机器上的生成物会让文档指针“合法”** —— 实测把镜像仓库克隆到
+    项目外跑 `--offline`，开发机全绿的「随包文档指针」在克隆体里当场变红：
+    两份文档指着 `webui/scripts/shots/contrast-report.json`，那是 gitignore 的本地产物，
+    别人 clone 后根本打不开。（用 `-z` 而不按行解：否则非 ASCII 路径会被八进制转义，
+    同一类「中文名文件静默漏扫」的坑。）
+
+    git 不可用时退回目录剪枝的遍历（宁可少判也不假报）。
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=str(ROOT), capture_output=True, timeout=120
+        )
+    except Exception:  # noqa: BLE001 - 没 git 也要能跑完自检
+        proc = None
+    if proc is not None and proc.returncode == 0 and proc.stdout:
+        names = {p.decode("utf-8", "replace") for p in proc.stdout.split(b"\0") if p}
+        return {n for n in names if not n.startswith("webui/dist/")}
+
     import os
 
     pruned = {"build", "node_modules", ".git", "__pycache__", ".pytest_cache", ".venv", "venv"}
@@ -9381,7 +9451,14 @@ def t_installer_metadata() -> str:
         assert directive in iss, f"安装器缺少 {directive}"
     # 图标文件必须真实存在，否则编译会失败
     icon = ROOT / "build" / "AI-3D-Forge.ico"
-    assert icon.is_file(), f"安装器引用的图标不存在：{icon}"
+    icon_note = ""
+    if icon.is_file():
+        assert icon.stat().st_size > 0, f"图标是空文件：{icon}"
+    else:
+        # 这个 .ico 是 `make_icon.py` 在构建时生成的（`build/` 不入库），
+        # 所以新 clone / CI 上它本来就应当不存在 —— 拿它当失败就是假红。
+        # 真正必须存的是**入库的那份**（LicenseFile），下面单独查。
+        icon_note = f"（{icon.name} 由构建生成，本仓库未构建：只核对 .iss 里的引用）"
 
     # ---- 版本单一来源 ----
     import re
@@ -9406,7 +9483,7 @@ def t_installer_metadata() -> str:
     )
     return (
         f"图标/发布者/卸载项/许可证/默认目录均已声明；版本单一来源 version.py={APP_VERSION}，"
-        f".iss 兜底为 {sentinel}"
+        f".iss 兜底为 {sentinel}{icon_note}"
     )
 
 

@@ -516,10 +516,12 @@ PyInstaller 打包 → **打包产物冒烟测试** → 生成安装包。
 - [ ] `node webui\scripts\verify-flow.mjs` 全绿（**86/86**；mock 要以 `--first-run` 新起，
       否则第一条「首次启动跳向导」就会红；默认地址是 `http://localhost:5273` —— Vite 默认
       只听 IPv6 的 `::1`，写 `127.0.0.1` 会直接死在第 1 步；覆盖实时尺寸标注、页面切换动画、
-      液态玻璃 10 条、送到切片软件、缺 WebView2 时的回退横幅 4 条、文件位置里的真实日志路径）
+      液态玻璃 10 条、送到切片软件、缺 WebView2 时的回退横幅 4 条、文件位置里的真实日志路径、
+      回收站（删→列→恢复→彻底删，含「没二次确认就删不掉」））
 - [ ] `node webui\scripts\verify-glass-contrast.mjs` 报 `CONTRAST_OK`（玻璃上的字逐像素实测，
-      四场景 × 多档位 × 浅/深；写进 `config.py` / 文档的玻璃数字必须能在这份报告里找到：
-      `webui\scripts\shots\contrast-report.json`）
+      四场景 × 多档位 × 浅/深；写进 `config.py` / 文档的玻璃数字必须能在它跑完时打印的
+      明细里逐条对上。明细只落在本地截图目录里（不入库），所以下面两份文档与代码注释
+      都**不得拿它当出处**——别人 clone 后打不开）
 - [ ] `node webui\scripts\verify-hdpi.mjs` 全绿（4K@200% / 150% / 125% 横溢 0px、
       画布后备缓冲跟随缩放）
 - [ ] `node webui\scripts\audit-interface.mjs` 全绿（按 jakubkrehel/skills 的条款实测：

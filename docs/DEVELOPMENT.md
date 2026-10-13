@@ -180,6 +180,39 @@ node webui\scripts\verify-job-survives-navigation.mjs            # 切页/刷新
 | `backend-offline` | windows | 安装依赖、导入冒烟、`selfcheck.py --offline`（跳过的项会列出来） |
 | `frontend` | ubuntu | `npm ci` + `tsc --noEmit` + `vite build` |
 
+### 推之前先在本地排演一遍 CI（实测做法）
+
+为什么单独记这一节：开发机上「全绿」只说明**这台机器**绿。实测过一次直接把三个坑留给 CI：
+文档指着不入库的本地产物（别人 clone 后指针死链）、`--offline` 里有两项其实需要 OpenSCAD、
+预算守卫的下限把「未构建」当成了失败。三个 job 都能不依赖 GitHub 先跑一遍：
+
+```powershell
+# 先拿一份干净的仓库副本（用镜像仓或导出集克隆），下面三步全部在它里面跑
+$m = "<克隆目录>"
+# 0) 一个只装了 requirements.txt 的新 venv（验证依赖声明真的完整）+ 一个裸 venv（验证 audit job 不依赖任何包）
+python -m venv "$env:TEMP\ci2\venv";  python -m venv --without-pip "$env:TEMP\ci1\venv"
+& "$env:TEMP\ci2\venv\Scripts\python.exe" -m pip install -r "$m\requirements.txt"
+
+# 1) audit job（不装任何依赖的那个解释器）
+& "$env:TEMP\ci1\venv\Scripts\python.exe" "$m\scripts\check_oss_files.py"
+& "$env:TEMP\ci1\venv\Scripts\python.exe" "$m\scripts\check_no_secrets.py" --history
+& "$env:TEMP\ci1\venv\Scripts\python.exe" -m compileall -q "$m\src" "$m\scripts" "$m\main.py"
+& "$env:TEMP\ci1\venv\Scripts\python.exe" "$m\scripts\check_no_secrets.py" --paths-only
+
+# 2) backend-offline job（先清掉本机 AIFORGE_* 变量，否则测的是开发机目录）
+$env:AIFORGE_DATA_DIR = $null; $env:AIFORGE_LOCAL_DIR = $null; $env:AIFORGE_PROJECTS_DIR = $null
+Push-Location $m; & "$env:TEMP\ci2\venv\Scripts\python.exe" scripts\selfcheck.py --offline; Pop-Location
+
+# 3) frontend job：不拆掉现有 node_modules 也能验出 lock 与 package.json 是否同步
+Push-Location "$m\webui"; npm ci --dry-run; Pop-Location
+```
+
+预期与口径：第 2 步**失败项为 0**，跳过项比开发机多一条（需要真编译的那条会自己报原因）；
+跳过的条数不写进文档，以免与开发机读数混淆。第 3 步只算「lock 同步」证据；
+ubuntu 平台二进制能否装到，看 `webui/package-lock.json` 里有没有
+`@rollup/rollup-linux-x64-gnu` 与 `@esbuild/linux-x64`（两者都带 `os: ["linux"], cpu: ["x64"]`）——
+这是静态核对，**不能当成「在 ubuntu 上真装成功」的结论**，后者只能等首跑。
+
 CI **不使用真实 DeepSeek API**（避免产生费用），也**不跑**端到端验收与安装包验收 ——
 那两项需要 OpenSCAD、真实 Key 和一台可安装软件的 Windows，请在本地按 §四 跑。
 

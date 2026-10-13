@@ -7255,7 +7255,19 @@ def t_llm_offline() -> str:
     assert fenced["score"] == 50 and fenced["verdict"] == "fail", fenced
 
     broken = llm.parse_review_json("这不是 JSON")
-    assert broken["score"] == 70 and broken["verdict"] == "warn", broken
+    # 以前这里断言 `broken["score"] == 70 and broken["verdict"] == "warn"` —— 把「模型没给出
+    # 可用结果」与「模型真给出了一个中性评分」当成同一件事，而这个假 70 分会直接
+    # 渲染成用户看到的「打印评分」——本轮修的就是这个（跟 parse_snapshot_verdict 的三态修复同形状）。
+    # 现在「解析不了」必须是 None，不能拿中性值充数。
+    assert broken is None, broken
+    # 分数不是数字 / 缺 score 字段：同样不能退回默认 70
+    assert llm.parse_review_json('{"score": "挺高的", "verdict": "warn"}') is None
+    assert llm.parse_review_json('{"verdict": "pass"}') is None, "缺 score 字段也不能拿默认分充数"
+    # 反例：合法但档位单词写错时，仍按模型自己给的分数反推档位（这不是编造，分数是真实的）
+    derived = llm.parse_review_json('{"score": 92}')
+    assert derived is not None and derived["verdict"] == "pass", derived
+    derived2 = llm.parse_review_json('{"score": 30, "verdict": "完美无缺"}')
+    assert derived2 is not None and derived2["verdict"] == "fail", derived2
 
     sysmsg = llm.design_system_prompt()
     assert "@param" in sysmsg and "禁止" in sysmsg or "严禁" in sysmsg

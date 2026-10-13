@@ -670,8 +670,17 @@ def repair_user_prompt(scad: str, problem: str) -> str:
 # --------------------------------------------------------------------------
 # 响应解析
 # --------------------------------------------------------------------------
-def parse_review_json(text: str) -> dict[str, object]:
-    """从 AI 回复里稳健地取出打印性检查 JSON；失败则给出温和的兜底结论。"""
+def parse_review_json(text: str) -> dict[str, object] | None:
+    """从 AI 回复里稳健地取出打印性检查 JSON；**解析不了就返回 `None`，绝不编一个看起来像结论的东西**。
+
+    为什么以前那种「温和兑底」是错的（本轮修的真缺陷）：回复不是合法 JSON 时，旧实现
+    固定返回 `score=70 / verdict="warn"`，界面就会把这当成 AI 真的给出了 70 分、
+    可以打印但有注意事项——而这串数字与文字根本不是模型说的，是程序替它说的。同类的坑
+    本文件已经修过两次：外观复核把「没结论」当成「没问题」（`parse_snapshot_verdict`
+    的三态修复），还有诊断页把没配置的提供商写死成 DeepSeek——都是「判据说不出真实答案时，
+    拿一个中性值充数」。现在把它改成与 `parse_snapshot_verdict` 同一形状：`None` = 没有结论，
+    调用方必须分开处理「没结论」与「有结论」（不能拿它当成 pass/warn/fail 中的一档）。
+    """
     raw = (text or "").strip()
     fenced = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
     if fenced:
@@ -684,22 +693,11 @@ def parse_review_json(text: str) -> dict[str, object]:
     try:
         data = json.loads(raw)
     except (ValueError, TypeError):
-        log.warning("打印性检查返回的不是合法 JSON，使用兜底结论")
-        return {
-            "score": 70,
-            "verdict": "warn",
-            "summary": "AI 未能给出结构化结论，请参考下方的测量数据自行判断。",
-            "issues": [
-                {
-                    "severity": "info",
-                    "title": "AI 回复格式异常",
-                    "detail": "AI 的检查结论不是预期的结构，已按中性处理。",
-                    "suggestion": "可以点击「重新生成」再试一次。",
-                }
-            ],
-        }
+        log.warning("打印性检查返回的不是合法 JSON，判定为「没有结论」")
+        return None
     if not isinstance(data, dict):
-        data = {}
+        log.warning("打印性检查返回的不是 JSON 对象（得到 %s），判定为「没有结论」", type(data).__name__)
+        return None
 
     issues_raw = data.get("issues")
     issues: list[dict[str, str]] = []
@@ -719,14 +717,22 @@ def parse_review_json(text: str) -> dict[str, object]:
                 }
             )
 
+    # 分数必须是模型真的给出的数字；拿不到就不能拿 70 充数（同上理由）。
+    raw_score = data.get("score")
+    if raw_score is None:
+        log.warning("打印性检查的 JSON 里没有 score 字段，判定为「没有结论」")
+        return None
     try:
-        score = int(float(data.get("score", 70)))
+        score = int(float(raw_score))
     except (TypeError, ValueError):
-        score = 70
+        log.warning("打印性检查的 score 不是数字（%r），判定为「没有结论」", raw_score)
+        return None
     score = max(0, min(100, score))
 
     verdict = str(data.get("verdict", "")).lower()
     if verdict not in ("pass", "warn", "fail"):
+        # 这不是编造：分数是模型自己给的，只是没把档位写成单词；按分数反推档位
+        # 与「模型根本没给分」不同，不构成替模型说话。
         verdict = "pass" if score >= 80 else ("warn" if score >= 60 else "fail")
 
     return {
@@ -1339,7 +1345,7 @@ class DeepSeekClient:
         metrics_summary: str,
         user_requirement: str | None = None,
         printer_block: str | None = None,
-    ) -> dict[str, object]:
+    ) -> dict[str, object] | None:
         result = await self.chat(
             [
                 {"role": "system", "content": REVIEW_SYSTEM_PROMPT},

@@ -2125,39 +2125,52 @@ class GenerationRunner:
             try:
                 client = self._client_economy()
                 summary = summarize_for_ai(metrics, project.name, limits)
-                printability = await client.review_printability(
+                review = await client.review_printability(
                     final_source, summary, requirement, self.printer_block
-                ) or {}
-                if visual_review:
-                    printability["visual_review"] = visual_review
-                metrics_note = "；".join(metrics.issues) if metrics.issues else "程序测量未发现明显几何问题。"
-                printability["metrics_note"] = metrics_note
-                printability["printer"] = self.printer_context()
-                # 判定诚实化：实测硬失败 / 外观复核报的问题 / 修复残留，都必须拖低 verdict 与 score。
-                # 不加这一步的后果（实测）：夹口完全没切出来，AI 仍给 pass/85 分，
-                # 而唯一看出问题的外观复核只被当成一段附注文字，用户根本看不到。
-                honesty = _downgrade_printability(
-                    printability,
-                    requirement_suite,
-                    visual_review,
-                    self._integrity_remaining,
                 )
-                if honesty:
-                    log.info("打印性判定已按实测证据降级：%s", honesty)
-                verdict_key = str(printability.get("verdict"))
-                verdict_text = {
-                    "pass": "可以打印",
-                    "warn": "可以打印，但有注意事项",
-                    # 不要弱化：判 fail 时模型往往是**非封闭/严重超差**，
-                    # 实测用 kind="success" 播报「存在打印风险」，
-                    # 界面上看起来就是一条成功提示，用户很容易照打。
-                    "fail": "存在必须修复的问题，现在这版不建议直接打印",
-                }.get(verdict_key, "检查完成")
-                job.say(
-                    f"打印性检查：{verdict_text}。",
-                    detail=str(printability.get("summary") or ""),
-                    kind="success" if verdict_key == "pass" else ("error" if verdict_key == "fail" else "warn"),
-                )
+                if review is None:
+                    # 以前这里写的是 `or {}`：拿到 None 就用空字典接着往下跑，而下游
+                    # `_downgrade_printability` 与 `verdict_key = str(printability.get("verdict"))`
+                    # 对「没有这一栏」都会默默拿默认值（以前甚至是 70/warn）继续往下走，
+                    # 于是「AI 回复格式不对」与「AI 检查过了，没发现问题」在界面上看不出区别。
+                    # `parse_review_json` 现在把这两种情况分开了，调用方必须自己接住「None」。
+                    job.say(
+                        "打印性检查未完成（AI 回复不是预期结构），但模型已生成成功。",
+                        detail="可以点击「重新生成」再试一次；程序自己量的几何数据仍然可靠，不受影响。",
+                        kind="warn",
+                    )
+                else:
+                    printability = review
+                    if visual_review:
+                        printability["visual_review"] = visual_review
+                    metrics_note = "；".join(metrics.issues) if metrics.issues else "程序测量未发现明显几何问题。"
+                    printability["metrics_note"] = metrics_note
+                    printability["printer"] = self.printer_context()
+                    # 判定诚实化：实测硬失败 / 外观复核报的问题 / 修复残留，都必须拖低 verdict 与 score。
+                    # 不加这一步的后果（实测）：夹口完全没切出来，AI 仍给 pass/85 分，
+                    # 而唯一看出问题的外观复核只被当成一段附注文字，用户根本看不到。
+                    honesty = _downgrade_printability(
+                        printability,
+                        requirement_suite,
+                        visual_review,
+                        self._integrity_remaining,
+                    )
+                    if honesty:
+                        log.info("打印性判定已按实测证据降级：%s", honesty)
+                    verdict_key = str(printability.get("verdict"))
+                    verdict_text = {
+                        "pass": "可以打印",
+                        "warn": "可以打印，但有注意事项",
+                        # 不要弱化：判 fail 时模型往往是**非封闭/严重超差**，
+                        # 实测用 kind="success" 播报「存在打印风险」，
+                        # 界面上看起来就是一条成功提示，用户很容易照打。
+                        "fail": "存在必须修复的问题，现在这版不建议直接打印",
+                    }.get(verdict_key, "检查完成")
+                    job.say(
+                        f"打印性检查：{verdict_text}。",
+                        detail=str(printability.get("summary") or ""),
+                        kind="success" if verdict_key == "pass" else ("error" if verdict_key == "fail" else "warn"),
+                    )
             except LlmError as exc:
                 job.say("打印性检查未完成，但模型已生成成功。", detail=exc.message, kind="warn")
         else:
@@ -3315,7 +3328,10 @@ def _downgrade_printability(
     try:
         score = int(printability.get("score"))
     except (TypeError, ValueError):
-        score = 70
+        # 以前拿 70 当默认分数——`parse_review_json` 已经改过一轮：拿不到真实分数就不该拿
+        # 一个中性值充数（同一个道理用在这）。这里变成 None：下面每个降级分支遇到 None
+        # 直接把分数钉在该档的天花板上，而不是假装 AI 给了个 70 再去 min。
+        score = None
     verdict = str(printability.get("verdict") or "pass")
     notes: list[str] = []
 
@@ -3336,7 +3352,7 @@ def _downgrade_printability(
             },
         )
         verdict = "fail"
-        score = min(score, 49)
+        score = 49 if score is None else min(score, 49)
         notes.append(f"{len(hard)} 项实测硬失败已计入判定")
     elif leftovers:
         issues.insert(
@@ -3350,7 +3366,7 @@ def _downgrade_printability(
         )
         if _VERDICT_ORDER.get(verdict, 0) < 1:
             verdict = "warn"
-        score = min(score, 79)
+        score = 79 if score is None else min(score, 79)
         notes.append("残留问题已计入判定")
 
     if visual_bad:
@@ -3368,7 +3384,7 @@ def _downgrade_printability(
         )
         if _VERDICT_ORDER.get(verdict, 0) < 1:
             verdict = "warn"
-        score = min(score, 79)
+        score = 79 if score is None else min(score, 79)
         notes.append("外观复核报告的问题已计入判定")
 
     printability["issues"] = issues[:12]

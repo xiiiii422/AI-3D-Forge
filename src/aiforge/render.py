@@ -108,6 +108,22 @@ VIEWS: tuple[tuple[str, float, float], ...] = (
 )
 
 
+def _frame_all(points: list[tuple[float, float, float]]) -> tuple[tuple[float, float, float], float]:
+    """用**整个模型**算中心与最长边，不是用抽样后的子集。
+
+    为什么必须这样：面数超线时下面只拿抽样出来的三角面画图，
+    如果包围盒也按这批点算，**最端点没被抽到就会把中心算偏、把最长边算小**，
+    于是 `scale` 偏大，模型超出画布被当场裁掉一块 —— 复核图是给 AI 看「有没有穿腔、
+    有没有缺件」的，自己先缺一个角就是谎报（轻则误判，重则把正确的模型说成没做对）。
+    """
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    zs = [p[2] for p in points]
+    center = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, (min(zs) + max(zs)) / 2)
+    span = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs), 1e-6)
+    return center, span
+
+
 def render_views(
     stl_path: Path,
     out_dir: Path,
@@ -135,12 +151,8 @@ def render_views(
         base = face * 3
         triples.append((points[base], points[base + 1], points[base + 2]))
 
-    # 以整体包围盒的中心为原点，按最长边归一化，保证任何尺寸的模型都填满画面
-    xs = [p[0] for t in triples for p in t]
-    ys = [p[1] for t in triples for p in t]
-    zs = [p[2] for t in triples for p in t]
-    center = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, (min(zs) + max(zs)) / 2)
-    span = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs), 1e-6)
+    # 中心与缩放按**全量顶点**算（不是按抽样出来的这批），否则大模型会被裁掉一角
+    center, span = _frame_all(points)
     scale = (size * 0.82) / span
 
     out_dir.mkdir(parents=True, exist_ok=True)

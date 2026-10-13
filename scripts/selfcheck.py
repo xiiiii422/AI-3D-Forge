@@ -6110,6 +6110,28 @@ def t_visual_review() -> str:
         "同样的模型两次渲染结果不一致，渲染过程引入了随机性"
     )
 
+    # 抽样渲染时的取景必须按**全量顶点**算（本轮实测的坑）：
+    # 原来中心与最长边是从 `triples`（抽样后拿去画的那批）里来的，
+    # 最端的点没被抽到时就把最长边算小、scale 算大，模型超出画布被裁掉一角 ——
+    # 而这张图是给 AI 判「有没有缺件」用的，自己先缺就是谎报。
+    far = [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 10.0, 0.0), (0.0, 10.0, 10.0),
+           (200.0, 200.0, 200.0)]
+    c_all, span_all = render._frame_all(far)  # noqa: SLF001 - 验的就是这个取值口径
+    subset = far[:4]  # 模拟「最远那个点没被抽到」
+    c_sub, span_sub = render._frame_all(subset)  # noqa: SLF001
+    assert span_all > span_sub * 1.5, f"抽样前后的最长边没差别（{span_all} / {span_sub}），用例是空跑"
+    assert c_all != c_sub, "抽样前后的中心没差别，这个夹具验不出错位"
+    flat = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
+    _, span_flat = render._frame_all(flat)  # noqa: SLF001
+    assert span_flat > 0, "退化的零尺寸模型会把 scale 算成除零"
+    # 上面的夹具只证明「取值口径区分得开」，还不能证明画图时真的用了它 ——
+    # 这一条盯调用点：只能拿全量 points 算框，不准退回用抽样集算。
+    src_views = inspect.getsource(render.render_views)
+    assert "_frame_all(points)" in src_views, "render_views 不再用全量顶点算框（大模型会被裁角）"
+    assert "for t in triples for p in t" not in src_views, (
+        "又回到用抽样出来的 triples 算包围盒：最端点被抽掉时整张复核图会裁掉一角"
+    )
+
     # 判读方向：只有明确说「有问题」才算有问题。
     # 把「没结论」当成「没问题」会静默放过缺陷，这是最危险的失败方向。
     assert llm.parse_snapshot_verdict("结论：有问题\n桶口有两个多余凸起") is True

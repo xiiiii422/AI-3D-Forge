@@ -133,9 +133,18 @@ git commit --amend --reset-author --no-edit
 # 4) 确认没有把生成物带进来
 git status --porcelain -uall | Select-String "build/|node_modules|dist/|Output/|shots/"
 
-# 5) 在**项目之外**克隆一份，跑它自己的自检（"别人 clone 下来能用"最直接的验证）
+# 5) 在**项目之外**克隆一份，跑它自己的离线自检
+#    这是唯一能拆穿「只在我的机器上绿」的一条：GitHub 的 CI 跑的就是 `--offline`，
+#    而克隆体里没有 OpenSCAD、没有 build/venv、没有任何构建产物。
+#    一定要先清掉本机的 AIFORGE_* 变量，否则测的还是开发机那套目录。
+$env:AIFORGE_DATA_DIR = $null; $env:AIFORGE_LOCAL_DIR = $null; $env:AIFORGE_PROJECTS_DIR = $null
 git clone <你的仓库> <克隆目录>
-& build\venv\Scripts\python.exe <克隆目录>\scripts\selfcheck.py
+git -C <克隆目录> log --oneline -1          # 确认克隆到的就是你要推的那个提交
+Push-Location <克隆目录>
+& <开发树>\build\venv\Scripts\python.exe scripts\selfcheck.py --offline
+Pop-Location
+#    预期：失败项 0；跳过项比开发机多一条（需要真编译的那条会自己打印原因）。
+#    具体条数不写死在这里，也不要拿它去对文档里的开发机读数。
 ```
 
 第 3 条是关键：**只看当前文件是不够的** —— 密钥可能是"提交过又删掉"，

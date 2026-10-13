@@ -635,10 +635,16 @@ class GenerationRunner:
             # 空回复必须如实说成「没有结论」。当成「没问题」会静默放过缺陷。
             job.say("图片复核没有给出结论（已跳过，不影响模型本身）。", kind="warn")
             return ""
-        if llm_mod.parse_snapshot_verdict(text):
+        verdict = llm_mod.parse_snapshot_verdict(text)
+        if verdict == llm_mod.VERDICT_PROBLEM:
             job.say("AI 看过外观后提出了问题。", detail=text[:400], kind="warn")
-        else:
+        elif verdict == llm_mod.VERDICT_CLEAR:
             job.say("AI 看过外观，未发现明显问题。", detail=text[:400], kind="success")
+        else:
+            # 回复非空，但既不守首行契约也不含强问题标记（实测 glm-4v-flash 会这样只
+            # 复述指标、或说一句含「不确定」的话）—— 以前这会被当成 else 分支，播成
+            # success「未发现明显问题」，而它其实只是「没给出可判定的结论」。
+            job.say("图片复核的回答无法判定（已跳过，不影响模型本身）。", detail=text[:400], kind="warn")
         return text
 
     def _dim_deviation(
@@ -2917,7 +2923,9 @@ def _geometry_integrity_problems(
         )
     # 视觉复核：程序量不出来的那一类。只有模型**明确说有问题**才并进来，
     # 空回复/说不确定都不算 —— 否则会拿一段含糊的话去驱动修改。
-    if visual and llm_mod.parse_snapshot_verdict(visual):
+    # 不能直接拿 `parse_snapshot_verdict` 的结果做真值判断：三态返回值都是非空字符串，
+    # 都算真 —— 必须显式比 `VERDICT_PROBLEM`。
+    if visual and llm_mod.parse_snapshot_verdict(visual) == llm_mod.VERDICT_PROBLEM:
         body = "\n".join(
             line for line in visual.strip().splitlines()[1:] if line.strip()
         ) or visual.strip()
@@ -3294,7 +3302,9 @@ def _downgrade_printability(
     if not isinstance(printability, dict):
         return None
     hard = _hard_failures(suite)
-    visual_bad = bool(visual_review and llm_mod.parse_snapshot_verdict(visual_review))
+    visual_bad = bool(
+        visual_review and llm_mod.parse_snapshot_verdict(visual_review) == llm_mod.VERDICT_PROBLEM
+    )
     leftovers = [str(p) for p in (remaining or []) if str(p).strip()]
     if not hard and not visual_bad and not leftovers:
         return None

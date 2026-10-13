@@ -592,23 +592,37 @@ SNAPSHOT_PROBLEM_MARKERS = (
     "没有螺纹", "不封闭", "飘在", "缺失了",
 )
 
+# `parse_snapshot_verdict` 的三态返回值。
+# 为什么不能用 bool：注释一直要求「空回复、格式跑偏、说不确定都算『没有结论』」，
+# 但 bool 只有两面 —— 这个「没有结论」要么被压成 False（跟真正的「明确没问题」共用一个值，
+# 调用方无从区分，只能把它当没问题播出去，于是含糊/跑偏的回复会被说成「未发现明显问题」），
+# 要么被压成 True（把没结论当有问题，白花一次修复调用）。历史注释自己写过这两句，
+# 但没有第三个值可返，那个承诺就只能停在注释里 —— 现在补上第三个状态。
+VERDICT_PROBLEM = "problem"
+VERDICT_CLEAR = "clear"
+VERDICT_UNKNOWN = "unknown"
 
-def parse_snapshot_verdict(text: str) -> bool:
-    """图片复核是否明确报告了问题。
 
-    注意判据方向：**只有明确说「有问题」才返回 True**。
-    空回复、格式跑偏、说不确定，全部算「没有结论」——
+def parse_snapshot_verdict(text: str) -> str:
+    """图片复核的判定：`VERDICT_PROBLEM` / `VERDICT_CLEAR` / `VERDICT_UNKNOWN`。
+
+    注意判据方向：**只有明确写了「有问题」才返回 `VERDICT_PROBLEM`**。
+    空回复、格式跑偏、说不确定一律返回 `VERDICT_UNKNOWN` ——
     因为把「没结论」当成「没问题」会静默放过缺陷，代价远大于多问一次。
+    调用方必须自己区分 `VERDICT_UNKNOWN` 与 `VERDICT_CLEAR`（不能靠 `if ...:` 的
+    非空字符串真值，三个返回值都是非空串，都算真）；三处调用点都显式比常量。
     """
     head = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
     head = head.replace(" ", "").replace("**", "")
     if SNAPSHOT_VERDICT_CLEAR.replace(" ", "") in head:
-        return False
+        return VERDICT_CLEAR
     if SNAPSHOT_VERDICT_FLAG.replace(" ", "") in head:
-        return True
+        return VERDICT_PROBLEM
     # 首行没有结论（模型不守契约）→ 退而求其次：全文找强问题标记。
     # 方向仍然保守：找不到就还是「无结论」，绝不把客套话当「没问题」。
-    return any(marker in (text or "") for marker in SNAPSHOT_PROBLEM_MARKERS)
+    if any(marker in (text or "") for marker in SNAPSHOT_PROBLEM_MARKERS):
+        return VERDICT_PROBLEM
+    return VERDICT_UNKNOWN
 
 
 def snapshot_review_user_prompt(requirement: str, metrics_summary: str = "") -> str:
@@ -1262,8 +1276,14 @@ class DeepSeekClient:
                     code="API_UNREACHABLE",
                 ) from exc
             if response.status_code >= 400:
-                if self._try_fallback(response.status_code, payload):
-                    continue
+                # 不能在这里调 `_try_fallback`：那个方法处理的是「文本模型过载/不可用」的降级，
+                # 会把 `payload["model"]` 改成 `self.fallback_model`（一个**文本**模型）。
+                # 而这里的 `payload["model"]` 是 `vision_model_for()` 选出来的**视觉**模型，
+                # 跟 `self.model` 根本不是一回事。实测（修复前）：智谱用户高峰遇到 429 时，
+                # 这条路径会把 `glm-4v-flash` 换成 `glm-4-flash` 重发 —— 那个模型收不到图，
+                # 会回一句「我无法查看你上传的图片」（非空正文），于是被当成一次真实的
+                # 复核结果传下去，而它一个字也没看。这正是上面「接口事实」注释里禁止的事，
+                # 被一个本来只服务文本调用的工具函数从旁边绕开了。
                 raise _friendly_http_error(response.status_code, response.text, self.base_url)
             try:
                 data = response.json()

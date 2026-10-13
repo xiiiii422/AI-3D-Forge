@@ -277,7 +277,8 @@ async def run_case(client: llm.DeepSeekClient, case: dict, index: int) -> dict:
         visual = await client.review_snapshot(
             [s.path.read_bytes() for s in shots], prompt, mesh.summarize_for_ai(metrics, "model.stl")
         )
-        flag = "有问题" if llm.parse_snapshot_verdict(visual) else "无明显问题"
+        verdict = llm.parse_snapshot_verdict(visual)
+        flag = {llm.VERDICT_PROBLEM: "有问题", llm.VERDICT_CLEAR: "无明显问题"}.get(verdict, "无结论")
         print(f"   外观复核（{flag}）：{visual.replace(chr(10), ' ')[:180]}")
     except Exception as exc:  # noqa: BLE001 - 复核失败不该让用例失败
         print(f"   外观复核跳过：{type(exc).__name__}: {exc}")

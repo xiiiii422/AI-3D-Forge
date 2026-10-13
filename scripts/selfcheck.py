@@ -3030,12 +3030,14 @@ def t_glm_provider() -> str:
     # glm 读超时放大（思考模型首字慢），DeepSeek 保持原值
     assert g.timeout.read > d.timeout.read
     # 视觉复核二级判据：不守首行契约但描述了强问题 → 算报告；纯复述指标 → 无结论
-    assert llm_mod.parse_snapshot_verdict("模型整体不错\n但有一根筋悬空在腔体里") is True
+    # （不是「没问题」！这两以前都返回 False，调用方区分不出来；现在必须返回不同常量）
+    assert llm_mod.parse_snapshot_verdict("模型整体不错\n但有一根筋悬空在腔体里") == llm_mod.VERDICT_PROBLEM
     assert llm_mod.parse_snapshot_verdict(
         "好的，包围盒 81.7 x 81.7 x 9.0 mm，水密单一实体，可用于 3D 打印。"
-    ) is False
-    assert llm_mod.parse_snapshot_verdict("结论：无明显问题") is False
-    assert llm_mod.parse_snapshot_verdict("结论：有问题\n底座悬空") is True
+    ) == llm_mod.VERDICT_UNKNOWN, "纯复述指标必须是「无结论」，不能等同于「明确没问题」"
+    assert llm_mod.parse_snapshot_verdict("结论：无明显问题") == llm_mod.VERDICT_CLEAR
+    assert llm_mod.parse_snapshot_verdict("结论：有问题\n底座悬空") == llm_mod.VERDICT_PROBLEM
+    assert llm_mod.VERDICT_UNKNOWN != llm_mod.VERDICT_CLEAR, "三态必须互不相同，否则又退回 bool"
     # 同提供商降级：仅 429/5xx 且未降级过时切换，并改写 payload；其余不切
     fb = llm_mod.DeepSeekClient("k", glm_url, "glm-4.7-flash", fallback_model="glm-4-flash")
     payload = {"model": fb.model}
@@ -6167,11 +6169,21 @@ def t_visual_review() -> str:
 
     # 判读方向：只有明确说「有问题」才算有问题。
     # 把「没结论」当成「没问题」会静默放过缺陷，这是最危险的失败方向。
-    assert llm.parse_snapshot_verdict("结论：有问题\n桶口有两个多余凸起") is True
-    assert llm.parse_snapshot_verdict("结论：无明显问题") is False
-    assert llm.parse_snapshot_verdict("结论：**有问题**") is True
-    assert llm.parse_snapshot_verdict("") is False, "空回复必须算「没有结论」"
-    assert llm.parse_snapshot_verdict("我看不太清楚，可能有吧") is False, "含糊的答复不算数"
+    # 三态之前被压成 bool 的坑：「没结论」和「真的没问题」共用一个 False，
+    # 调用方（jobs._review_snapshot）只能把它们一起播成 success。
+    assert llm.parse_snapshot_verdict("结论：有问题\n桶口有两个多余凸起") == llm.VERDICT_PROBLEM
+    assert llm.parse_snapshot_verdict("结论：无明显问题") == llm.VERDICT_CLEAR
+    assert llm.parse_snapshot_verdict("结论：**有问题**") == llm.VERDICT_PROBLEM
+    assert llm.parse_snapshot_verdict("") == llm.VERDICT_UNKNOWN, "空回复必须算「没有结论」"
+    assert llm.parse_snapshot_verdict("我看不太清楚，可能有吧") == llm.VERDICT_UNKNOWN, "含糊的答复不算数"
+    assert llm.parse_snapshot_verdict("好的，包围盒正常，水密，可用于 3D 打印。") == llm.VERDICT_UNKNOWN, (
+        "只复述指标不给结论也不算「没问题」——必须能被调用方区分于真的「无明显问题」"
+    )
+    # 上面几条都是拿常量本身去比函数返回值，即使常量被意外改回同一个值也自洽，
+    # 抓不到「三态被重新坍缩成两态」（就是本次要修的坑本身）。这一条直接比常量本身。
+    assert len({llm.VERDICT_PROBLEM, llm.VERDICT_CLEAR, llm.VERDICT_UNKNOWN}) == 3, (
+        "VERDICT_PROBLEM/CLEAR/UNKNOWN 必须互不相同；一旦有两态合并，就退回了修好之前的 bool 老坑"
+    )
 
     # 视觉结论只有「明确有问题」时才并进修复证据
     from aiforge import jobs, mesh
@@ -6194,6 +6206,25 @@ def t_visual_review() -> str:
     review_body = inspect.getsource(llm.DeepSeekClient.review_snapshot)
     assert '"length"' in review_body, "必须识别「额度用尽导致的空正文」，不能当成没问题"
     assert "VISION_MAX_TOKENS_RETRY" in review_body, "额度用尽后必须放大额度重试一次"
+    # 本轮新查出的缺陷：`_try_fallback` 是「文本模型过载时降级」的工具函数，会改写
+    # `payload["model"]`。以前 `review_snapshot` 在 >=400 时也调了它 —— 于是视觉请求
+    # 的模型被换成一个**不会看图**的文本模型重发，那个模型会回一句「我无法查看图片」
+    # 这种**非空**正文，看起来像复核成功、其实一个字也没看。上面「接口事实」那两条
+    # 注释禁止的就是这件事，不能从降级工具函数那条路绕回去。
+    # 不能用 `"_try_fallback" not in review_body` 这种裸字符串包含判断：下面修复后写的
+    # 解释注释本身就提到了这个词，会被误判成「还在调用」（这个坑在本文件其他地方已经
+    # 踩过一次，当时也是用 AST 而不是正则解决，见下方对 `_review_snapshot` 的处理）。
+    import ast as _ast_try
+
+    review_tree = _ast_try.parse(inspect.cleandoc(inspect.getsource(llm.DeepSeekClient.review_snapshot)))
+    called_names = {
+        n.func.attr
+        for n in _ast_try.walk(review_tree)
+        if isinstance(n, _ast_try.Call) and isinstance(n.func, _ast_try.Attribute)
+    }
+    assert "_try_fallback" not in called_names, (
+        "视觉复核不能走 `_try_fallback`：它会把会看图的模型换成不会看图的文本模型"
+    )
     # 本轮清查出的真缺陷：那份系统提示词写好了却从没发出去过，而用户提示里还写着
     # 「请按系统提示复核」—— parse_snapshot_verdict 的第一行契约判定因此始终落空，
     # 只能退到全文关键词兜底（看起来能跑，实际把最可靠的一层判据去掉了）。

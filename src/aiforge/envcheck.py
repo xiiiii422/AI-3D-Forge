@@ -292,6 +292,43 @@ def check_openscad_version() -> CheckItem:
     )
 
 
+# 诊断页里的「AI 服务」不能写死成某一家：本项目支持 DeepSeek 与智谱 GLM（混合模式下两者同时用）。
+# 硬编码过一次的实际后果：只配了智谱免费档的用户，在系统诊断里看到的是
+# 「尚未配置 DeepSeek API Key」+「去 platform.deepseek.com 创建」——指引方向就是错的；
+# 而「网络连接」那一项探的是 api.deepseek.com，**用户真正依赖的那个地址一次也没测过**。
+# 提供商 → (给用户看的名字, 可达性探测地址, 注册地址)
+AI_PROVIDERS: dict[str, tuple[str, str, str]] = {
+    "deepseek": ("DeepSeek", "https://api.deepseek.com", "platform.deepseek.com"),
+    "glm": ("智谱 GLM", "https://open.bigmodel.cn", "open.bigmodel.cn"),
+}
+AI_PROVIDER_FALLBACK = ("AI 服务", "", "你所配置的服务商官网")
+
+
+def ai_provider_info(base_url: str | None = None) -> tuple[str, str, str]:
+    """按 base_url 给出（显示名, 探测地址, 注册地址）；认不出的自定义地址用兜底。"""
+    from .config import provider_of_base
+
+    provider = provider_of_base(base_url if base_url is not None else store().config.api.base_url)
+    name, probe, signup = AI_PROVIDERS.get(provider, AI_PROVIDER_FALLBACK)
+    if not probe:
+        # 自定义 OpenAI 兼容地址：拿它自己当探测目标，否则这一项会探一个无关站点
+        probe = (base_url or "").strip()
+    return name, probe, signup
+
+
+def ai_network_targets() -> dict[str, str]:
+    """「网络连接」那一项要探的 AI 地址：主提供商 + 经济档（与主提供商不同才加）。"""
+    api = store().config.api
+    name, probe, _ = ai_provider_info(api.base_url)
+    targets = {f"{name} AI 服务": probe} if probe else {}
+    econ_url = (api.economy_base_url or "").strip()
+    # 混合模式的两个提供商可以不同域名：只探主提供商就会漏掉「生成能用、复核一直失败」那种困局
+    if econ_url and econ_url.rstrip("/") != (api.base_url or "").rstrip("/"):
+        econ_name, econ_probe, _ = ai_provider_info(econ_url)
+        targets[f"经济档（{econ_name}）"] = econ_probe or econ_url
+    return targets
+
+
 def check_webview2() -> CheckItem:
     """WebView2 运行时 + 原生窗口链路是否可用。
 
@@ -482,13 +519,15 @@ def check_temp() -> CheckItem:
 
 
 async def check_network(timeout: float = 6.0) -> CheckItem:
-    """分别测试 DeepSeek 与 OpenSCAD 官方源的可达性。"""
+    """分别测试「用户真的依赖的那些地址」与 OpenSCAD 官方源的可达性。
+
+    AI 那部分由 `ai_network_targets()` 按配置算出来（主提供商 + 混合模式下的经济档），
+    而不是写死 DeepSeek —— 写死会同时造成两种错：GLM 用户的真实依赖没被测过，
+    却可能因为 api.deepseek.com 可达而被报成「网络正常」。
+    """
     import httpx
 
-    targets = {
-        "DeepSeek AI 服务": "https://api.deepseek.com",
-        "OpenSCAD 官方下载源": "https://files.openscad.org",
-    }
+    targets = {**ai_network_targets(), "OpenSCAD 官方下载源": "https://files.openscad.org"}
     results: dict[str, bool | str] = {}
     details: list[str] = []
 
@@ -518,7 +557,8 @@ async def check_network(timeout: float = 6.0) -> CheckItem:
             title="网络连接",
             status="fail",
             detail="当前无法访问网络。" + "；".join(details),
-            action="请检查网络连接；如果在公司网络或使用了代理，请确认允许访问 api.deepseek.com。",
+            action="请检查网络连接；如果在公司网络或使用了代理，请放行："
+            + "、".join(sorted(set(targets.values()))),
             fixable=False,
             meta={"results": results},
         )
@@ -542,20 +582,21 @@ def check_api() -> CheckItem:
         "config_file": "本机配置文件",
         "env": "环境变量",
     }.get(backend, backend)
+    provider_name, _, signup_host = ai_provider_info(cfg.config.api.base_url)
 
     if not key:
         return CheckItem(
             id="api",
-            title="DeepSeek API",
+            title=f"{provider_name} API",
             status="warn",
-            detail="尚未配置 DeepSeek API Key，AI 设计功能暂不可用。",
-            action="填入 API Key 即可开始设计（可在 platform.deepseek.com 免费创建）。",
+            detail=f"尚未配置 {provider_name} 的 API Key，AI 设计功能暂不可用。",
+            action=f"填入 API Key 即可开始设计（可在 {signup_host} 申请）。",
             fixable=False,
             meta={"configured": False, "base_url": cfg.config.api.base_url, "model": cfg.config.api.model},
         )
     return CheckItem(
         id="api",
-        title="DeepSeek API",
+        title=f"{provider_name} API",
         status="ok",
         detail=f"已配置（{cfg.mask_key(key)}，保存在{backend_label}）。",
         meta={

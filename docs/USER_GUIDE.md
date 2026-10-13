@@ -152,6 +152,10 @@
 
 AI 设计功能需要 DeepSeek 的 API Key（这是按用量计费的，费用很低）。
 
+> 上面是按默认的 DeepSeek 写的。想改用免费的智谱 GLM 也可以（设置 → AI 服务 → 使用模式 /
+> 服务地址）；换过之后，系统诊断里那一项会显示你**实际配的那家**（如「智谱 GLM API」），
+> 指引里的网址也跟着变，不会一直让你去 DeepSeek。
+
 1. 打开 [platform.deepseek.com](https://platform.deepseek.com/api_keys) 注册并创建一个 API Key
 2. 把它粘贴到向导的输入框里
 3. 点击 **[测试连接]** 确认可用

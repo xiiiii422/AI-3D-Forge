@@ -6866,7 +6866,53 @@ def t_envcheck() -> str:
     missing = required - ids
     assert not missing, f"环境报告缺少必需项：{missing}"
     assert report["total"] >= 10, report["total"]
-    return f"{report['ok_count']}/{report['total']} 项通过（overall={report['overall']}）"
+
+    # ---- 「AI 服务」不能写死成 DeepSeek（本项目支持智谱 GLM 与混合模式）----
+    # 实测过的坑：只配了智谱免费档的用户，在诊断页看到的是「尚未配置 DeepSeek API Key」
+    # 与「去 platform.deepseek.com 创建」；而「网络连接」探的也是 api.deepseek.com ——
+    # 用户真正依赖的那个地址一次也没测过，却可能因为 DeepSeek 可达而被报成「网络正常」。
+    name_ds, probe_ds, signup_ds = envcheck.ai_provider_info("https://api.deepseek.com")
+    name_glm, probe_glm, signup_glm = envcheck.ai_provider_info("https://open.bigmodel.cn/api/paas/v4")
+    assert (name_ds, name_glm) == ("DeepSeek", "智谱 GLM"), (name_ds, name_glm)
+    assert "deepseek" in probe_ds and "platform.deepseek.com" == signup_ds, (probe_ds, signup_ds)
+    assert "bigmodel" in probe_glm and "deepseek" not in probe_glm, (probe_glm, "GLM 用户去探 DeepSeek")
+    assert "deepseek" not in signup_glm, f"GLM 用户被指引去 DeepSeek 注册：{signup_glm}"
+    name_any, probe_any, _ = envcheck.ai_provider_info("https://ai.example.com/v1")
+    assert probe_any == "https://ai.example.com/v1", (
+        f"自定义地址应探它自己，不然这一项在测一个与用户无关的站点：{probe_any}"
+    )
+    assert name_any == "AI 服务" and name_ds != name_any, "认不出的提供商也要有中性名字"
+
+    # 标题/指引跟着配置走（只改内存里的值，最后还回去，不碰磁盘）
+    from aiforge.config import store as config_store
+
+    cfg = config_store()
+    saved_base = cfg.config.api.base_url
+    saved_econ = cfg.config.api.economy_base_url
+    try:
+        cfg.config.api.base_url = "https://open.bigmodel.cn/api/paas/v4"
+        item_glm = envcheck.check_api()
+        assert "智谱" in item_glm.title and "DeepSeek" not in item_glm.title, item_glm.title
+        assert "deepseek" not in (item_glm.action or ""), item_glm.action
+        # 混合模式：经济档是另一家时，网络那一项必须两家都探
+        cfg.config.api.base_url = "https://api.deepseek.com"
+        cfg.config.api.economy_base_url = "https://open.bigmodel.cn/api/paas/v4"
+        targets = envcheck.ai_network_targets()
+        hosts = " ".join(targets.values())
+        assert "deepseek" in hosts and "bigmodel" in hosts, f"混合模式只探了一家：{targets}"
+        # 同址不能算两个目标（否则一个故障会被计成「全失败」，假报断网）
+        cfg.config.api.economy_base_url = "https://api.deepseek.com/"
+        assert len(envcheck.ai_network_targets()) == 1, envcheck.ai_network_targets()
+    finally:
+        cfg.config.api.base_url = saved_base
+        cfg.config.api.economy_base_url = saved_econ
+    item_ds = envcheck.check_api()
+    assert "DeepSeek" in item_ds.title, f"反向兜底：默认配置下标题不应变成别家（{item_ds.title}）"
+
+    return (
+        f"{report['ok_count']}/{report['total']} 项通过（overall={report['overall']}）；"
+        "AI 提供商名字/探测地址/注册指引按 base_url 走（DeepSeek / 智谱 / 自定义 / 混合模式）"
+    )
 
 
 def t_api_surface() -> str:

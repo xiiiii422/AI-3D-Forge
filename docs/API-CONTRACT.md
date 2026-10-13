@@ -45,9 +45,9 @@ type CheckId =
   | "openscad_version" // OpenSCAD 版本
   | "deps"           // 必要 Python 依赖
   | "project_dir"    // 项目目录权限
-  | "network"        // 网络连接（DeepSeek / OpenSCAD 官方源）
-  | "api"            // DeepSeek API 配置状态
-  | "api_live"       // DeepSeek API 实际可用性（联网测试）
+  | "network"        // 网络连接（实际配置的 AI 服务 + OpenSCAD 官方源；混合模式下经济档是另一家时两个都探）
+  | "api"            // API 配置状态（`title` 按实际提供商显示：DeepSeek API / 智谱 GLM API / AI 服务 API）
+  | "api_live"       // API 实际可用性（联网测试；探的是配置里那个 base_url）
   | "temp"           // 本地临时目录可读写
   | "stl_preview"    // Three.js / WebGL 预览能力
   | "mesh_engine";   // 3D 模型引擎（STL 解析/分析）

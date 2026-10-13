@@ -2997,13 +2997,38 @@ def t_glm_provider() -> str:
     assert llm_mod.detect_provider("https://api.deepseek.com") == "deepseek"
     assert llm_mod.detect_provider("https://open.bigmodel.cn/api/paas/v4") == "glm"
     assert llm_mod.detect_provider("https://example.com/v1") == "openai"
+    glm_url = "https://open.bigmodel.cn/api/paas/v4"
+    # 智谱国际站（api.z.ai）必须认出来是 glm：以前 `config.provider_of_base` 与
+    # `llm.GLM_BASE_HINTS` 各养一张域名表、两张都漏了这个，国际站用户被当成
+    # 自定义 openai 服务，拿到 DeepSeek 的视觉模型名与 token 预算，全线报错。
+    # 现在两张表合并到一处（detect_provider 只是 config.provider_of_base 的薄包装），
+    # 加一家只需改一处；这条断言防的就是「漂回去变成两张表各自演化」。
+    assert llm_mod.detect_provider("https://api.z.ai/api/paas/v4") == "glm", "智谱国际站必须被认成 glm"
+    # 提供商名字/注册地址也不能写死：自定义网关用户收到 401 时，界面以前会说
+    # 「DeepSeek API Key 无效…可在 platform.deepseek.com 创建」（指引方向完全错）。
+    custom_url = "https://ai.corp.example/v1"
+    e = llm_mod._friendly_http_error(401, "", custom_url)
+    assert "DeepSeek" not in e.message and "deepseek" not in (e.hint or ""), (e.message, e.hint)
+    assert "AI 服务" in e.message, e.message
+    # 404 对自定义网关也不该把用户赶回 DeepSeek，而该提示他核对路径与模型名
+    e = llm_mod._friendly_http_error(404, "", custom_url)
+    assert "api.deepseek.com" not in (e.hint or ""), e.hint
+    assert "自定义" in (e.hint or ""), e.hint
+    # 1000（UNKNOWN，智谱服务端内部错误）不能被当成「API Key 无效」：
+    # 以前跟 1001/1002/1004 一起归进鉴权名单，智谱侧偶发内部故障会把用户
+    # 引去删 Key/重建/重新粘贴，做什么都是白折腾。
+    e = llm_mod._friendly_http_error(400, '{"error":{"code":"1000"}}', glm_url)
+    assert e.code == "API_UNREACHABLE", (e.message, e.code)
+    assert "Key 无效" not in e.message, e.message
+    # 1001/1002/1004 才是真的鉴权类，仍必须报成 Key 无效（不能因上一条把方向修反）
+    e = llm_mod._friendly_http_error(400, '{"error":{"code":"1001"}}', glm_url)
+    assert e.code == "API_KEY_INVALID", e.code
     # 视觉模型随提供商切换
     assert llm_mod.vision_model_for("https://open.bigmodel.cn/api/paas/v4") == "glm-4v-flash"
     assert llm_mod.vision_model_for("https://api.deepseek.com") == "deepseek-flash"
     # 输出预算：智谱视觉硬上限 1024；DeepSeek 保持 8192/16384
     assert llm_mod.vision_max_tokens_for("https://open.bigmodel.cn/x") == (1024, 1024)
     assert llm_mod.vision_max_tokens_for("https://api.deepseek.com") == (8192, 16384)
-    glm_url = "https://open.bigmodel.cn/api/paas/v4"
     e = llm_mod._friendly_http_error(429, '{"error":{"code":"1305"}}', glm_url)
     assert "访问量过大" in e.message and e.code == "API_UNREACHABLE", e.message
     e = llm_mod._friendly_http_error(400, '{"error":{"code":"1113"}}', glm_url)

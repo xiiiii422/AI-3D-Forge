@@ -296,24 +296,11 @@ def check_openscad_version() -> CheckItem:
 # 硬编码过一次的实际后果：只配了智谱免费档的用户，在系统诊断里看到的是
 # 「尚未配置 DeepSeek API Key」+「去 platform.deepseek.com 创建」——指引方向就是错的；
 # 而「网络连接」那一项探的是 api.deepseek.com，**用户真正依赖的那个地址一次也没测过**。
-# 提供商 → (给用户看的名字, 可达性探测地址, 注册地址)
-AI_PROVIDERS: dict[str, tuple[str, str, str]] = {
-    "deepseek": ("DeepSeek", "https://api.deepseek.com", "platform.deepseek.com"),
-    "glm": ("智谱 GLM", "https://open.bigmodel.cn", "open.bigmodel.cn"),
-}
-AI_PROVIDER_FALLBACK = ("AI 服务", "", "你所配置的服务商官网")
-
-
-def ai_provider_info(base_url: str | None = None) -> tuple[str, str, str]:
-    """按 base_url 给出（显示名, 探测地址, 注册地址）；认不出的自定义地址用兜底。"""
-    from .config import provider_of_base
-
-    provider = provider_of_base(base_url if base_url is not None else store().config.api.base_url)
-    name, probe, signup = AI_PROVIDERS.get(provider, AI_PROVIDER_FALLBACK)
-    if not probe:
-        # 自定义 OpenAI 兼容地址：拿它自己当探测目标，否则这一项会探一个无关站点
-        probe = (base_url or "").strip()
-    return name, probe, signup
+# `AI_PROVIDERS`/`AI_PROVIDER_FALLBACK`/`ai_provider_info` 已上提到 config.py（单一事实来源）：
+# 错误翻译（llm._friendly_http_error）要用同一套「这个名字显示成什么、去哪里申请」，
+# 不能在两个模块各养一份——以前就是各养一份才会漂。这里重新导出，保持
+# `envcheck.ai_provider_info` 这个对外名字不变（自检、发布文档都按这个路径引用）。
+from .config import AI_PROVIDERS, AI_PROVIDER_FALLBACK, ai_provider_info  # noqa: F401  re-export
 
 
 def ai_network_targets() -> dict[str, str]:

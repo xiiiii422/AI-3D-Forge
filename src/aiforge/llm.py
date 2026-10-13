@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, AsyncIterator
 
 import httpx
 
-from .config import DEFAULT_BASE_URL, DEFAULT_MODEL
+from .config import DEFAULT_BASE_URL, DEFAULT_MODEL, ai_provider_info, provider_of_base
 from .design import SPEC_SYSTEM_PROMPT, DesignSpec, parse_spec_response, spec_user_prompt
 
 if TYPE_CHECKING:  # 仅用于类型标注，避免运行时循环导入
@@ -96,19 +96,20 @@ VISION_MAX_TOKENS_RETRY = 16384
 # 实测（2026-09，对着 open.bigmodel.cn）：glm-4v-flash 读图正常；glm-4.7-flash 存在
 # 但高峰期返 429/1305「访问量过大」（瞬态，可重试）；glm-4.5-flash 为思考模型。
 # --------------------------------------------------------------------------
-GLM_BASE_HINTS = ("bigmodel.cn", "zhipu")
 GLM_VISION_MODEL = "glm-4v-flash"
 GLM_VISION_MAX_TOKENS = 1024
 
 
 def detect_provider(base_url: str) -> str:
-    """从 base_url 识别提供商：deepseek / glm / 通用 openai 兼容。"""
-    url = (base_url or "").lower()
-    if "deepseek" in url:
-        return "deepseek"
-    if any(hint in url for hint in GLM_BASE_HINTS):
-        return "glm"
-    return "openai"
+    """从 base_url 识别提供商：deepseek / glm / 通用 openai 兼容。
+
+    以前这里自己养一张 `GLM_BASE_HINTS` 域名表，跟 `config.provider_of_base` 是同语义的
+    两份实现（注释里写过「config 不能反向 import llm」——那是对的，但可以反过来，llm 已经
+    在 import config）。两份清单会漂：两张都没收智谱国际站 `api.z.ai`，导致那部分用户被
+    当成自定义 openai 服务，拿到 DeepSeek 的视觉模型名与 token 预算（见 config.provider_of_base
+    的补充说明）。合并成一处后这个函数就只是保留对外名字的薄包装，真正的判据单一事实来源。
+    """
+    return provider_of_base(base_url)
 
 
 def vision_model_for(base_url: str) -> str:
@@ -142,8 +143,19 @@ _GLM_ERROR_HINTS = {
     ),
     "1210": (
         "请求的输出长度超出该 GLM 模型上限。",
-        "程序已自动改用该模型允许的输出上限；若仍失败请改用其它模型。",
+        # 以前这里写「程序已自动改用该模型允许的输出上限」—— 实测程序 **没有**这个逻辑：
+        # 文本调用的 max_tokens 全是写死的常量（8192/2048/1200/512），不像视觉那条会按
+        # 提供商分（`vision_max_tokens_for`）。用户重试多少次都会撞同一个错，而界面
+        # 一直说「已经自动处理好了」—— 这是会说谎的文案，改回可核实的说法。
+        "在「设置 → AI 服务」改用输出上限更大的模型，或拆成更小的修改一步。",
         "INTERNAL",
+    ),
+    "1000": (
+        "智谱服务端返回了内部错误（UNKNOWN）。",
+        # 以前 1000 与 1001/1002/1004 一起被当成「API Key 无效」，把用户引去重新粘贴/重建 Key；
+        # 而 1000 实际是智谱侧的通用服务端错误，跟 Key 无关，照那说法用户做什么都修不好。
+        "稍后重试；持续失败请查看智谱开放平台服务状态。",
+        "API_UNREACHABLE",
     ),
 }
 
@@ -155,7 +167,9 @@ def _glm_friendly_error(status: int, body: str) -> LlmError | None:
         code = str((json.loads(body or "{}").get("error") or {}).get("code") or "")
     except (ValueError, TypeError, AttributeError):
         code = ""
-    if status == 401 or code in ("1000", "1001", "1002", "1004"):
+    # 1000（UNKNOWN，服务端内部错误）不属于鉴权问题，不能归进这个名单——以前混在一起，
+    # 智谱侧偶发内部故障会让用户白折腾一遍重新粘贴 Key。1001/1002/1004 才是真的鉴权类。
+    if status == 401 or code in ("1001", "1002", "1004"):
         return LlmError(
             "智谱 GLM API Key 无效或已失效。",
             hint="请在「设置 → AI 服务」填入智谱 API Key（open.bigmodel.cn 创建）；"
@@ -737,6 +751,12 @@ class ChatResult:
 
 def _friendly_http_error(status: int, body: str, base_url: str) -> LlmError:
     snippet = (body or "").strip()[:300]
+    # 提供商名 / 探测地址 / 注册地址 都按 base_url 从单一事实来源（config.ai_provider_info）算：
+    # 以前 401/402/404(非 glm)/兑底 四个分支写死了 "DeepSeek"/"platform.deepseek.com"，
+    # 自定义网关（`detect_provider` 返 `openai`）的用户收到 401 时界面会说
+    # 「DeepSeek API Key 无效…可在 platform.deepseek.com 创建」—— 指引方向完全错，
+    # 与 envcheck 那次同一个坑，只是换了个分支没扫到（已写进自检的扫描面）。
+    provider_name, _probe, signup = ai_provider_info(base_url)
     # 智谱 GLM 有自己的业务错误码（1305 过载 / 1113 余额 / 1220 无权 / 1210 超长），
     # 先按提供商翻译，翻译不了再走下面的通用 HTTP 分支。
     if detect_provider(base_url) == "glm":
@@ -745,25 +765,23 @@ def _friendly_http_error(status: int, body: str, base_url: str) -> LlmError:
             return glm_err
     if status == 401:
         return LlmError(
-            "DeepSeek API Key 无效或已失效。",
-            hint="请在「设置 → AI 服务」中重新填入正确的 API Key（可在 platform.deepseek.com 创建）。",
+            f"{provider_name} API Key 无效或已失效。",
+            hint=f"请在「设置 → AI 服务」中重新填入正确的 API Key（可在 {signup} 创建）。",
             code="API_KEY_INVALID",
         )
     if status == 402:
         return LlmError(
-            "DeepSeek 账户余额不足，无法继续生成。",
-            hint="请前往 DeepSeek 开放平台充值后重试。",
+            f"{provider_name} 账户余额不足，无法继续生成。",
+            hint=f"请前往 {provider_name} 开放平台充值后重试。",
             code="API_KEY_INVALID",
         )
     if status == 429:
-        provider_name = "智谱 GLM" if detect_provider(base_url) == "glm" else "DeepSeek"
         return LlmError(
             f"请求过于频繁，已被 {provider_name} 限流。",
             hint="请稍等十几秒再试，或减少同时进行的任务。",
             code="API_UNREACHABLE",
         )
     if status >= 500:
-        provider_name = "智谱 GLM" if detect_provider(base_url) == "glm" else "DeepSeek"
         return LlmError(
             f"{provider_name} 服务暂时不可用。",
             hint="这是对方服务端的问题，请稍后重试。",
@@ -777,13 +795,20 @@ def _friendly_http_error(status: int, body: str, base_url: str) -> LlmError:
                 "并确认模型名拼写正确（如 glm-4.7-flash）。",
                 code="API_UNREACHABLE",
             )
+        if detect_provider(base_url) == "deepseek":
+            return LlmError(
+                f"接口地址不正确（{base_url}）。",
+                hint="请在「设置 → AI 服务」中把接口地址恢复为 https://api.deepseek.com。",
+                code="API_UNREACHABLE",
+            )
+        # 自定义网关：不该把用户赶回 DeepSeek，而该提示他检查自己填的那个地址
         return LlmError(
-            f"接口地址不正确（{base_url}）。",
-            hint="请在「设置 → AI 服务」中把接口地址恢复为 https://api.deepseek.com。",
+            f"接口地址或模型名不正确（{base_url}）。",
+            hint="这是自定义的 OpenAI 兼容地址：请核对路径（很多网关需要 /v1 后缀）与模型名。",
             code="API_UNREACHABLE",
         )
     return LlmError(
-        f"调用 DeepSeek 失败（HTTP {status}）。{snippet}",
+        f"调用 {provider_name} 失败（HTTP {status}）。{snippet}",
         hint="可稍后重试；若持续失败请检查网络或代理设置。",
         code="INTERNAL",
     )
@@ -898,13 +923,14 @@ class DeepSeekClient:
             except httpx.HTTPError as exc:
                 raise LlmError(
                     f"网络请求失败：{_describe_network_error(exc)}。",
-                    hint="请检查网络后重试；若使用代理或公司网络，请确认能访问 api.deepseek.com。",
+                    hint=f"请检查网络后重试；若使用代理或公司网络，请确认能访问 {self.base_url}。",
                     code="API_UNREACHABLE",
                 ) from exc
         assert last is not None
+        provider_name, _probe, _signup = ai_provider_info(self.base_url)
         raise LlmError(
-            f"无法连接到 DeepSeek 服务器（{self.base_url}）：{_describe_network_error(last)}。",
-            hint="请检查网络连接；若使用代理或公司网络，请在「设置」中确认可以访问 api.deepseek.com。",
+            f"无法连接到 {provider_name} 服务器（{self.base_url}）：{_describe_network_error(last)}。",
+            hint=f"请检查网络连接；若使用代理或公司网络，请在「设置」中确认可以访问 {self.base_url}。",
             code="API_UNREACHABLE",
         ) from last
 
@@ -1035,9 +1061,10 @@ class DeepSeekClient:
                 if not started and attempt == 0:
                     await asyncio.sleep(CONNECT_RETRY_DELAY_S)
                     continue
+                provider_name, _probe, _signup = ai_provider_info(self.base_url)
                 raise LlmError(
-                    f"无法连接到 DeepSeek 服务器（{self.base_url}）：{_describe_network_error(exc)}。",
-                    hint="请检查网络连接；若使用代理或公司网络，请在「设置」中确认可以访问 api.deepseek.com。",
+                    f"无法连接到 {provider_name} 服务器（{self.base_url}）：{_describe_network_error(exc)}。",
+                    hint=f"请检查网络连接；若使用代理或公司网络，请在「设置」中确认可以访问 {self.base_url}。",
                     code="API_UNREACHABLE",
                 ) from exc
             except httpx.TimeoutException as exc:
@@ -1049,7 +1076,7 @@ class DeepSeekClient:
             except httpx.HTTPError as exc:
                 raise LlmError(
                     f"网络请求失败：{_describe_network_error(exc)}。",
-                    hint="请检查网络后重试；若使用代理或公司网络，请确认能访问 api.deepseek.com。",
+                    hint=f"请检查网络后重试；若使用代理或公司网络，请确认能访问 {self.base_url}。",
                     code="API_UNREACHABLE",
                 ) from exc
 

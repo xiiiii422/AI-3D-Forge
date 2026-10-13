@@ -27,13 +27,41 @@ KEYRING_USER_GLM = "glm-api-key"
 
 
 def provider_of_base(base_url: str) -> str:
-    """按 base_url 判提供商（与 llm.detect_provider 同语义；config 不能反向 import llm）。"""
+    """按 base_url 判提供商（**单一事实来源**）。
+
+    以前这个判据有两份同语义实现：这里一份、`llm.detect_provider`（带 `GLM_BASE_HINTS` 域名表）
+    一份，注释里自己写过「config 不能反向 import llm」——那是对的，但可以反过来：llm.py
+    已经 import config.py，`detect_provider` 应当直接调这里，而不是养第二张域名清单。
+    两份清单会漂：实测漏记了智谱国际站 `api.z.ai`（两张清单都没收），智谱国际站用户被
+    当成自定义 openai 兼容服务，拿到 DeepSeek 的视觉模型名与 token 预算，全线报错。
+    合并到这一处后，加第三家只需改这里。
+    """
     url = (base_url or "").lower()
     if "deepseek" in url:
         return "deepseek"
-    if "bigmodel.cn" in url or "zhipu" in url:
+    if "bigmodel.cn" in url or "zhipu" in url or "api.z.ai" in url:
         return "glm"
     return "openai"
+
+
+# 提供商 → (给用户看的名字, 可达性探测地址, 注册地址)。
+# 与上面 `provider_of_base` 一起放在 config.py：诊断页（envcheck）与错误翻译（llm）都要用同一套
+# 「这个名字该显示成什么、去哪里申请」，不能在两个模块各养一份 —— 已经漂过一次（写死 DeepSeek）。
+AI_PROVIDERS: dict[str, tuple[str, str, str]] = {
+    "deepseek": ("DeepSeek", "https://api.deepseek.com", "platform.deepseek.com"),
+    "glm": ("智谱 GLM", "https://open.bigmodel.cn", "open.bigmodel.cn"),
+}
+AI_PROVIDER_FALLBACK = ("AI 服务", "", "你所配置的服务商官网")
+
+
+def ai_provider_info(base_url: str | None = None) -> tuple[str, str, str]:
+    """按 base_url 给出（显示名, 探测地址, 注册地址）；认不出的自定义地址用兑底。"""
+    provider = provider_of_base(base_url if base_url is not None else store().config.api.base_url)
+    name, probe, signup = AI_PROVIDERS.get(provider, AI_PROVIDER_FALLBACK)
+    if not probe:
+        # 自定义 OpenAI 兼容地址：拿它自己当探测目标，否则这一项会探一个无关站点
+        probe = (base_url or "").strip()
+    return name, probe, signup
 
 # 读配置一律用 utf-8-sig：它写出的字节与 utf-8 完全相同（不带 BOM），
 # 但读的时候能容忍 BOM。为什么必须容忍：用户完全可能用记事本之类

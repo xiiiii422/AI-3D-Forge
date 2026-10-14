@@ -2592,19 +2592,49 @@ def _collect_issues(metrics: MeshMetrics, limits: AnalysisLimits) -> None:
                 f"最薄 {wall.min_mm:.2f}mm（共 {wall.samples} 处采样）"
             )
             thread_depth = metrics.thread_depth_mm
-            if thread_depth is not None:
+            is_helix = metrics.thread_is_helix
+            if thread_depth is not None and is_helix is True:
                 # 螺纹件的「薄」是牙型本身，不是壁做薄了 —— 必须分开说。
                 # 实测：一个完全合规的 M72×0.75 转接环，射线法量出来最薄 0.05mm、
                 # 中位数 0.47mm；照普通薄壁判据就会报"远低于 1.2mm 无法打印"，
                 # 而它其实是可以打的（0.1mm 层高），只是牙尖细。
                 # 用户看到这种结论会以为模型废了 —— 这是**误报**，要按螺纹口径讲清楚。
-                metrics.thread_depth_mm = thread_depth
+                #
+                # 以前这里只看 `thread_depth is not None`，完全不读 `is_helix` —— 同心环假螺纹
+                # （`detect_helix_thread` 已判成 False）或者样本不够判不出（None）都会走进这条
+                # 「检测到螺旋螺纹，不是壁做得薄」的洗白分支，还会挤掉下面真正该报的
+                # 薄壁告警。`reqtests.py` 那边同样的三分支已经修过（见 `thread:real` 那段注释），
+                # 这里却一直没同步 —— 同一类判据养两份、修一份漏一份。
+                # 「即 0.75mm 细牙」也被删掉了：螺距从来没有被测过（`measure_thread_depth` 只量
+                # 牙深，不量导程），把没测过的数字写进「实测」文案里又是一处替模型/替工具说话。
                 metrics.issues.append(
-                    f"检测到螺旋螺纹（实测牙深约 {thread_depth:.2f}mm，即 0.75mm 细牙）："
+                    f"检测到真螺旋螺纹（实测牙深约 {thread_depth:.2f}mm）："
                     f"上方那条「壁厚」统计量的是**牙尖**，不是壁做得薄。"
                     f"细牙在 {limits.nozzle_mm}mm 喷嘴上建议用 0.1mm 层高打印；"
-                    f"若只想粗用，可把牙型换成粗牙（例如 M72×2）。{where}"
+                    f"若只想粗用，可把牙型换成粗牙。{where}"
                 )
+            elif thread_depth is not None and is_helix is False:
+                # 有牙型起伏，但 `detect_helix_thread` 判定是同心环而不是真螺旋 ——
+                # 这是「看着有螺纹纹理、实际拧不进去」那一类事故（滤镜转接环就这么翻过车），
+                # 不能当成「检测到螺旋螺纹、不用修」放过去，也不能退回普通薄壁那句
+                # （那句会把它当成一般性薄壁问题，而不是功能性缺陷）。
+                metrics.issues.append(
+                    f"检测到同心环而不是螺旋（实测牙型起伏约 {thread_depth:.2f}mm）："
+                    "用 `rotate_extrude` 转出来的是一圈一圈的环，同一高度上各角度完全一样，"
+                    "看着有螺纹纹理但根本拧不进去。改用固定零件库 "
+                    "`use <aiforge_parts.scad>` 的 `filter_adapter` / `thread_sleeve`（真螺旋）。"
+                    f"{where}"
+                )
+            elif thread_depth is not None and is_helix is None:
+                # 有牙型起伏，但样本不够，`detect_helix_thread` 明写「不猜」返回 None ——
+                # 与上面两种都必须分开：这一条只能说「没判定成」，既不能说真螺旋（洗白），
+                # 也不能说同心环（冤枉），得照 reqtests 那边的 INVALID 口径说话。
+                # 不代替薄壁告警：拿不到结论时，普通薄壁那句话仍是唯一能给的保守结论。
+                stats_invalid = stats + (
+                    f"；量到了 {thread_depth:.2f}mm 的牙型起伏，但样本不够，没能判定是螺旋还是同心环"
+                    "（面数太少会这样，降低 $fn 或先按普通薄壁对待）"
+                )
+                metrics.issues.append(f"{stats_invalid}。{where}")
             elif limits.is_resin:
                 metrics.issues.append(
                     f"{stats}。该机型建议的最小细节厚度为 {limits.min_wall_mm:.2f}mm，"

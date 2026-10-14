@@ -7985,7 +7985,49 @@ def t_printer_affects_analysis() -> str:
     assert not plate.too_thin_wall, f"树脂机不该按喷嘴判壁厚：{plate.issues}"
     assert not plate.too_thin_rough, f"1.3mm 在树脂机上应合格：{plate.issues}"
 
-    return "薄壁/最小尺寸/成型范围三类判定均随机型与喷嘴正确变化"
+    # ---- 螺纹洗白分支必须区分真螺旋/同心环/判不出，不能只看 `thread_depth is not None` ----
+    # 以前这个分支完全不读 `metrics.thread_is_helix`：同心环假螺纹（`detect_helix_thread`
+    # 已判成 False）或者样本不够判不出（None）都会走进「检测到螺旋螺纹，不是壁做得薄」
+    # 的洗白文案，还会挤掉下面真正该报的薄壁告警。`reqtests.py` 那边同样的三分支早就
+    # 修了（见 `thread:real` 那段），这里一直没同步 —— 同一类判据养两份、修一份漏一份。
+    def make_thread_metrics(is_helix: bool | None) -> mesh.MeshMetrics:
+        m = make_metrics(2.0)
+        m.thread_depth_mm = 0.46
+        m.thread_is_helix = is_helix
+        return m
+
+    spiral = make_thread_metrics(True)
+    mesh._collect_issues(spiral, coarse_limits)  # noqa: SLF001
+    assert spiral.too_thin_wall, "真螺旋也得置位 too_thin_wall（牙尖确实是射线法量到的最薄处）"
+    assert any("真螺旋螺纹" in i for i in spiral.issues), spiral.issues
+    assert not any("同心环" in i for i in spiral.issues), spiral.issues
+    assert not any("0.75mm 细牙" in i for i in spiral.issues), (
+        "「即 0.75mm 细牙」是把螺距当成实测数字写进文案，`measure_thread_depth` 从来没测过螺距"
+    )
+
+    rings = make_thread_metrics(False)
+    mesh._collect_issues(rings, coarse_limits)  # noqa: SLF001
+    assert any("同心环而不是螺旋" in i for i in rings.issues), rings.issues
+    assert not any("检测到真螺旋螺纹" in i for i in rings.issues), (
+        "同心环不能被说成螺旋（这正是要避免的那类洗白）"
+    )
+
+    unknown = make_thread_metrics(None)
+    mesh._collect_issues(unknown, coarse_limits)  # noqa: SLF001
+    joined = "\n".join(unknown.issues)
+    assert "没能判定是螺旋还是同心环" in joined, unknown.issues
+    assert "真螺旋螺纹" not in joined, "样本不足不能当成已确认是真螺旋"
+    assert "同心环而不是螺旋" not in joined, "样本不足不能反过来咬定是同心环"
+
+    # 反向（关键）：没测出螺纹起伏时，普通薄壁告警必须照常触发，不能被螺纹分支「顺手」吃接走。
+    no_thread = make_metrics(2.0)
+    no_thread.thread_depth_mm = None
+    no_thread.thread_is_helix = None
+    mesh._collect_issues(no_thread, coarse_limits)  # noqa: SLF001
+    assert any("2.4mm" in i and "0.8mm" in i for i in no_thread.issues), no_thread.issues
+    assert not any("螺旋螺纹" in i for i in no_thread.issues), no_thread.issues
+
+    return "薄壁/最小尺寸/成型范围三类判定均随机型与喷嘴正确变化；螺纹洗白分支按真螺旋/同心环/判不出三分"
 
 
 def t_printer_prompt_injection() -> str:

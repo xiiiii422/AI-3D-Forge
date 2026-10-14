@@ -3063,7 +3063,7 @@ def t_glm_provider() -> str:
     assert llm_mod.parse_snapshot_verdict("结论：无明显问题") == llm_mod.VERDICT_CLEAR
     assert llm_mod.parse_snapshot_verdict("结论：有问题\n底座悬空") == llm_mod.VERDICT_PROBLEM
     assert llm_mod.VERDICT_UNKNOWN != llm_mod.VERDICT_CLEAR, "三态必须互不相同，否则又退回 bool"
-    # 同提供商降级：仅 429/5xx 且未降级过时切换，并改写 payload；其余不切
+    # 同提供商降级：仅瞬态过载/不可用且未降级过时切换，并改写 payload；其余不切
     fb = llm_mod.DeepSeekClient("k", glm_url, "glm-4.7-flash", fallback_model="glm-4-flash")
     payload = {"model": fb.model}
     assert fb._try_fallback(429, payload) is True, "429 应触发降级"  # noqa: SLF001
@@ -3072,6 +3072,31 @@ def t_glm_provider() -> str:
     nb = llm_mod.DeepSeekClient("k", glm_url, "glm-4.7-flash")
     assert nb._try_fallback(429, {"model": nb.model}) is False, "没配备用模型不降级"  # noqa: SLF001
     assert nb._try_fallback(404, {"model": nb.model}) is False, "404 不降级"  # noqa: SLF001
+
+    # ---- 「瞬态」判据必须读业务码，不能只看状态码（本轮修的真缺陷）----
+    # 以前 `_post_with_connect_retry` 与 `_try_fallback` 各自写了一份「429/5xx 就算瞬态」，
+    # 两处都不读 body：智谱 1113（余额/资源包不足）或 OpenAI 兼容网关常见的 insufficient_quota
+    # 都会被当成「稍后再试就好」，白等几轮退避/白试一次备用模型，最后才报出真正原因。
+    # 判据合并到一处后（`_is_transient_status`），两个调用点共用，不能再漂。
+    assert llm_mod._is_transient_status(429, '{"error":{"code":"1305"}}') is True, "1305 过载是真瞬态"
+    assert llm_mod._is_transient_status(429, '{"error":{"code":"1130"}}') is True, "1130 频控也是真瞬态"
+    assert llm_mod._is_transient_status(429, '{"error":{"code":"1113"}}') is False, (
+        "1113 是余额/资源包不足，等一下也没用，不能重试"
+    )
+    assert llm_mod._is_transient_status(500, '{"error":{"code":"1220"}}') is False, (
+        "1220 无权访问该模型，跟服务不可用没关系，换模型重发也白搭"
+    )
+    assert llm_mod._is_transient_status(429, '{"error":{"type":"insufficient_quota"}}') is False, (
+        "OpenAI 兼容网关常用 429 搭配 insufficient_quota 表达配额耗尽，不是「请求太频繁」"
+    )
+    assert llm_mod._is_transient_status(503, "") is True, "没带业务码的 5xx 仍按瞬态处理（兼容旧行为）"
+    assert llm_mod._is_transient_status(400, "anything") is False, "400 本来就不在可重试范围"
+    # 反向：同一个 429 状态码，带 1305 与带 1113 的结果必须相反（这就是“读业务码”与
+    # “只看状态码”的分水岭；若两处判据重新分家，这条断言不会自动抓，但上面逐条断言会先红）
+    assert llm_mod._is_transient_status(429, '{"error":{"code":"1305"}}') != llm_mod._is_transient_status(
+        429, '{"error":{"code":"1113"}}'
+    ), "同为 429，1305 与 1113 的分流必须相反"
+
     # DeepSeek 分支不受影响
     e = llm_mod._friendly_http_error(402, "", "https://api.deepseek.com")
     assert "余额不足" in e.message and e.code == "API_KEY_INVALID"

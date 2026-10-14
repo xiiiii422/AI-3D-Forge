@@ -182,6 +182,38 @@ def _glm_friendly_error(status: int, body: str) -> LlmError | None:
     return None
 
 
+# 判定「这个错误是不是瞬态、可以安全重发」的唯一一处判据。
+# 以前这个判据在 `_post_with_connect_retry` 与 `_try_fallback` 各写各的「429/5xx 就算瞬态」，
+# 两处都不读业务码 —— 而 `_friendly_http_error` 明明已经会区分智谱 1113（余额不足，硬失败）
+# 与 1305（瞬态过载），OpenAI 兼容网关也普遍用 429 搭配 `insufficient_quota` 表达「配额耗尽」。
+# 同一个信息在两个判据里没接上：硬失败会被当成「稍后再试就好」白白重发几轮，而 OpenAI
+# 兼容网关的 429/5xx 以前干脆一次都不重试（两家行为相反）。同一类判据养两份、两份都
+# 不完整 —— 正是这个项目反复修的形状，合并到这一处。
+_TRANSIENT_BODY_HINTS = (
+    "insufficient_quota", "exceeded_quota", "quota_exceeded",
+    "billing_hard_limit_reached", "insufficient_balance",
+)
+# 智谱业务码里「等一下也没用」的那几种（余额/资源包不足、无权访问该模型）；
+# 1305/1130 不在这个名单里，它们是真瞬态过载/频控，应该重发。
+_GLM_PERMANENT_CODES = ("1113", "1220")
+
+
+def _is_transient_status(status: int, body: str) -> bool:
+    """429/5xx 只有真的是过载/瞬态才值得重发；配额/余额/权限类必须直接失败。"""
+    if status != 429 and status < 500:
+        return False
+    lowered = (body or "").lower()
+    if any(hint in lowered for hint in _TRANSIENT_BODY_HINTS):
+        return False
+    try:
+        code = str((json.loads(body or "{}").get("error") or {}).get("code") or "")
+    except (ValueError, TypeError, AttributeError):
+        code = ""
+    if code in _GLM_PERMANENT_CODES:
+        return False
+    return True
+
+
 class LlmError(RuntimeError):
     """带用户可读信息与修复建议的 AI 调用错误。"""
 
@@ -840,16 +872,21 @@ class DeepSeekClient:
             read_s = min(read_s * 1.5, 600.0)
         self.timeout = httpx.Timeout(connect=20.0, read=read_s, write=60.0, pool=20.0)
 
-    def _try_fallback(self, status: int, payload: dict) -> bool:
+    def _try_fallback(self, status: int, payload: dict, body: str = "") -> bool:
         """同提供商内模型降级：glm-4.7-flash 免费档高峰连发 1305/5xx 时临时改用备用模型。
 
-        只在 429/5xx（过载/瞬态）且尚未降级过时触发；降级会改写 payload["model"]，
+        只在瞬态过载/不可用且尚未降级过时触发；降级会改写 payload["model"]，
         本次与后续重试都用备用模型，并留日志。实测免费档高峰连发 3+ 次 1305，
         光靠重试等不到放行，降级到负载较低的 glm-4-flash 才能把作业跑完。
+
+        以前这里只看状态码（429/5xx），不读业务码 —— 于是「429 + insufficient_quota」这种
+        余额/配额耗尽的硬失败也会被当成「稍后再试就好」，换成另一个模型再试一次：模型换了，
+        没余额这件事没变，白花一次调用。判据合并到 `_is_transient_status` 这一处（与
+        `_post_with_connect_retry` 共用，不能再养两份）。
         """
         if not self.fallback_model or self.model == self.fallback_model:
             return False
-        if status not in (429, 500, 502, 503, 504):
+        if not _is_transient_status(status, body):
             return False
         log.warning(
             "模型 %s 返回 %s（过载/不可用），临时降级到 %s",
@@ -895,7 +932,8 @@ class DeepSeekClient:
         下面报错时必须把**异常类型**和**目标地址**都写出来。）
         """
         # 智谱免费档高峰常连发 1305（瞬态过载、不计费），实测连发 3 次时 2 次重试仍会失败；
-        # 给 4 次机会 + 递增退避。其余提供商保持 2 次（1 次连接重试）。
+        # 给 4 次机会 + 递增退避。其余提供商给 2 次（1 次重机会）——以前这 2 次只服务
+        # 「连都连不上」，现在瞬态 429/5xx 也能用掉其中一次（见下面的 `_is_transient_status`）。
         attempts = 4 if detect_provider(self.base_url) == "glm" else 2
         last: Exception | None = None
         for attempt in range(attempts):
@@ -904,14 +942,17 @@ class DeepSeekClient:
                     response = await client.post(url, headers=self._headers(), json=payload)
                     # 智谱 1305＝模型临时过载（HTTP 429），属「稍后再试就好」的瞬态错误；
                     # 与连接失败一样重试一次，不会对失败请求重复计费。
-                    # 智谱免费档的 429（1305 过载 / 1130 频控等）与间歇性 5xx 都是
-                    # 瞬态且不计费，一律退避重试；其余提供商仅连接失败重试。
+                    # 瞬态的 429（过载/频控）与间歇性 5xx 一律退避重试 —— 不再只对智谱生效：
+                    # 以前 DeepSeek / 自定义网关的 429/5xx 一次都不重试（两家行为相反，而且
+                    # 方向是「付费的那家行为更差」）：同一个作业里连续跑 generate → review_printability，
+                    # DeepSeek 侧瞬时并发限流 429 就会直接红，而同类错误在 GLM 路径会自动退避重试。
+                    # 判据合并到 `_is_transient_status`：配额/余额耗尽（哪怕状态码也是 429/5xx）
+                    # 不算瞬态，不能白等几轮退避才告诉用户真正原因。
                     if (
-                        detect_provider(self.base_url) == "glm"
-                        and (response.status_code == 429 or response.status_code >= 500)
+                        _is_transient_status(response.status_code, response.text)
                         and attempt + 1 < attempts
                     ):
-                        # 退避递增：免费档频控往往要等几秒才放行
+                        # 退避递增：频控往往要等几秒才放行
                         await asyncio.sleep(CONNECT_RETRY_DELAY_S * (attempt + 1))
                         continue
                     return response
@@ -976,7 +1017,7 @@ class DeepSeekClient:
         for attempt in range(2):
             payload["max_tokens"] = budget
             response = await self._post_with_connect_retry(url, payload)
-            if response.status_code >= 400 and self._try_fallback(response.status_code, payload):
+            if response.status_code >= 400 and self._try_fallback(response.status_code, payload, response.text):
                 response = await self._post_with_connect_retry(url, payload)
             if response.status_code >= 400:
                 raise _friendly_http_error(response.status_code, response.text, self.base_url)
@@ -1044,7 +1085,7 @@ class DeepSeekClient:
                         started = True
                         if response.status_code >= 400:
                             body = (await response.aread()).decode("utf-8", errors="replace")
-                            if self._try_fallback(response.status_code, payload):
+                            if self._try_fallback(response.status_code, payload, body):
                                 continue
                             raise _friendly_http_error(response.status_code, body, self.base_url)
                         async for line in response.aiter_lines():

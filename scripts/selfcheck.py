@@ -7048,6 +7048,41 @@ def t_envcheck() -> str:
         cfg.config.api.economy_base_url = saved_econ
     item_ds = envcheck.check_api()
     assert "DeepSeek" in item_ds.title, f"反向兜底：默认配置下标题不应变成别家（{item_ds.title}）"
+    
+    # ---- 「诊断探测的墙钟」必须跟着「实际读超时」算，不能自己写死一个数（P2-15）----
+    # 实测过的坑：`check_api_live` 以前写死 `timeout: float = 95.0`（当时 `timeout_s=90`，
+    # 95>90 对），后来 llm 给智谱加了 1.5 倍放大（变成 135），envcheck 这边的写死数字
+    # 没跟着变 —— 好好的智谱 Key 在诊断页会被误报成「超时」，正是那段注释自己
+    # 发誓要避免的「反向撤销」。现在墙钟由 `effective_read_timeout` 实时算，两边共用
+    # 同一个公式；这条断言钉住「共用」这个事实：把公式改到另一处、或者两边重新
+    # 各写一个写死的数，就会红。
+    from aiforge.llm import API_PROBE_BASE_TIMEOUT_S, DeepSeekClient, effective_read_timeout
+    
+    glm_url = "https://open.bigmodel.cn/api/paas/v4"
+    ds_url = "https://api.deepseek.com"
+    glm_read = effective_read_timeout(API_PROBE_BASE_TIMEOUT_S, glm_url)
+    ds_read = effective_read_timeout(API_PROBE_BASE_TIMEOUT_S, ds_url)
+    # 正向：智谱确实被放大（不放大 = 公式叉回一处），而 DeepSeek 不受影响
+    assert glm_read > ds_read, (glm_read, ds_read)
+    assert ds_read == float(API_PROBE_BASE_TIMEOUT_S), ds_read
+    # 反向（关键）：墙钟（在 check_api_live 里算的是 read+缓冲）必须严格大于读超时本身，
+    # 而不是大于一个早就旧的写死数字；拿以前那个 95 当尺子，智谱用户就会被误报
+    assert glm_read > 95.0, (
+        f"墙钟基准（{glm_read}）必须大于历史上写死的 95，否则又回到那个「好好的 Key 被判超时」的坑"
+    )
+    # 墙钟的「+缓冲」那一步在 envcheck 里，不重复测；但得确认这个缓冲确实被用上了：
+    # 拿一个能控制配置的假 Key 直接跑 `check_api_live` 不现实（会真发网络请求），
+    # 所以这里验证的是「公式共用」这个结构事实：改 `GLM_TIMEOUT_BOOST` 必须同时
+    # 影响 `effective_read_timeout` 与 `DeepSeekClient.__init__` 真实设下的超时。
+    saved_boost = DeepSeekClient.GLM_TIMEOUT_BOOST
+    try:
+        DeepSeekClient.GLM_TIMEOUT_BOOST = 2.0
+        client_glm = DeepSeekClient("k", glm_url, "glm-4.7-flash", timeout_s=API_PROBE_BASE_TIMEOUT_S)
+        assert client_glm.timeout.read == effective_read_timeout(API_PROBE_BASE_TIMEOUT_S, glm_url), (
+            "DeepSeekClient 自己的读超时与 effective_read_timeout 算出来的不一样 —— 公式分叉了"
+        )
+    finally:
+        DeepSeekClient.GLM_TIMEOUT_BOOST = saved_boost
 
     return (
         f"{report['ok_count']}/{report['total']} 项通过（overall={report['overall']}）；"

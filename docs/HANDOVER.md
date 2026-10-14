@@ -46,7 +46,7 @@ cd <项目目录>
 # 2) 自检（改动后必跑；离线跑很快）
 .\build\venv\Scripts\python.exe scripts\selfcheck.py --offline
 .\build\venv\Scripts\python.exe scripts\selfcheck.py            # 完整版：含 OpenSCAD 编译 / STL 分析 / 打包
-.\build\venv\Scripts\python.exe scripts\selfcheck_design.py     # 设计规格与改动机制（144 项）
+.\build\venv\Scripts\python.exe scripts\selfcheck_design.py     # 设计规格与改动机制（147 项）
 ```
 
 > **AI Key**：存在 Windows 凭据管理器里（`config.py`，后端名 `credential_manager`），
@@ -118,7 +118,7 @@ cd <项目目录>
 |---|---|---|---|
 | `scripts/selfcheck.py --offline` | 无 | 94 项中跳 15 项（需真实环境）后剩下的全部：模块/路径/SCAD 处理/契约语义/改名桥/缩放/回退/零件库/线程/编码/密钥/外观材质/切片检测规则/接口面/预算/构建脚本形状/模块内未定义名字/高 DPI 工作区 | 79 通过 / 15 跳过 / 0 失败 |
 | `scripts/selfcheck.py` | OpenSCAD | 加上真实编译、STL 分析、打包检查、路由契约、**无参数 GET 逐条发真请求**等（共 94 项） | 94 通过 / 0 失败 |
-| `scripts/selfcheck_design.py` | 无 | 设计规格与改动机制的 144 项细判据 | 全部通过 |
+| `scripts/selfcheck_design.py` | 无 | 设计规格与改动机制的 147 项细判据 | 全部通过 |
 | `webui/scripts/verify-flow.mjs` | mock 后端（`--first-run` **新起**）+ vite | 界面全流程：欢迎向导 → 工作台 → 需求确认 → 结果卡片 → 预览（含尺寸标注）→ 线框开关 → 设置（页面动画、液态玻璃 10 条、送到切片软件）→ 缺 WebView2 的回退横幅 4 条 → 溢出审计 | 86/86，且 console/pageErrors/failedRequests 全空（2026-10-13 复跑，含回收站三步） |
 | `webui/scripts/verify-glass-contrast.mjs` | 同上 | 玻璃上的字还读不读得清：逐像素量文字对比度 / 底纹泄漏 / 浮层分界度。写进注释与文档的玻璃数字必须能在报告里找到 | `CONTRAST_OK`（不达标就非零退出） |
 | `webui/scripts/layout-audit.mjs` / `audit-interface.mjs` | 真实后端托管 `webui/dist`（默认 8770）或 vite | 布局溢出/遮挡；对比度、焦点、命名、颜色单载、tabular-nums | 0 问题 + `INTERFACE_AUDIT_OK`（audit 必须含一个真实项目路由 `#/studio/<id>`；2026-10-13 在真后端上复跑：10 组 0 问题，项目路由 tabular 候选 7 个、仅颜色 59、无焦点 25 全部 0 违规） |
@@ -171,7 +171,7 @@ cd <项目目录>
 * `selfcheck.py --offline`：**79 通过 / 15 跳过 / 0 失败**
 * `selfcheck.py`（完整，含 OpenSCAD 编译 / STL 分析 / 打包检查 / 路由契约 / 真实 HTTP 逐条跑）：
   **94 通过 / 0 失败**
-* `selfcheck_design.py`：**全部通过**（144 项设计机制判据）
+* `selfcheck_design.py`：**全部通过**（147 项设计机制判据）
 * `scripts/verify_parts.py`：固定零件库 **3 个零件共 6 个用例**全绿（含升口径与内外螺纹位置、镂空断言）
 * `scripts/check_oss_files.py` / `check_no_secrets.py` / `check_ps_encoding.py`：全绿
   （无密钥扫描覆盖 **182 个文本文件**、编码/本机路径扫描 181 个提交文本文件，无 BOM / 乱码；
@@ -336,7 +336,7 @@ cd <项目目录>
 1. `.\scripts\build.ps1` 成功产出安装包并打出 `BUILD_COMPLETE`；自检输出就在它自己那一段
    （`5/8 Backend self-check`）里，要留档自己重定向（`*> build\work\build.log`）；
 2. `scripts\selfcheck.py --offline` = **79 通过 / 15 跳过 / 0 失败**（完整版：**94 通过 / 0 失败**）；
-   `selfcheck_design.py` 全通过（包在「设计规格与改动机制」那一项里，**144 项**）；
+   `selfcheck_design.py` 全通过（包在「设计规格与改动机制」那一项里，**147 项**）；
 3. 改一个**小**东西（例如提示词里一句措辞），跑通"改 → 自检 → 打包"闭环；
 4. 用真实 Key 跑一次 `scripts/verify_modify_matrix.py`，按 §7 的说明把它跑到全绿；
 5. 用 `webui/scripts/verify-flow.mjs` 跑到全绿；

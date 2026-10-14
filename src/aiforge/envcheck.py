@@ -596,19 +596,24 @@ def check_api() -> CheckItem:
     )
 
 
-async def check_api_live(timeout: float = 95.0) -> CheckItem:
-    """真实调用一次 DeepSeek，确认 Key 真的能用（而不是只填了字符串）。
+async def check_api_live(timeout: float | None = None) -> CheckItem:
+    """真实调用一次 AI 服务，确认 Key 真的能用（而不是只填了字符串）。
 
-    `timeout` 是**整次探测的墙钟上限**，之前它只是形参没接上（实测：函数体里
+    `timeout` 是**整次探测的墙钟上限**，以前它只是形参没接上（实测：函数体里
     完全没用过这个数）：底层 `DeepSeekClient` 的 90 秒是**每次读**的超时，一个
     「一直有字节 trickle、但正文永远出不来」的连接会不断重置它，于是这一项能
     把整份环境报告挂住不放 —— 而 `GET /api/env/report` 是串行 await 它的，
     前端对这条请求又没有任何超时（`request()` 只在组件卸载时才 abort），
     用户看到的就是「系统诊断/首次准备」转圈转到天荒地老。
 
-    默认值必须**大于** llm 里那个 90：那里是刻意放宽的（思考模型首字慢、
-    免费档高峰排队，45 秒会误报超时）。在这里卡一个更小的数，就等于把
-    那次修复反向撤销 —— 好好的 Key 会被判成超时。
+    默认值必须**大于** llm 那边实际会用的读超时：那里是刻意放宽的（思考模型首字慢、
+    免费档高峰排队，45 秒会误报超时）。在这里卡一个更小的数，就等于把那次修复
+    反向撤销 —— 好好的 Key 会被判成超时。
+
+    以前这里写死 95（当时 90*1=90<95 对），后来 llm 给智谱加了 1.5 倍放大（变成 135），
+    envcheck 这边的写死数字没跟着变，好好的智谱 Key 在诊断页会被误报成「超时」——
+    正是这段注释自己发誓要避免的那种反向撤销。现在墙钟按 `effective_read_timeout`
+    实时算，两边共用同一个公式，不会再漂（见 llm.effective_read_timeout 的注释）。
     """
     cfg = store()
     key = cfg.api_key
@@ -620,9 +625,13 @@ async def check_api_live(timeout: float = 95.0) -> CheckItem:
             detail="尚未配置 API Key，跳过测试。",
             action="配置 API Key 后可测试。",
         )
-    from .llm import test_api_key
+    from .llm import API_PROBE_BASE_TIMEOUT_S, effective_read_timeout, test_api_key
 
     api = cfg.config.api
+    if timeout is None:
+        # 墙钟 = 实际会用到的读超时 + 一点缓冲（建连、退避重发等）；按提供商实时算，
+        # 不在这里抄一份「1.5 倍」的公式，否则又变成两边各自写死、迟早漂。
+        timeout = effective_read_timeout(API_PROBE_BASE_TIMEOUT_S, api.base_url) + 25.0
     try:
         result = await asyncio.wait_for(
             test_api_key(key, api.base_url, api.model), timeout=timeout

@@ -747,10 +747,70 @@ def t_ai_review_merge() -> None:
         llm.TEMPERATURE_REVIEW == 0.0,
         str(llm.TEMPERATURE_REVIEW),
     )
-    # 九个调用点必须全部引用常量，不允许再有裸数字漂进来
+    # 调用点必须引用常量，不允许再有裸数字漂进来。以前这里用正则扫源码，看不见两种
+    # 真实写法：① `chat`/`chat_stream` 自己签名上的默认值（不是 `temperature=数字` 这种形状），
+    # ② 方法里 `self.chat(...)` 忘传 `temperature` 时静默拿默认值 —— 正则也看不见（压根没有
+    # `temperature=` 这个字串）—— 而②正是这条注释自己声称要防的（「集中成常量才能一眼
+    # 看全」）：一个判定型方法忘记传 temperature，就会静默拿到 GENERATE 的默认值，跟
+    # ⑥ 这套「判定温度为 0」的初衷直接矛盾，而自检仍是绿的。改用 AST 遍历真正的调用点。
+    import ast as _ast_temp
+
     llm_source = _source_of(llm)
     bare = re.findall(r"temperature=(?!TEMPERATURE_)[\d.]+", llm_source)
     check("没有裸写的 temperature 数字", not bare, str(bare))
+
+    temp_tree = _ast_temp.parse(llm_source)
+    chat_call_sites = 0
+    missing_temp: list[str] = []
+    for node in _ast_temp.walk(temp_tree):
+        if not isinstance(node, _ast_temp.Call):
+            continue
+        fn = node.func
+        if not (isinstance(fn, _ast_temp.Attribute) and fn.attr in ("chat", "chat_stream")):
+            continue
+        chat_call_sites += 1
+        kw = next((k for k in node.keywords if k.arg == "temperature"), None)
+        if kw is None or not (isinstance(kw.value, _ast_temp.Name) and kw.value.id.startswith("TEMPERATURE_")):
+            owner = getattr(fn.value, "id", type(fn.value).__name__)
+            missing_temp.append(f"{owner}.{fn.attr}(行{node.lineno})")
+    # chat/chat_stream 至少要有这些调用点（跟 llm.py 里业务方法的实际数量同量级），
+    # 少于这个数 = AST 遍历本身没跑对（比如 llm_source 拿错了），不能默认「没发现问题 = 通过」。
+    check(
+        "AST 确实扫到了 chat/chat_stream 调用点",
+        chat_call_sites >= 9,
+        f"只扫到 {chat_call_sites} 个调用点，这条守卫自己没跑对",
+    )
+    check(
+        "每个 chat/chat_stream 调用点都显式传 temperature=<TEMPERATURE_ 常量>",
+        not missing_temp,
+        "这些调用点没显式传常量（可能静默拿默认值，正是⑥要防的漂移）：" + "、".join(missing_temp),
+    )
+    # 兜底：`chat`/`chat_stream` 自己的默认值也必须是常量，不能是裸数字（忘传时才会退到这里）。
+    fn_defaults: dict[str, object] = {}
+    for node in _ast_temp.walk(temp_tree):
+        if isinstance(node, (_ast_temp.FunctionDef, _ast_temp.AsyncFunctionDef)) and node.name in ("chat", "chat_stream"):
+            args = node.args
+            if args.args:
+                pos_names = [a.arg for a in args.args]
+                pos_defaults = list(args.defaults)
+                offset = len(pos_names) - len(pos_defaults)
+                for i, name in enumerate(pos_names):
+                    if name == "temperature" and i >= offset:
+                        fn_defaults[node.name] = pos_defaults[i - offset]
+                if args.kwonlyargs:
+                    for argnode, dflt in zip(args.kwonlyargs, args.kw_defaults):
+                        if argnode.arg == "temperature" and dflt is not None:
+                            fn_defaults[node.name] = dflt
+    bad_defaults = [
+        name
+        for name, dflt in fn_defaults.items()
+        if not (isinstance(dflt, _ast_temp.Name) and dflt.id.startswith("TEMPERATURE_"))
+    ]
+    check(
+        "chat/chat_stream 的默认温度也是常量（不是裸数字）",
+        set(fn_defaults) == {"chat", "chat_stream"} and not bad_defaults,
+        f"fn_defaults={list(fn_defaults)} bad_defaults={bad_defaults}",
+    )
     check(
         "复核方法用的是复核温度常量",
         "TEMPERATURE_REVIEW" in _source_of(llm.DeepSeekClient.review_change),

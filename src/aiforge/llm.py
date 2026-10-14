@@ -214,6 +214,28 @@ def _is_transient_status(status: int, body: str) -> bool:
     return True
 
 
+def effective_read_timeout(timeout_s: float, base_url: str) -> float:
+    """算出某个提供商真正会用的「每次读」超时上限。**单一事实来源**。
+
+    `DeepSeekClient.__init__` 与 `envcheck.check_api_live` 都必须调这里，不能在调用方
+    再抄一份公式：以前 envcheck 写死了 95 秒（当时 `timeout_s=90` 就是最终值，所以
+    95>90 对），后来这里给智谱加了 1.5 倍放大（变成 135），envcheck 那边的写死数字没跟着变，
+    好好的智谱 Key 在诊断页会被误报成「超时」—— 正是它自己的注释发誓要避免的那种
+    「反向撤销」。把公式收在一处，改一处就两边一起生效。
+    """
+    # 延迟引用，避免与 `DeepSeekClient` 的定义顺序缠在一起（这个函数在类被定义前
+    # 就已经存在于模块里，但被调用时类一定已经定义完了）。
+    if detect_provider(base_url) == "glm":
+        return min(float(timeout_s) * DeepSeekClient.GLM_TIMEOUT_BOOST, DeepSeekClient.GLM_TIMEOUT_CAP_S)
+    return float(timeout_s)
+
+
+# 探测 API Key 时用的「每次读」超时基准值（不区分提供商；具体会不会被上面的公式
+# 再放大，交给 `effective_read_timeout` 自己判）。`test_api_key` 与 `envcheck.check_api_live`
+# 共用这一个常量，不能再各自写一份 90 —— 同一个道理：两处数字各写一套，早晚会漂。
+API_PROBE_BASE_TIMEOUT_S = 90
+
+
 class LlmError(RuntimeError):
     """带用户可读信息与修复建议的 AI 调用错误。"""
 
@@ -853,6 +875,13 @@ def _friendly_http_error(status: int, body: str, base_url: str) -> LlmError:
 
 
 class DeepSeekClient:
+    # 思考模型（glm-4.7-flash 等）先输出 reasoning 再输出正文，同样的 timeout 对它偏紧；
+    # 放大这个倍数，避免把「慢」误报成「超时」。单一事实来源：这里算出来的上限被
+    # `envcheck.check_api_live` 的墙钟引用，不能再在调用方抄一份「90 秒 + 一点缓冲」的
+    # 写死数字（实测就漂过：那里写死 95，而智谱实际已经是 90*1.5=135，好好的 Key 会被误报超时）。
+    GLM_TIMEOUT_BOOST = 1.5
+    GLM_TIMEOUT_CAP_S = 600.0
+
     def __init__(
         self,
         api_key: str,
@@ -865,11 +894,7 @@ class DeepSeekClient:
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.model = model or DEFAULT_MODEL
         self.fallback_model = fallback_model
-        read_s = float(timeout_s)
-        if detect_provider(self.base_url) == "glm":
-            # 思考模型（glm-4.7-flash 等）先输出 reasoning 再输出正文，同样的
-            # timeout 对它偏紧；放大 1.5 倍，避免把「慢」误报成「超时」。
-            read_s = min(read_s * 1.5, 600.0)
+        read_s = effective_read_timeout(timeout_s, self.base_url)
         self.timeout = httpx.Timeout(connect=20.0, read=read_s, write=60.0, pool=20.0)
 
     def _try_fallback(self, status: int, payload: dict, body: str = "") -> bool:
@@ -1416,7 +1441,9 @@ async def test_api_key(api_key: str, base_url: str = DEFAULT_BASE_URL, model: st
         return {"ok": False, "message": "尚未填写 API Key。", "model": None, "latency_ms": None}
 
     # 思考模型（glm-4.7-flash 等）首字慢、且免费档可能排队，45s 太紧会误报超时。
-    client = DeepSeekClient(api_key.strip(), base_url, model, timeout_s=90)
+    # 基准值走 `API_PROBE_BASE_TIMEOUT_S`（与 envcheck.check_api_live 共用一个常量），
+    # 具体到这个提供商会放大到多少由 `DeepSeekClient.__init__` 调 `effective_read_timeout` 决定。
+    client = DeepSeekClient(api_key.strip(), base_url, model, timeout_s=API_PROBE_BASE_TIMEOUT_S)
     started = time.perf_counter()
     try:
         result = await client.chat(

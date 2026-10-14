@@ -44,11 +44,52 @@
 - **守卫自己的三个坑**（由一轮误红抓出）：扫描范围用硬编码黑名单与 `.gitignore` 不同源、
   本机路径判据区分大小写（小写盘符能绕过）、宽 `except` 把漏导入的 NameError 抹成
   「git 不可用」静默降级。现在扫描范围问 `git check-ignore`（与 `git add -A` 同源）。
+- **零件库单字关键词误命中**：`catalog.py` 里 `threaded_cap` 的关键词写了个单字「盖」，
+  「帮我掩盖一下表面瑕疵」「这个设计要覆盖所有表面」这种跟盖子无关的说法都能命中它，
+  而 `_parts_block_for` 自己的注释写着「prompt 只在真正相关时才变长」——注释在骗人。
+  单字改成必须写成复合词（瓶盖/镜头盖/盖子），并加了一对双向断言（改回单字必红）。
+- **`scad.strip_strings` 未闭合引号吹掉真代码**：字符集允许跨行匹配，`x = "abc;` 少打一个
+  闭合引号，下一行的 `import("C:/Windows/win.ini")` 会被当成字符串内容抹掉，`validate()`
+  返回 `ok=True`——安全拦截假过（与本文件开头承诺的「拒绝读写本地文件」不符）。字符集
+  现在排除换行；守卫直接断言这条未闭合引号的注入必须被拦。
+- **`parse_snapshot_verdict` 把「没结论」当成「没问题」**：返回 bool，空回复、格式跑偏、
+  说不确定三种都只能挤进一个 False，与「真的没问题」共用，调用方（`jobs._review_snapshot`）
+  只能把它们一起播成 success「未发现明显问题」。现在三态返回（problem/clear/unknown）。
+- **`review_snapshot` 走了一条会静默放过缺陷的降级通道**：429/5xx 时它调了只服务文本调用的
+  `_try_fallback`，会把会看图的视觉模型换成一个不会看图的文本模型重发——那个模型回一句
+  「我无法查看你上传的图片」（非空正文），于是被当成一次真实的复核结果传下去，而它一个字
+  也没看。守卫用 AST 检查调用点，不用裸字符串包含（否则会被自己写的解释注释误判）。
+- **`parse_review_json` 拿不合法 JSON 时编造 `score=70/verdict=warn`**：与「没结论」当「没问题」
+  同形状——编出来的数字会直接渲染成用户看到的「打印评分」。`_downgrade_printability` 里
+  还有一处同类的 `except: score = 70`。两处都改成「拿不到真实分数就是 None，不能拿中性值充数」。
+- **错误文案与域名清单写死 DeepSeek**：`_friendly_http_error` 四个分支 + 连接失败/超时文案
+  都不跟 `detect_provider` 走，自定义网关的用户收到 401 会被指引去 platform.deepseek.com
+  创建 Key；智谱国际站 `api.z.ai` 不在两张域名清单里（config 与 llm 各养了一份），被当成
+  自定义 openai 服务。两张清单合并到 `config.provider_of_base` 一处，`ai_provider_info` 也
+  上提到 config.py 作为单一事实来源（llm.py 与 envcheck.py 都从这一处读），`_GLM_ERROR_HINTS`
+  里 1210 那句「程序已自动改用允许的上限」实测并未实现，已改成可核实的说法；1000
+  不再被当成鉴权失败（它是智谱侧的 UNKNOWN，内部错误，与 Key 无关）。
+- **「瞬态可重试」判据合并**：`_post_with_connect_retry` 与 `_try_fallback` 以前各写各的
+  「429/5xx 就算瞬态」、两处都不读业务码——`_friendly_http_error` 明明能区分 1113（余额不足，
+  硬失败）与 1305（瞬态过载），OpenAI 兼容网关也常用 429 搭配 `insufficient_quota`。硬失败
+  会被当成「稍后再试就好」白白重发几轮；同时自定义网关的 429/5xx 以前干脆一次都不重试
+  （两家行为相反，方向还是「付费的那家行为更差」）。现在合并成一处 `_is_transient_status`。
+- **诊断页的墙钟比实际读超时还短**：`check_api_live` 以前写死 95 秒（当时 `timeout_s=90` 就是
+  最终值，95>90 对），后来 `DeepSeekClient` 给智谱加了 1.5 倍放大（变成 135），这边没跟着变，
+  好好的智谱 Key 在诊断页会被误报成「超时」。现在墙钟由 `effective_read_timeout` 实时算，
+  两边共用同一个公式（`API_PROBE_BASE_TIMEOUT_S` 也是共享常量），改一处就两边一起生效。
+- **温度守卫自己看不见自己承诺要防的东西**：以前用正则扫 `temperature=数字`，看不见
+  `chat`/`chat_stream` 签名上的默认值（不是这个形状），也看不见「某个调用点忘传
+  `temperature=`，静默拿默认值」（压根没这个字串）——后者正是⑥「判定温度为 0」要防的
+  漂移。现在改用 AST 遍历调用点，`chat`/`chat_stream` 每个调用点必须显式传 `TEMPERATURE_*`
+  常量，函数默认值本身也必须是常量。
 
 ### 验证
 
 - 三套全量：`selfcheck.py` **94 通过 / 0 失败**、`--offline` **79 通过 / 15 跳过 / 0 失败**、
-  `selfcheck_design.py` 144 项全过（本轮守卫全部并入既有项，**项数未变**）。
+  `selfcheck_design.py` 147 项全过（上面「温度守卫自己看不见自己承诺要防的东西」那一条
+  新加的三条子检查无法并入既有项——AST 遍历与旧的文本包含判定查的是完全不同的东西，
+  项数从上一句写的 144 涨到了现在的 147，「项数未变」到这一句就不成立了）。
 - 界面：`verify-flow.mjs` **86/86**（新增回收站三步），console/pageErrors/failedRequests 全 0；
   `verify-glass-contrast.mjs` `CONTRAST_OK`；真后端上 `layout-audit` 10 组 0 问题、
   `audit-interface` `INTERFACE_AUDIT_OK`（项目路由 tabular 候选 7 个）。

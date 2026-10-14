@@ -32,7 +32,7 @@ git checkout -b fix/short-description
 # 1) 完整后端自检（94 项）
 & build\venv\Scripts\python.exe scripts\selfcheck.py
 
-# 2) 设计规格与改动机制（144 项子检查，不消耗 AI）
+# 2) 设计规格与改动机制（147 项子检查，不消耗 AI）
 & build\venv\Scripts\python.exe scripts\selfcheck_design.py
 
 # 3) 密钥与隐私扫描（含 Git 历史）

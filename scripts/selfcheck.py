@@ -3372,6 +3372,45 @@ def t_hole_measure() -> str:
             f"每端预算 {_mesh._END_BUDGET_S}s 不合理：要能跑完 3 条扫线，又不能卡住界面"
         )
 
+        # --- hole_through 推导必须在**真编译的网格**上验 --------------------------------------
+        # `t_hole_criterion` 与 `t_requirement_tests` 里那些用例都是直接 `{hole_through: ...}`
+        # 塑好成品给下游看，它们验的是「下游怎么用」，验不到 `analyze()` 那一行推导本身对不对
+        # ——拿假数据推导与拿真数据推导对不上，就是个照不到问题的守卫（同一文件里已写过一次
+        # 「旧守卫自己也是照不到问题的守卫」，同一个坑不能靠下游用例默不作声地撑过去）。
+        sealed_cavity_scad = (
+            "$fn = 64;\n"
+            "difference(){ cube([60,60,40]); translate([22,22,10]) cylinder(d=16, h=20); }\n"
+        )
+        through_hole_scad = (
+            "$fn = 64;\n"
+            "difference(){ cube([60,60,40]); translate([22,22,-1]) cylinder(d=16, h=42); }\n"
+        )
+        blind_hole_scad = (
+            "$fn = 64;\n"
+            "difference(){ cube([60,60,40]); translate([22,22,-1]) cylinder(d=16, h=10); }\n"
+        )
+        for _name, _scad, _want in (
+            ("sealed", sealed_cavity_scad, False),
+            ("through", through_hole_scad, True),
+            ("blind", blind_hole_scad, None),
+        ):
+            _r = _compiler.compile_to_stl(_scad, d, _name)
+            assert _r.ok and _r.stl_path, (_name, _r.message or _r.fatal)
+            _m = _mesh.analyze(_Path(_r.stl_path))
+            assert _m.hole_through is _want, (
+                f"{_name} 模型的 hole_through 应判 {_want}，实际 {_m.hole_through}"
+                f"（剖面 {_m.hole_profile}）"
+            )
+            if _want is False:
+                # 阴面的关键断言：这个模型确实能被量出「孔径」（中间高度有 16mm 的空档），
+                # 不是「完全量不到」——如果 hole_diameter_mm 本身已经是 None，那 hole_through=False
+                # 就只是在重复一个不需要重复的结论，本用例的存在意义（拿「任一高度命中」当通过）
+                # 就没被验证到了。
+                assert _m.hole_diameter_mm is not None, (
+                    f"{_name} 模型本应能被量到孔径（这样 hole_through=False 才有意义），"
+                    f"实际 hole_diameter_mm 已是 {_m.hole_diameter_mm}：用例没验证到它想验的东西"
+                )
+
     # --- 代价必须封顶，但封顶要用**时间**而不是面数 ---
     assert not hasattr(_mesh, "_HOLE_AXIS_MAX_FACES"), (
         "面数上限又回来了：按面数封顶会把「本来 0.2 秒能量出来的模型」判成没量到"
@@ -3422,7 +3461,19 @@ def t_hole_criterion() -> str:
     # 4) 非用户点名 → 不报
     m = MeshMetrics(); m.hole_profile = [8.0] * 6
     assert jobs_mod._hole_problems(spec_with_hole(10.0, user_specified=False), m) == []
-    return "匹配不报/不符报问题8/量不到不报/未点名不报 四种情形均正确"
+    # 5) 剖面「任一高度命中」但 mesh 已判定这不是开口的孔（`hole_through is False`，
+    #    两端都没开口）—— 不能当成「孔径做到」静默放过，必须报出来。
+    m = MeshMetrics(); m.hole_profile = [None, None, 10.0, 10.0, 10.0, None]
+    m.hole_through = False
+    probs = jobs_mod._hole_problems(spec_with_hole(10.0), m)
+    assert len(probs) == 1 and "封闭" in probs[0], probs
+    # 反向：同样的剖面数字，`hole_through is None`（只开一面的盲孔，或没测完）不能
+    # 被误报成封闭腔（否则会把真实合法的凹槽/盲孔设计当成缺陷去修，与本次要防的
+    # 「没结论被当成结论」是同一种错的另一个方向）。
+    m = MeshMetrics(); m.hole_profile = [None, None, 10.0, 10.0, 10.0, None]
+    m.hole_through = None
+    assert jobs_mod._hole_problems(spec_with_hole(10.0), m) == []
+    return "匹配不报/不符报问题8/量不到不报/未点名不报/封闭腔报问题 五种情形均正确"
 
 
 def t_thread_detection() -> str:
@@ -4193,6 +4244,35 @@ def t_requirement_tests() -> str:
             assert row in s_thread.failures, "invalid 必须算失败（论文口径：不许拿没测当通过）"
             assert s_thread.summary()["invalid_ratio"] > 0.0, s_thread.summary()
             assert s_thread.summary()["pass_rate"] == 0.0, "没能判定却整件 PR=1 = 假绿复活"
+
+    # --- 1c. 贯通三态：两端都开口=True 过 / 两端都没开口=False 不过 / 只开一面或没测完=None 不报 ---
+    # mesh 新加的 `hole_through` 把「剖面某些高度命中了但根本没开口」这种情况与
+    # 「真通孔」「只开一面的合法盲孔」分开。以前只看「任一高度命中」，密封腔体会被
+    # 当成孔径做到了（拿一个插不进东西、漏不出东西的内部空腔去匹配用户的孔需求）。
+    hole_base = dict(base)
+    hole_base["declared_holes"] = [("线孔直径", 8.0, "hole_d")]
+    for through, want_status in (
+        (True, None),        # 真通孔：不新增那行“必须是开口的”判定
+        (False, reqtests.FAIL),  # 两端都没开口，中间命中：必须报
+        (None, None),         # 只开一面或没测完：不强行报，也不假装它是真通孔
+    ):
+        m_hole = mk(
+            bbox=(60.0, 60.0, 100.0), watertight=True, boundary_edges=0,
+            solid_parts=1, stray_parts=0, wall=wall_ok, sits_on_plate=True,
+            hole_profile=([8.0] * 6 if through is True else [None, None, 8.0, 8.0, 8.0, None]),
+            hole_through=through,
+        )
+        s_hole = reqtests.evaluate(
+            metrics=m_hole, **dict(hole_base, requirement="做一个笔筒，背面有 8mm 的穿线孔")
+        )
+        sealed_rows = [t for t in s_hole.tests if t.group == "hole:sealed-void"]
+        if want_status is None:
+            assert not sealed_rows, f"hole_through={through} 不该多出『必须是开口的』这一行"
+        else:
+            assert sealed_rows and sealed_rows[0].status == want_status, (
+                f"hole_through={through} 应该判 {want_status}，实际 {[t.status for t in sealed_rows]}"
+            )
+            assert sealed_rows[0] in s_hole.blocking_failures, "确认是封闭腔体时必须驱动修复（与螺纹三态里 None 的处理相反）"
 
     # --- 2. 尺寸偏小：判定 + 回喂日志带数字与公差 ---------------------------
     short = mk(

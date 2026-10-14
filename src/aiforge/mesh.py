@@ -99,6 +99,15 @@ class MeshMetrics:
     # 拿剖面去匹配用户声明的孔径——**任一高度匹配即视为做到**，避免误报。
     # 探针里两个贴底、一个贴顶（`_HOLE_PROFILE_PLAN`）：只按比例取会漏掉薄底座里的孔。
     hole_profile: list[float | None] = field(default_factory=list)
+    # 这七个孔径探针里，至少有一个是因为**预算耗尽**而返回 None（不是量完了真的没有孔）。
+    # 必须与「测了，确实没有」分开：把「没测出来」当成「没有孔」，与把「没结论」当成「没问题」
+    # 是同一种错（本项目 llm.parse_snapshot_verdict / parse_review_json 都修过这个形状）。
+    hole_inconclusive: bool = False
+    # 剖面里量到的那个空档到底方不**贯通**：True=贴底与贴顶两个探针都量到了孔（真通孔）；
+    # False=两个都没量到、但中间某些高度量到了（完全封闭的内部腔体，没开口——拿「任一高度
+    # 命中」当「孔做到了」就是错的）；None=只有一端命中（从一面开的盲孔/凹槽，真实存在的
+    # 合法设计，不能当成假的也不能当成贯通），或者 `hole_inconclusive` 为真（测不完，不下结论）。
+    hole_through: bool | None = None
     # 贴底/贴顶那一层里「足迹内部是材料」的比例（0~1）。判“实心底”有没有被挖成开口管。
     # 为什么需要它（实测，31 份真模型）：AI 写的笔筒经常用
     # `difference(){ 外坯; cylinder(r=inner, h=height+0.01); }` —— 内腔圆柱从 z=0 就开挖，
@@ -156,6 +165,8 @@ class MeshMetrics:
             "hole_profile": [
                 round(d, 2) if d is not None else None for d in self.hole_profile
             ],
+            "hole_inconclusive": self.hole_inconclusive,
+            "hole_through": self.hole_through,
             "bottom_coverage_pct": (
                 round(self.bottom_coverage * 100.0, 1) if self.bottom_coverage is not None else None
             ),
@@ -638,27 +649,47 @@ def analyze(
     )
     hole_deadline = time.monotonic() + _HOLE_PHASE_BUDGET_S
     hole_grid = _FaceGrid(points, triangle_count, 1.0) if triangle_count else None
-    metrics.hole_diameter_mm = measure_hole_diameter(
-        points,
-        triangle_count,
-        mid_z,
-        center=hole_center,
-        deadline=hole_deadline,
-        grid=hole_grid,
-    )
+
+    def _measure_one(z: float) -> float | None:
+        # `measure_hole_diameter` 返回 None 有两种完全不同的原因：预算耗尽中途放弃 vs
+        # 确实跑完了搜索而真的没找到孔。两者之前都只能看到 None，下游（reqtests/jobs）
+        # 把两种混为一谈。用同一个 `hole_deadline` 现场判断，不需要改
+        # `measure_hole_diameter` 的签名与所有调用方。不区分这个，下面 `hole_through` 的
+        # 推导就会犯同一种新错：把「没测出来」当「测了确实没有」。本文件 `_find_hole_axis`
+        # 的 docstring 已经立了同一个样板（「预算花完就 None：不把半程验过的簇当成结论」），
+        # 只是当时没把这个区分传递到 `analyze()` 这一层的聚合判断里。
+        got = measure_hole_diameter(
+            points, triangle_count, z, center=hole_center, deadline=hole_deadline, grid=hole_grid
+        )
+        if got is None and time.monotonic() >= hole_deadline:
+            metrics.hole_inconclusive = True
+        return got
+
+    metrics.hole_diameter_mm = _measure_one(mid_z)
     # 多高度剖面：供改动校验判断「用户声明的孔径到底做没做到」。
     # 高度取自 `_hole_profile_heights()`（含贴底/贴顶的绝对探针，见那里的实测理由）。
     metrics.hole_profile = [
-        measure_hole_diameter(
-            points,
-            triangle_count,
-            z,
-            center=hole_center,
-            deadline=hole_deadline,
-            grid=hole_grid,
-        )
-        for z in _hole_profile_heights(metrics.bbox_min[2], metrics.bbox_max[2])
+        _measure_one(z) for z in _hole_profile_heights(metrics.bbox_min[2], metrics.bbox_max[2])
     ]
+    # 贯通性推导：`_HOLE_PROFILE_PLAN` 自底向上排布，index 0 = 贴底探针，index -1 = 贴顶探针。
+    # 两端都命中 -> 真通孔；两端都不命中、但中间命中 -> 完全封闭的内部腔体（拿「任一高度
+    # 命中即视为做到」当通过就是错的，F3 报告里实测重现的那种）；只命中一端 -> 从一面开
+    # 的盲孔/凹槽，这是真实存在的合法设计，不能当成假的，但也不能当成「贯通」—— None 交
+    # 给下游自己按「不强行下结论」处理，与上面 `hole_inconclusive` 为真时同处理。
+    if not metrics.hole_inconclusive and len(metrics.hole_profile) >= 2:
+        bottom_hit, top_hit = metrics.hole_profile[0], metrics.hole_profile[-1]
+        if bottom_hit is not None and top_hit is not None:
+            metrics.hole_through = True
+        elif bottom_hit is None and top_hit is None:
+            # 只要中间有一个非 None 就当成「有封闭空腔被当成孔」（不是「完全没有孔」——
+            # 全 None 的情况上面 `hole_diameter_mm is None` 已经会让判据保持默不作声，
+            # 这里不重复下结论）。中间全是 None 时保持 None，不强行说它是假孔。
+            has_interior_hit = any(d is not None for d in metrics.hole_profile[1:-1])
+            metrics.hole_through = False if has_interior_hit else None
+        else:
+            metrics.hole_through = None
+    else:
+        metrics.hole_through = None
     # 两端材料占比：贴底与贴顶各量一层（判“实心底被挖穿了”）。
     # 代价实测（本仓 31 份真模型里最大的 30,980 面）：3~5 条扫线 0.005~0.05s，
     # 比一个孔径探针还便宜，所以给**自己的一份小预算**而不是挤用孔测量剩下的时间：

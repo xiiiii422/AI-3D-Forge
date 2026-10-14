@@ -3406,10 +3406,20 @@ def _hole_problems(spec: DesignSpec | None, metrics: MeshMetrics) -> list[str]:
     declared = _spec_declared_holes(spec)
     if not declared or not metrics.hole_profile:
         return []
+    problems: list[str] = []
+    # 剖面量到了空档，但贴底/贴顶两端都没开口 —— 完全封闭的内部腔体，不是孔。
+    # 以前「任一高度命中即视为做到」会把它当成孔（拿一个根本没开口的东西去匹配
+    # 用户点名的孔径需求）；`hole_through` 把这种情况与「真通孔」「只开一面的盲孔」分开。
+    # None（盲孔/没测完）不强行下结论，只有 False（确认两端都没开口）才报。
+    if getattr(metrics, "hole_through", None) is False:
+        problems.append(
+            "剖面在部分高度量到了空档，但两端都没开口 —— 这是完全封闭的内部腔体，不是能用的孔。"
+            "检查 difference() 里挖孔的圆柱是否真的沿该方向比模型更长（从头穿到尾）。"
+        )
+        return problems
     measured = [d for d in metrics.hole_profile if d is not None]
     if not measured:
         return []
-    problems: list[str] = []
     for label, value, _name in declared:
         tol = max(0.6, value * 0.06)
         if any(abs(d - value) <= tol for d in measured):

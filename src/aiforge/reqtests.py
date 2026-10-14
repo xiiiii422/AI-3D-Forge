@@ -595,6 +595,24 @@ def evaluate(
 
     # ---------- 3. 用户点名的孔径（射线剖面，任一高度命中即达成） ----------
     profile = [d for d in (getattr(metrics, "hole_profile", []) or [])]
+    hole_through = getattr(metrics, "hole_through", None)
+    if hole_through is False:
+        # 剖面里某些高度量到了空档，但贴底/贴顶两端探针都没量到——完全封闭的内部腔体，
+        # 不是能用的孔。以前只看「任一高度命中」会把这种密封腔当成「孔径做到了」，
+        # 拿一个根本没有开口的东西去匹配用户声明的孔需求。与「没测出来」不能混：
+        # `hole_inconclusive` 为真时 mesh 已经把 `hole_through` 定成 None，这里不会误报。
+        tests.append(
+            ReqTest(
+                group="hole:sealed-void",
+                requirement="孔必须是开口的（不是封闭内部腔体）",
+                kind="integrity",
+                status=FAIL,
+                expected="竖直贯通、两端至少一端开口",
+                actual="剖面某些高度量到了空档，但两端都没开口（像是完全封闭的内腔）",
+                fix_hint="检查 difference() 里挖孔的圆柱是否真的比模型在该方向上更长"
+                         "（从一端到另一端）；内腔不是孔，东西插不进去也漏不出去。",
+            )
+        )
     for label, want, spec_name in holes:
         for key in (_nn(spec_name), _nn(label)):
             if key in targets:

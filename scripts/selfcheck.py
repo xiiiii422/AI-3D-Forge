@@ -5632,9 +5632,22 @@ def t_dpi_workarea() -> str:
     assert tuple(state.work_px) != wrong, f"工作区又读成了 GetSystemMetrics(48)/(49)={wrong}"
 
     size, _mins = dpi_mod.window_geometry((1360, 880), (1080, 700), state=state)
-    assert size == (1360, 880), (
-        f"这台机器上窗口被夹成 {size}（旧缺陷下恒为 (720,520) 且 min_size == size）"
-    )
+    small_desktop = truth[0] < 1360 or truth[1] < 880
+    if small_desktop:
+        # GitHub 的 windows-latest 是无头 1024×768 桌面：设计尺寸 1360×880 在这里**本来**
+        # 就会被工作区夹紧，「宽裕工作区不该夹紧」这一档在本机无从验证 —— 不能拿它判红。
+        # 能验、也必须验的是：夹紧结果落在真实工作区内（不越界），且不再是旧缺陷那个
+        # 恒定的 (720,520) 常量。真有旧缺陷时，这两条断言照样会红。
+        assert size[0] <= truth[0] and size[1] <= truth[1], (
+            f"窗口 {size} 越出了本机工作区 {truth} —— 夹紧没拿真实工作区"
+        )
+        assert size != (720, 520), (
+            f"桌面只有 {truth[0]}×{truth[1]}，窗口却恰好是旧缺陷那个 (720,520) 常量"
+        )
+    else:
+        assert size == (1360, 880), (
+            f"这台机器上窗口被夹成 {size}（旧缺陷下恒为 (720,520) 且 min_size == size）"
+        )
 
     # 4) 感知模式必须报真话。DPI 感知是**进程级且不可逆**的，所以必须在子进程里做：
     #    先把子进程钉成 system aware（模拟「清单/引导程序已经设过」的机器），
@@ -5698,9 +5711,14 @@ def t_dpi_workarea() -> str:
             f"感知已由别处设定时报真值 {fields['REPORTED']}（不是造出来的 per_monitor）"
         )
 
+    clamp_note = (
+        "小桌面按真实工作区夹紧且不越界（设计尺寸不夹紧这一档在本机无从验证）"
+        if small_desktop
+        else "窗口回到设计尺寸，200% 小屏夹紧真能生效"
+    )
     return (
         f"工作区走 SPI_GETWORKAREA（实测 {truth[0]}×{truth[1]} 与系统一致）；"
-        f"窗口回到设计尺寸，200% 小屏夹紧真能生效；{mode_note}"
+        f"{clamp_note}；{mode_note}"
     )
 
 

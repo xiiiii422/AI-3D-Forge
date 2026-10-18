@@ -2,11 +2,11 @@
 
 **用一句话描述你想要的东西，AI 帮你设计出可以直接 3D 打印的模型。**
 
-[![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)](../../actions/workflows/ci.yml)
+[![CI](https://github.com/xiiiii422/AI-3D-Forge/actions/workflows/ci.yml/badge.svg)](https://github.com/xiiiii422/AI-3D-Forge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4.svg)](#系统要求)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/)
-[![Release](https://img.shields.io/badge/release-v1.0.0-success.svg)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v1.0.3-success.svg)](CHANGELOG.md)
 
 [English](README.en.md) | **简体中文**
 

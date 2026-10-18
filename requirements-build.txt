@@ -7,7 +7,7 @@
 -r requirements.txt
 
 # 把 Python 运行时 + 全部依赖打包成免安装 exe
-pyinstaller==6.11.1
+pyinstaller==6.22.3
 
 # 安装包构建（可选；若使用 Inno Setup 则不需要）
 # pyinstaller 已足够，Inno Setup 由 installer\ 脚本调用

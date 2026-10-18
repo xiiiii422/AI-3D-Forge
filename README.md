@@ -1,6 +1,6 @@
 # AI 3D Forge
 
-**用一句话描述你想要的东西，AI 帮你设计出可以直接 3D 打印的模型。**
+**用一句话描述你想要的东西，AI 帮你设计出可以直接 3D 打印不烧心的模型。**
 
 [![CI](https://github.com/xiiiii422/AI-3D-Forge/actions/workflows/ci.yml/badge.svg)](https://github.com/xiiiii422/AI-3D-Forge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)

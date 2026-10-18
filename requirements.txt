@@ -31,7 +31,7 @@ pydantic==2.10.4
 httpx==0.28.1
 
 # --- API Key 安全存储（Windows 凭据管理器）---
-keyring==25.6.0
+keyring==25.7.0
 
 # --- 桌面窗口（WebView2 原生窗口；缺失时自动回退到系统浏览器）---
 pywebview==5.4

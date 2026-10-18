@@ -25,7 +25,7 @@
 fastapi==0.115.6
 uvicorn==0.34.0
 python-multipart==0.0.20
-pydantic==2.10.4
+pydantic==2.14.1
 
 # --- HTTP 客户端（调用 DeepSeek API、下载 OpenSCAD 安装包）---
 httpx==0.28.1
